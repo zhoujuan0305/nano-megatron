@@ -1,8 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-src/nano_megatron.egg-info/PKG-INFO
-src/nano_megatron.egg-info/SOURCES.txt
-src/nano_megatron.egg-info/dependency_links.txt
-src/nano_megatron.egg-info/requires.txt
-src/nano_megatron.egg-info/top_level.txt
