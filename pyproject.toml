@@ -1,0 +1,178 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-megatron"
+version = "0.1.0"
+description = "A readable learning-oriented Megatron-style training system."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "zhiyuanzhou" }
+]
+dependencies = [
+  "torch>=2.5",
+  "numpy>=1.26",
+  "typing-extensions>=4.10",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.8",
+  "mypy>=1.13",
+]
+
+qwen = [
+  "transformers>=4.45",
+  "safetensors>=0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = [
+  "tests",
+]
+python_files = [
+  "test_*.py",
+]
+python_classes = [
+  "Test*",
+]
+python_functions = [
+  "test_*",
+]
+addopts = [
+  "-q",
+  "--strict-markers",
+  "--strict-config",
+  "--tb=short",
+]
+markers = [
+  "cpu: tests that can run on CPU",
+  "gpu: tests that require CUDA GPU",
+  "distributed: tests that require torch.distributed",
+  "slow: slow tests not required in default local CI",
+  "correctness: numerical correctness tests",
+  "integration: CLI or end-to-end integration tests",
+  "qwen: tests for Qwen-0.5B config or local weight loading",
+]
+filterwarnings = [
+  "error",
+  "ignore::UserWarning",
+  "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+exclude = [
+  ".git",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".venv",
+  "build",
+  "dist",
+  "checkpoints",
+  "runs",
+  "wandb",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+select = [
+  "E",      # pycodestyle errors
+  "W",      # pycodestyle warnings
+  "F",      # pyflakes
+  "I",      # isort
+  "B",      # flake8-bugbear
+  "C4",     # flake8-comprehensions
+  "UP",     # pyupgrade
+  "SIM",    # flake8-simplify
+  "RET",    # flake8-return
+  "ARG",    # flake8-unused-arguments
+  "PTH",    # prefer pathlib
+  "RUF",    # Ruff-specific rules
+]
+ignore = [
+  "E501",   # line length is handled by formatter; allow long tensor shape comments
+  "B008",   # allow function-call defaults when intentionally used in config helpers
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nano_megatron"]
+combine-as-imports = true
+force-sort-within-sections = false
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+  "ARG001", # pytest fixtures may be unused in function body
+  "ARG002",
+  "PTH"
+]
+"scripts/**/*.py" = [
+  "T201",   # allow print in small demo scripts if T rules are enabled later
+]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+files = ["src"]
+namespace_packages = true
+explicit_package_bases = true
+
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_optional = true
+
+allow_redefinition = false
+implicit_reexport = false
+show_error_codes = true
+pretty = true
+
+# PyTorch Tensor typing is still imperfect for a learning project.
+# Keep mypy useful, but do not make tensor-heavy code impossible to write.
+disable_error_code = [
+  "type-arg",
+  "no-any-return"
+]
+
+[[tool.mypy.overrides]]
+module = [
+  "torch.*",
+  "torchvision.*",
+  "transformers.*",
+  "safetensors.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "tests.*",
+  "scripts.*",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
