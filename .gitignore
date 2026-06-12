@@ -3,5 +3,6 @@
 AGENTS*
 uv.lock
 *pyc*
+*.egg-info/
 
 
