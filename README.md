@@ -52,9 +52,63 @@ and CPU tensors `loss`, `logits`, `params`, `grads`, `activations`,
 
 Do not loosen numerical tolerances only to make a test pass.
 
-## Setup and tests
+## Parallel context and CommBackend
+
+`nano_megatron.parallel` owns process-wide topology (TP/DP/PP/CP groups).
+`nano_megatron.distributed` exposes a small communication backend so model code
+does not call `torch.distributed` directly. Default backend is
+`TorchDistBackend` (PyTorch collectives); a future path may plug in `nano-nccl`.
+
+### Public API
+
+```python
+from nano_megatron.parallel import (
+    ParallelConfig,
+    ParallelContext,
+    RankGenerator,
+    destroy_parallel,
+    get_parallel_context,
+    initialize_parallel,
+    is_parallel_initialized,
+)
+from nano_megatron.distributed import CommBackend, TorchDistBackend
+```
+
+### Initialize pattern
+
+```python
+from nano_megatron.distributed import TorchDistBackend
+from nano_megatron.parallel import (
+    ParallelConfig,
+    destroy_parallel,
+    initialize_parallel,
+)
+
+# world_size must equal tp * cp * dp * pp (dp may be inferred from world_size).
+# Rank order default: tp-cp-dp-pp. Every rank participates in every new_group call.
+cfg = ParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+ctx = initialize_parallel(cfg, backend=TorchDistBackend())
+# ctx.tensor_parallel_group, ctx.data_parallel_group, ...
+# ctx.backend.all_reduce(tensor, group=ctx.data_parallel_group)
+destroy_parallel()
+```
+
+Single-process (CPU/gloo) init is enough for unit tests. Multi-GPU NCCL needs
+`torchrun` / env ranks as usual.
+
+### Setup and tests
 
 ```bash
-python -m pip install -e .
-python -m pytest tests/unit/reference -v
+python -m pip install -e ".[dev]"
+PYTHONPATH=. python -m pytest tests/unit/reference -v
+PYTHONPATH=. python -m pytest tests/unit/parallel tests/unit/distributed -v
+```
+
+NCCL multi-GPU (needs ≥4 CUDA devices; control plane on loopback):
+
+```bash
+PYTHONPATH=. python -m pytest tests/distributed -v --tb=short
+# or directly:
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 \
+  -m pytest tests/distributed/test_parallel_context_nccl.py -v
 ```

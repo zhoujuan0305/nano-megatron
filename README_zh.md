@@ -57,9 +57,62 @@ python scripts/run_reference_gpt.py \
 
 不要为了让测试通过而放宽数值容差。
 
-## 安装与测试
+## 并行上下文与 CommBackend
+
+`nano_megatron.parallel` 负责进程级拓扑（TP/DP/PP/CP 进程组）。
+`nano_megatron.distributed` 提供精简通信后端抽象，模型代码不直接调用
+`torch.distributed`。默认实现为 `TorchDistBackend`（PyTorch collective）；
+后续可接入 `nano-nccl`。
+
+### 公共 API
+
+```python
+from nano_megatron.parallel import (
+    ParallelConfig,
+    ParallelContext,
+    RankGenerator,
+    destroy_parallel,
+    get_parallel_context,
+    initialize_parallel,
+    is_parallel_initialized,
+)
+from nano_megatron.distributed import CommBackend, TorchDistBackend
+```
+
+### 初始化方式
+
+```python
+from nano_megatron.distributed import TorchDistBackend
+from nano_megatron.parallel import (
+    ParallelConfig,
+    destroy_parallel,
+    initialize_parallel,
+)
+
+# world_size 必须等于 tp * cp * dp * pp（dp 可由 world_size 推断）。
+# 默认 rank 序：tp-cp-dp-pp。每个 rank 都必须参与每一次 new_group 调用。
+cfg = ParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+ctx = initialize_parallel(cfg, backend=TorchDistBackend())
+# ctx.tensor_parallel_group, ctx.data_parallel_group, ...
+# ctx.backend.all_reduce(tensor, group=ctx.data_parallel_group)
+destroy_parallel()
+```
+
+单进程（CPU/gloo）即可跑单元测试。多卡 NCCL 需按常规使用 `torchrun` / 环境变量 rank。
+
+### 安装与测试
 
 ```bash
-python -m pip install -e .
-python -m pytest tests/unit/reference -v
+python -m pip install -e ".[dev]"
+PYTHONPATH=. python -m pytest tests/unit/reference -v
+PYTHONPATH=. python -m pytest tests/unit/parallel tests/unit/distributed -v
+```
+
+NCCL 多卡（需 ≥4 张 CUDA；控制面走 loopback）：
+
+```bash
+PYTHONPATH=. python -m pytest tests/distributed -v --tb=short
+# 或直接：
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 \
+  -m pytest tests/distributed/test_parallel_context_nccl.py -v
 ```

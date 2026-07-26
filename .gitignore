@@ -11,3 +11,4 @@ build/
 docs/
 *.pt
 !tests/**/fixtures/*.pt
+.worktrees/
