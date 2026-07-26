@@ -16,10 +16,14 @@ from nano_megatron.reference.layers import (
     CausalSelfAttention,
     MLP,
     TransformerBlock,
+    apply_rotary_emb,
     causal_attn_scores,
     gelu_erf,
     layer_norm,
+    precompute_freqs_cis,
+    rms_norm,
     softmax_last,
+    swiglu,
 )
 from nano_megatron.reference.model import ReferenceGPT
 
@@ -48,26 +52,53 @@ class TPCausalSelfAttention(nn.Module):
         rank = ctx.tensor_parallel_rank
         group = ctx.tensor_parallel_group
         backend = ctx.backend
-        self.q_proj = ColumnParallelLinear(
-            ref_attn.q_proj.weight, ref_attn.q_proj.bias, rank, tp, group, backend
-        )
-        self.k_proj = ColumnParallelLinear(
-            ref_attn.k_proj.weight, ref_attn.k_proj.bias, rank, tp, group, backend
-        )
-        self.v_proj = ColumnParallelLinear(
-            ref_attn.v_proj.weight, ref_attn.v_proj.bias, rank, tp, group, backend
-        )
-        self.out_proj = RowParallelLinear(
-            ref_attn.out_proj.weight, ref_attn.out_proj.bias, rank, tp, group, backend
-        )
-        self.local_num_heads = ref_attn.num_heads // tp
+        self.config = ref_attn.config
+        
+        # Support GQA (Group Query Attention)
+        self.num_heads = ref_attn.num_heads
+        self.num_kv_heads = ref_attn.num_kv_heads
+        self.num_heads_per_group = ref_attn.num_heads_per_group
         self.head_dim = ref_attn.head_dim
         self.hidden_size = ref_attn.hidden_size
         self.scale = ref_attn.scale
+        self.local_num_heads = self.num_heads // tp
+        self.local_num_kv_heads = self.num_kv_heads // tp
 
-    def _split_heads(self, x: Tensor) -> Tensor:
+        if self.config.use_fused_qkv:
+            # Fused QKV projection
+            self.qkv_proj = ColumnParallelLinear(
+                ref_attn.qkv_proj.weight, ref_attn.qkv_proj.bias, rank, tp, group, backend
+            )
+        else:
+            # Separate Q, K, V projections
+            self.q_proj = ColumnParallelLinear(
+                ref_attn.q_proj.weight, ref_attn.q_proj.bias, rank, tp, group, backend
+            )
+            self.k_proj = ColumnParallelLinear(
+                ref_attn.k_proj.weight, ref_attn.k_proj.bias, rank, tp, group, backend
+            )
+            self.v_proj = ColumnParallelLinear(
+                ref_attn.v_proj.weight, ref_attn.v_proj.bias, rank, tp, group, backend
+            )
+        
+        self.out_proj = RowParallelLinear(
+            ref_attn.out_proj.weight, ref_attn.out_proj.bias, rank, tp, group, backend
+        )
+
+        # RoPE
+        if self.config.position_embedding_type == 'rope':
+            self.rotary_emb = True
+            self.freqs = precompute_freqs_cis(
+                self.config.rotary_dim,
+                self.config.max_seq_len,
+                theta=self.config.rotary_base,
+            )
+        else:
+            self.rotary_emb = False
+
+    def _split_heads(self, x: Tensor, num_heads: int) -> Tensor:
         batch, seq_len, _ = x.shape
-        x = x.view(batch, seq_len, self.local_num_heads, self.head_dim)
+        x = x.view(batch, seq_len, num_heads, self.head_dim)
         return x.transpose(1, 2).contiguous()
 
     def _merge_heads(self, x: Tensor) -> Tensor:
@@ -75,10 +106,42 @@ class TPCausalSelfAttention(nn.Module):
         x = x.transpose(1, 2).contiguous()
         return x.view(batch, seq_len, self.local_num_heads * self.head_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
-        q = self._split_heads(self.q_proj(x))
-        k = self._split_heads(self.k_proj(x))
-        v = self._split_heads(self.v_proj(x))
+    def _repeat_kv(self, x: Tensor, n_rep: int) -> Tensor:
+        """Repeat KV heads for Group Query Attention."""
+        if n_rep == 1:
+            return x
+        batch, num_kv_heads, seq_len, head_dim = x.shape
+        x = x[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+        return x.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+    def forward(self, x: Tensor, positions: Tensor | None = None) -> Tensor:
+        if self.config.use_fused_qkv:
+            # Fused QKV projection
+            qkv = self.qkv_proj(x)
+            q_size = self.local_num_heads * self.head_dim
+            kv_size = self.local_num_kv_heads * self.head_dim
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        else:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+
+        q = self._split_heads(q, self.local_num_heads)
+        k = self._split_heads(k, self.local_num_kv_heads)
+        v = self._split_heads(v, self.local_num_kv_heads)
+
+        # Apply RoPE if configured
+        if self.rotary_emb and positions is not None:
+            # Move freqs to the same device as x
+            freqs = self.freqs.to(x.device)
+            freqs = freqs[positions]
+            q = apply_rotary_emb(q, freqs)
+            k = apply_rotary_emb(k, freqs)
+
+        # Repeat KV heads for GQA
+        k = self._repeat_kv(k, self.num_heads_per_group)
+        v = self._repeat_kv(v, self.num_heads_per_group)
+
         scores = causal_attn_scores(q, k, scale=self.scale)
         probs = softmax_last(scores)
         context = torch.matmul(probs, v)
@@ -93,15 +156,32 @@ class TPMLP(nn.Module):
         rank = ctx.tensor_parallel_rank
         group = ctx.tensor_parallel_group
         backend = ctx.backend
-        self.fc1 = ColumnParallelLinear(
-            ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, group, backend
-        )
+        self.config = ref_mlp.config
+        
+        if self.config.gated_linear_unit:
+            # SwiGLU: fc1 outputs 2x ffn_hidden_size for gating
+            self.fc1 = ColumnParallelLinear(
+                ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, group, backend
+            )
+        else:
+            self.fc1 = ColumnParallelLinear(
+                ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, group, backend
+            )
+        
         self.fc2 = RowParallelLinear(
             ref_mlp.fc2.weight, ref_mlp.fc2.bias, rank, tp, group, backend
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        h = gelu_erf(self.fc1(x))
+        h = self.fc1(x)
+        
+        if self.config.gated_linear_unit:
+            # SwiGLU activation
+            h = swiglu(h)
+        else:
+            # GELU activation
+            h = gelu_erf(h)
+        
         out = self.fc2(h)
         return out
 
@@ -114,6 +194,7 @@ class TPTransformerBlock(nn.Module):
         ref_block: TransformerBlock,
     ) -> None:
         super().__init__()
+        self.config = config
         self.ln1_weight = Parameter(ref_block.ln1_weight.data.clone())
         self.ln1_bias = Parameter(ref_block.ln1_bias.data.clone())
         self.ln2_weight = Parameter(ref_block.ln2_weight.data.clone())
@@ -122,11 +203,18 @@ class TPTransformerBlock(nn.Module):
         self.attn = TPCausalSelfAttention(ref_block.attn, ctx)
         self.mlp = TPMLP(ref_block.mlp, ctx)
 
-    def forward(self, x: Tensor) -> Tensor:
-        ln1_out = layer_norm(x, self.ln1_weight, self.ln1_bias, self.layernorm_eps)
-        attn_out = self.attn(ln1_out)
+    def _apply_norm(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        """Apply normalization based on config."""
+        if self.config.normalization == 'rmsnorm':
+            return rms_norm(x, weight, self.layernorm_eps)
+        else:
+            return layer_norm(x, weight, bias, self.layernorm_eps)
+
+    def forward(self, x: Tensor, positions: Tensor | None = None) -> Tensor:
+        ln1_out = self._apply_norm(x, self.ln1_weight, self.ln1_bias)
+        attn_out = self.attn(ln1_out, positions=positions)
         resid1 = x + attn_out
-        ln2_out = layer_norm(resid1, self.ln2_weight, self.ln2_bias, self.layernorm_eps)
+        ln2_out = self._apply_norm(resid1, self.ln2_weight, self.ln2_bias)
         mlp_out = self.mlp(ln2_out)
         resid2 = resid1 + mlp_out
         return resid2
@@ -144,8 +232,14 @@ class TPGPT(nn.Module):
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.hidden_size)
         self.tok_emb.weight.data.copy_(ref.tok_emb.weight.data)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.hidden_size)
-        self.pos_emb.weight.data.copy_(ref.pos_emb.weight.data)
+        
+        # Only use position embedding for learned_absolute type
+        if config.position_embedding_type == 'learned_absolute':
+            self.pos_emb = nn.Embedding(config.max_seq_len, config.hidden_size)
+            self.pos_emb.weight.data.copy_(ref.pos_emb.weight.data)
+        else:
+            self.pos_emb = None
+            
         self.blocks = nn.ModuleList(
             [TPTransformerBlock(config, ctx, rb) for rb in ref.blocks]
         )
@@ -171,10 +265,23 @@ class TPGPT(nn.Module):
         if positions is None:
             positions = torch.arange(seq_len, device=input_ids.device)
             positions = positions.unsqueeze(0).expand(batch, -1)
-        x = self.tok_emb(input_ids) + self.pos_emb(positions)
+        
+        # Token embedding
+        x = self.tok_emb(input_ids)
+        
+        # Position embedding (only for learned_absolute type)
+        if self.pos_emb is not None:
+            x = x + self.pos_emb(positions)
+        
         for block in self.blocks:
-            x = block(x)
-        final_ln = layer_norm(x, self.ln_f_weight, self.ln_f_bias, self.layernorm_eps)
+            x = block(x, positions=positions)
+        
+        # Final normalization
+        if self.config.normalization == 'rmsnorm':
+            final_ln = rms_norm(x, self.ln_f_weight, self.layernorm_eps)
+        else:
+            final_ln = layer_norm(x, self.ln_f_weight, self.ln_f_bias, self.layernorm_eps)
+        
         return self.lm_head(final_ln)
 
 
