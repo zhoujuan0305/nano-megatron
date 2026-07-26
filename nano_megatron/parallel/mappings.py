@@ -11,6 +11,25 @@ import torch.nn.functional as F
 from nano_megatron.distributed.backend import CommBackend
 
 
+class CommunicationBuffer:
+    """Pre-allocated communication buffer manager.
+
+    Caches buffers by (shape, dtype, device) so repeated all-reduce
+    calls reuse the same memory instead of allocating every time.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: dict[tuple[tuple[int, ...], torch.dtype, torch.device], Tensor] = {}
+
+    def get_buffer(self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> Tensor:
+        key = (tuple(shape), dtype, device)
+        buf = self._buffers.get(key)
+        if buf is None:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self._buffers[key] = buf
+        return buf
+
+
 class _CopyToTPRegion(torch.autograd.Function):
     """Input is replicated across TP ranks.
 
@@ -20,16 +39,21 @@ class _CopyToTPRegion(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, x: Tensor, group: Any, backend: CommBackend) -> Tensor:
+    def forward(ctx: Any, x: Tensor, group: Any, backend: CommBackend, buffer_manager: CommunicationBuffer | None = None) -> Tensor:
         ctx.group = group
         ctx.backend = backend
+        ctx.buffer_manager = buffer_manager
         return x
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None]:
-        grad = grad_output.clone()
-        ctx.backend.all_reduce(grad, group=ctx.group, op="sum")
-        return grad, None, None
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None, None]:
+        if ctx.buffer_manager is not None:
+            buf = ctx.buffer_manager.get_buffer(grad_output.shape, grad_output.dtype, grad_output.device)
+            buf.copy_(grad_output)
+            ctx.backend.all_reduce(buf, group=ctx.group, op="sum")
+            return buf, None, None, None
+        ctx.backend.all_reduce(grad_output, group=ctx.group, op="sum")
+        return grad_output, None, None, None
 
 
 class _ReduceFromTPRegion(torch.autograd.Function):
@@ -40,16 +64,20 @@ class _ReduceFromTPRegion(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, x: Tensor, group: Any, backend: CommBackend) -> Tensor:
+    def forward(ctx: Any, x: Tensor, group: Any, backend: CommBackend, buffer_manager: CommunicationBuffer | None = None) -> Tensor:
         ctx.group = group
         ctx.backend = backend
-        out = x.clone()
-        ctx.backend.all_reduce(out, group=ctx.group, op="sum")
-        return out
+        if buffer_manager is not None:
+            buf = buffer_manager.get_buffer(x.shape, x.dtype, x.device)
+            buf.copy_(x)
+            backend.all_reduce(buf, group=group, op="sum")
+            return buf
+        backend.all_reduce(x, group=group, op="sum")
+        return x
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None]:
-        return grad_output, None, None
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None, None]:
+        return grad_output, None, None, None
 
 
 def column_shard(
@@ -102,9 +130,10 @@ class ColumnParallelLinear(nn.Module):
         self.tp_size = tp_size
         self.group = group
         self.backend = backend
+        self.buffer_manager = CommunicationBuffer()
 
     def forward(self, x: Tensor) -> Tensor:
-        x = _CopyToTPRegion.apply(x, self.group, self.backend)
+        x = _CopyToTPRegion.apply(x, self.group, self.backend, self.buffer_manager)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -126,10 +155,11 @@ class RowParallelLinear(nn.Module):
         self.tp_size = tp_size
         self.group = group
         self.backend = backend
+        self.buffer_manager = CommunicationBuffer()
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.linear(x, self.weight, bias=None)
-        out = _ReduceFromTPRegion.apply(out, self.group, self.backend)
+        out = _ReduceFromTPRegion.apply(out, self.group, self.backend, self.buffer_manager)
         if self.bias is not None:
             out = out + self.bias
         return out

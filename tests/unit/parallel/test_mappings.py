@@ -10,6 +10,7 @@ from nano_megatron.parallel import (
     is_parallel_initialized,
 )
 from nano_megatron.parallel.mappings import (
+    CommunicationBuffer,
     _CopyToTPRegion,
     _ReduceFromTPRegion,
     ColumnParallelLinear,
@@ -63,12 +64,40 @@ def test_reduce_from_tp_region_backward_identity(monkeypatch):
     assert torch.equal(x.grad, torch.ones_like(x))
 
 
+def test_reduce_from_tp_region_with_buffer_returns_different_ptr(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29516")
+    x = torch.randn(3, 4, dtype=torch.float32)
+    snapshot = x.clone()
+    buf_mgr = CommunicationBuffer()
+    y = _ReduceFromTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend, buf_mgr)
+    assert y.data_ptr() != x.data_ptr()
+    assert torch.equal(y, snapshot)
+
+
+def test_reduce_from_tp_region_without_buffer_is_in_place(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29517")
+    x = torch.randn(3, 4, dtype=torch.float32)
+    snapshot = x.clone()
+    y = _ReduceFromTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend)
+    assert y.data_ptr() == x.data_ptr()
+    assert torch.equal(y, snapshot)
+
+
 def test_copy_to_tp_region_does_not_mutate_input(monkeypatch):
     ctx = _init_tp1(monkeypatch, "29514")
     x = torch.randn(3, 4, dtype=torch.float32)
     snapshot = x.clone()
     _CopyToTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend)
     assert torch.equal(x, snapshot)
+
+
+def test_copy_to_tp_region_backward_is_in_place(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29515")
+    x = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+    y = _CopyToTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend)
+    grad = torch.randn(3, 4, dtype=torch.float32)
+    y.backward(grad)
+    assert torch.equal(x.grad, grad)
 
 
 def test_column_shard_shape_and_reconstruction():
@@ -153,3 +182,59 @@ def test_row_parallel_linear_bias_not_doubled_on_size1(monkeypatch):
     y = lin(x)
     # x is zero so the all_reduce output is zero; bias should add exactly once
     assert torch.equal(y, b.expand(2, 3, 8))
+
+
+def test_communication_buffer_reuses_same_tensor():
+    mgr = CommunicationBuffer()
+    buf1 = mgr.get_buffer((3, 4), torch.float32, torch.device("cpu"))
+    buf2 = mgr.get_buffer((3, 4), torch.float32, torch.device("cpu"))
+    assert buf1.data_ptr() == buf2.data_ptr()
+
+
+def test_communication_buffer_different_shape_creates_new():
+    mgr = CommunicationBuffer()
+    buf1 = mgr.get_buffer((3, 4), torch.float32, torch.device("cpu"))
+    buf2 = mgr.get_buffer((5, 4), torch.float32, torch.device("cpu"))
+    assert buf1.data_ptr() != buf2.data_ptr()
+
+
+def test_communication_buffer_different_dtype_creates_new():
+    mgr = CommunicationBuffer()
+    buf1 = mgr.get_buffer((3, 4), torch.float32, torch.device("cpu"))
+    buf2 = mgr.get_buffer((3, 4), torch.float16, torch.device("cpu"))
+    assert buf1.data_ptr() != buf2.data_ptr()
+
+
+def test_reduce_from_tp_region_backward_with_buffer(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29530")
+    x = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+    buf_mgr = CommunicationBuffer()
+    y = _ReduceFromTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend, buf_mgr)
+    y.sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+
+
+def test_copy_to_tp_region_backward_with_buffer(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29531")
+    x = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+    buf_mgr = CommunicationBuffer()
+    y = _CopyToTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend, buf_mgr)
+    grad = torch.randn(3, 4, dtype=torch.float32)
+    y.backward(grad)
+    assert torch.equal(x.grad, grad)
+
+
+def test_column_parallel_linear_has_buffer_manager(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29532")
+    w = torch.randn(8, 4)
+    b = torch.randn(8)
+    lin = ColumnParallelLinear(w, b, tp_rank=0, tp_size=1, group=ctx.tensor_parallel_group, backend=ctx.backend)
+    assert isinstance(lin.buffer_manager, CommunicationBuffer)
+
+
+def test_row_parallel_linear_has_buffer_manager(monkeypatch):
+    ctx = _init_tp1(monkeypatch, "29533")
+    w = torch.randn(8, 4)
+    b = torch.randn(8)
+    lin = RowParallelLinear(w, b, tp_rank=0, tp_size=1, group=ctx.tensor_parallel_group, backend=ctx.backend)
+    assert isinstance(lin.buffer_manager, CommunicationBuffer)

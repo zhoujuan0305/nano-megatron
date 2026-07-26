@@ -14,64 +14,68 @@
 
 **Architecture**: GPT-3 345M (Decoder-only Transformer)
 
-| Parameter | Value |
-|-----------|-------|
-| vocab_size | 51200 |
-| hidden_size | 512 |
-| num_layers | 12 |
-| num_heads | 8 |
-| ffn_hidden_size | 2048 |
-| max_seq_len | 1024 |
-| position_embedding | RoPE |
-| activation | SwiGLU |
-| normalization | LayerNorm |
-| bias | False |
-| Total Parameters | 102,786,048 |
+| Parameter | nano-megatron | Megatron-LM |
+|-----------|---------------|-------------|
+| vocab_size | 51200 | 51200 |
+| hidden_size | 1024 | 1024 |
+| num_layers | 24 | 24 |
+| num_heads | 16 | 16 |
+| ffn_hidden_size | 4096 | 4096 |
+| max_seq_len | 2048 | 2048 |
+| position_embedding | RoPE | RoPE |
+| activation | SwiGLU (silu) | SwiGLU (silu) |
+| normalization | LayerNorm | LayerNorm |
+| bias | False | False |
+| Total Parameters | ~345M | ~345M |
 
 ### TP2 Performance
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 27,991 | 3,200 | 73.17 |
-| Megatron-LM | 39,078 | 1,103 | 52.41 |
+| nano-megatron | 6,344 | 19,953 | 645.64 |
+| Megatron-LM | 6,760 | 22,598 | 605.92 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.72x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **0.94x**
 
 ### TP4 Performance
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 29,502 | 2,720 | 69.42 |
-| Megatron-LM | 39,010 | 1,107 | 52.50 |
+| nano-megatron | 7,857 | 14,577 | 521.32 |
+| Megatron-LM | 10,067 | 12,312 | 406.86 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.76x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **0.78x**
 
-## 3. How to Reproduce
+## 4. Reproduction
 
 ### TP2 Benchmark
 
 ```bash
-torchrun --standalone --nproc_per_node=2 \
+PYTHONPATH=/workspace/src/nano-megatron:/workspace/src/Megatron-LM:$PYTHONPATH \
+/workspace/envs/megatron/bin/python -m torch.distributed.run \
+    --standalone --nproc_per_node=2 \
     scripts/benchmark_tp.py \
     --framework both \
     --tp-size 2 \
     --batch-size 2 \
-    --seq-len 1024 \
-    --hidden-size 512 \
-    --num-layers 12 \
-    --num-heads 8
+    --seq-len 2048 \
+    --hidden-size 1024 \
+    --num-layers 24 \
+    --num-heads 16
 ```
 
 ### TP4 Benchmark
 
 ```bash
-torchrun --standalone --nproc_per_node=4 \
+PYTHONPATH=/workspace/src/nano-megatron:/workspace/src/Megatron-LM:$PYTHONPATH \
+/workspace/envs/megatron/bin/python -m torch.distributed.run \
+    --standalone --nproc_per_node=4 \
     scripts/benchmark_tp.py \
     --framework both \
     --tp-size 4 \
     --batch-size 2 \
-    --seq-len 1024 \
-    --hidden-size 512 \
-    --num-layers 12 \
-    --num-heads 8
+    --seq-len 2048 \
+    --hidden-size 1024 \
+    --num-layers 24 \
+    --num-heads 16
 ```

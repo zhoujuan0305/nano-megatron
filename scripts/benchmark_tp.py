@@ -34,10 +34,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--framework", type=str, choices=["nano", "megatron", "both"], default="both")
     p.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--seq-len", type=int, default=128)
-    p.add_argument("--hidden-size", type=int, default=512)
-    p.add_argument("--num-layers", type=int, default=4)
-    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--hidden-size", type=int, default=1024)
+    p.add_argument("--num-layers", type=int, default=24)
+    p.add_argument("--num-heads", type=int, default=16)
     p.add_argument("--ffn-hidden-size", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
@@ -66,7 +66,7 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
     # 使用 Megatron-LM 兼容的配置
     cfg = ReferenceGPTConfig(
         vocab_size=51200,
-        max_seq_len=args.seq_len + 64,
+        max_seq_len=args.seq_len,  # 对齐：使用相同的seq_len
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
@@ -159,20 +159,37 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
 def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
     """Benchmark Megatron-LM TP implementation."""
-    from megatron.core import parallel_state
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
     ffn_hidden_size = args.ffn_hidden_size or 4 * args.hidden_size
 
-    # Initialize megatron distributed if not already done
-    if not parallel_state.is_initialized():
-        if dist.is_initialized():
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=args.tp_size,
-                pipeline_model_parallel_size=1,
-                context_parallel_size=1,
-            )
-        # If not in distributed mode, we'll use a proxy model without Megatron's parallel state
+    from megatron.core import parallel_state
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+
+    # Initialize megatron distributed
+    # Megatron-LM requires proper initialization of all process groups
+    parallel_state.destroy_model_parallel()
+    
+    if not dist.is_initialized():
+        # Get rank and world_size from environment
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    
+    # Initialize Megatron model parallel
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=args.tp_size,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+    )
+    
+    # Initialize model parallel RNG
+    model_parallel_cuda_manual_seed(42)
 
     config = TransformerConfig(
         num_layers=args.num_layers,
@@ -180,53 +197,41 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
         num_attention_heads=args.num_heads,
         ffn_hidden_size=ffn_hidden_size,
         layernorm_epsilon=1e-5,
-        add_bias_linear=True,
-        add_qkv_bias=True,
-        activation_func="gelu",
+        add_bias_linear=False,
+        add_qkv_bias=False,
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
         normalization="LayerNorm",
         sequence_parallel=False,
     )
 
-    # Use PyTorch's native Transformer as a proxy for Megatron-LM performance
-    # This gives us a baseline for the same model architecture
-    # Megatron-LM's actual implementation would use fused kernels and optimizations
-    class MegatronProxyModel(torch.nn.Module):
-        """Proxy model using PyTorch's Transformer to simulate Megatron-LM performance."""
-        def __init__(self, config):
-            super().__init__()
-            self.embedding = torch.nn.Embedding(1024, config.hidden_size)
-            self.layers = torch.nn.ModuleList([
-                torch.nn.TransformerEncoderLayer(
-                    d_model=config.hidden_size,
-                    nhead=config.num_attention_heads,
-                    dim_feedforward=config.ffn_hidden_size,
-                    batch_first=True,
-                    norm_first=True,
-                    activation="gelu",
-                ) for _ in range(config.num_layers)
-            ])
-            self.ln_f = torch.nn.LayerNorm(config.hidden_size)
-            self.lm_head = torch.nn.Linear(config.hidden_size, 1024, bias=False)
-
-        def forward(self, x):
-            h = self.embedding(x)
-            for layer in self.layers:
-                h = layer(h)
-            h = self.ln_f(h)
-            return self.lm_head(h)
-
-    model = MegatronProxyModel(config).to(args.device)
+    # Use Megatron-LM's GPT model
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=51200,
+        max_sequence_length=args.seq_len,
+    ).to(args.device)
 
     input_ids = torch.randint(
-        0, 1024, (args.batch_size, args.seq_len), device=args.device
+        0, 51200, (args.batch_size, args.seq_len), device=args.device
     )
+    
+    position_ids = torch.arange(args.seq_len, device=args.device).unsqueeze(0).expand(args.batch_size, -1)
+    
+    # Create attention mask (causal mask)
+    attention_mask = torch.ones(
+        (args.batch_size, 1, args.seq_len, args.seq_len), device=args.device
+    ).bool()
 
     # Warmup
     for _ in range(args.warmup_steps):
-        logits = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, 1024), input_ids.view(-1)
-        )
+        logits = model(input_ids, position_ids, attention_mask)
+        # Use Megatron-LM's vocab_parallel_cross_entropy for TP
+        loss = vocab_parallel_cross_entropy(logits, input_ids)
+        loss = loss.mean()
         loss.backward()
         model.zero_grad()
 
@@ -238,10 +243,10 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
     start_time = time.perf_counter()
 
     for _ in range(args.benchmark_steps):
-        logits = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, 1024), input_ids.view(-1)
-        )
+        logits = model(input_ids, position_ids, attention_mask)
+        # Use Megatron-LM's vocab_parallel_cross_entropy for TP
+        loss = vocab_parallel_cross_entropy(logits, input_ids)
+        loss = loss.mean()
         loss.backward()
         model.zero_grad()
 
@@ -261,7 +266,7 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
     parallel_state.destroy_model_parallel()
 
     return BenchmarkResult(
-        framework="Megatron-LM (proxy)",
+        framework="Megatron-LM",
         model_name="GPT",
         tp_size=args.tp_size,
         batch_size=args.batch_size,
