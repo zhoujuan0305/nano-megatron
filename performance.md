@@ -9,7 +9,6 @@
 | CUDA | 13.1 |
 | Python | 3.12.3 |
 | OS | Linux |
-| Date | 2026-07-26 |
 
 ## 2. Model Configuration
 
