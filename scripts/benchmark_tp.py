@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--output", type=str, default="performance.md")
+    p.add_argument("--output", type=str, default=None, help="Output file path (default: no output)")
     return p.parse_args()
 
 
@@ -402,8 +402,11 @@ def main() -> None:
             traceback.print_exc()
 
     if results:
-        write_performance_md(results, args.output)
-        print(f"\nResults written to {args.output}")
+        if args.output:
+            write_performance_md(results, args.output)
+            print(f"\nResults written to {args.output}")
+        else:
+            print("\nNo output file specified (use --output to save results)")
     else:
         print("No benchmark results to write.")
 
