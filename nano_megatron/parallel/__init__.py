@@ -6,15 +6,25 @@ from nano_megatron.parallel.context import (
     initialize_parallel,
     is_parallel_initialized,
 )
+from nano_megatron.parallel.mappings import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    column_shard,
+    row_shard,
+)
 from nano_megatron.parallel.rank_generator import RankGenerator, generate_masked_orthogonal_rank_groups
 
 __all__ = [
+    "ColumnParallelLinear",
     "ParallelConfig",
     "ParallelContext",
     "RankGenerator",
+    "RowParallelLinear",
+    "column_shard",
     "destroy_parallel",
     "generate_masked_orthogonal_rank_groups",
     "get_parallel_context",
     "initialize_parallel",
     "is_parallel_initialized",
+    "row_shard",
 ]
