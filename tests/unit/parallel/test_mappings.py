@@ -238,3 +238,123 @@ def test_row_parallel_linear_has_buffer_manager(monkeypatch):
     b = torch.randn(8)
     lin = RowParallelLinear(w, b, tp_rank=0, tp_size=1, group=ctx.tensor_parallel_group, backend=ctx.backend)
     assert isinstance(lin.buffer_manager, CommunicationBuffer)
+
+
+def test_reduce_from_tp_forward_async_matches_sync(monkeypatch):
+    """Async-launch reduce output equals sync-launch reduce output (TP1 gloo)."""
+    import torch.distributed as dist
+    from nano_megatron.distributed.torch_backend import TorchDistBackend
+
+    if is_parallel_initialized():
+        destroy_parallel()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29600")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    ctx = initialize_parallel(ParallelConfig(), dist_backend="gloo")
+    backend = ctx.backend
+
+    torch.manual_seed(0)
+    x_base = torch.randn(4, 8, dtype=torch.float32)
+
+    # Sync baseline: force async_op=False on the underlying TorchDistBackend.
+    orig_all_reduce = TorchDistBackend.all_reduce
+
+    def force_sync(self, tensor, *, group=None, op="sum", async_op=False):
+        return orig_all_reduce(self, tensor, group=group, op=op, async_op=False)
+
+    monkeypatch.setattr(TorchDistBackend, "all_reduce", force_sync)
+    x_sync = x_base.clone()
+    out_sync = _ReduceFromTPRegion.apply(x_sync, ctx.tensor_parallel_group, backend)
+    out_sync = out_sync.clone()
+    monkeypatch.undo()
+
+    # Async path (default after Task 2).
+    x_async = x_base.clone()
+    out_async = _ReduceFromTPRegion.apply(x_async, ctx.tensor_parallel_group, backend)
+    out_async = out_async.clone()
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+    assert torch.allclose(out_async, out_sync, atol=1e-6), (
+        f"async vs sync output differ: max diff = {(out_async - out_sync).abs().max().item()}"
+    )
+
+    if is_parallel_initialized():
+        destroy_parallel()
+
+
+def test_copy_to_tp_backward_async_matches_sync(monkeypatch):
+    """Async-launch reduce grad equals sync-launch reduce grad (TP1 gloo)."""
+    import torch.distributed as dist
+    from nano_megatron.distributed.torch_backend import TorchDistBackend
+
+    if is_parallel_initialized():
+        destroy_parallel()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29601")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    ctx = initialize_parallel(ParallelConfig(), dist_backend="gloo")
+    backend = ctx.backend
+
+    torch.manual_seed(0)
+    x_base = torch.randn(4, 8, dtype=torch.float32, requires_grad=False)
+    grad_seed = torch.randn(4, 8, dtype=torch.float32)
+
+    # Sync baseline: force async_op=False on the underlying TorchDistBackend.
+    orig_all_reduce = TorchDistBackend.all_reduce
+
+    def force_sync(self, tensor, *, group=None, op="sum", async_op=False):
+        return orig_all_reduce(self, tensor, group=group, op=op, async_op=False)
+
+    monkeypatch.setattr(TorchDistBackend, "all_reduce", force_sync)
+    x_sync = x_base.clone().requires_grad_(True)
+    y_sync = _CopyToTPRegion.apply(x_sync, ctx.tensor_parallel_group, backend)
+    y_sync.backward(grad_seed.clone())
+    grad_sync = x_sync.grad.detach().clone()
+    monkeypatch.undo()
+
+    # Async path.
+    x_async = x_base.clone().requires_grad_(True)
+    y_async = _CopyToTPRegion.apply(x_async, ctx.tensor_parallel_group, backend)
+    y_async.backward(grad_seed.clone())
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    grad_async = x_async.grad.detach().clone()
+
+    assert torch.allclose(grad_async, grad_sync, atol=1e-6), (
+        f"async vs sync grad differ: max diff = {(grad_async - grad_sync).abs().max().item()}"
+    )
+
+    if is_parallel_initialized():
+        destroy_parallel()
+
+
+def test_column_parallel_forward_unchanged_after_async(monkeypatch):
+    """ColumnParallelLinear.forward has no reduce; ensure async wiring did not
+    introduce an unexpected all_reduce call."""
+    import torch.distributed as dist
+    if is_parallel_initialized():
+        destroy_parallel()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29603")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    ctx = initialize_parallel(ParallelConfig(), dist_backend="gloo")
+
+    w = torch.randn(8, 4)
+    b = torch.randn(8)
+    lin = ColumnParallelLinear(w, b, tp_rank=0, tp_size=1,
+                               group=ctx.tensor_parallel_group, backend=ctx.backend)
+    x = torch.randn(2, 3, 4)
+    out = lin(x)
+    assert out.shape == (2, 3, 8)
+
+    if is_parallel_initialized():
+        destroy_parallel()

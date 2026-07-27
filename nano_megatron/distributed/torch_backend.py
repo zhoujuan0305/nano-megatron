@@ -22,10 +22,13 @@ def reduce_op_from_string(op: str) -> dist.ReduceOp:
 
 class TorchDistBackend:
     def all_reduce(
-        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum"
-    ) -> Tensor:
-        dist.all_reduce(tensor, op=reduce_op_from_string(op), group=group)
-        return tensor
+        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | Any:
+        work = dist.all_reduce(
+            tensor, op=reduce_op_from_string(op), group=group, async_op=async_op,
+        )
+        return work if async_op else tensor
 
     def reduce_scatter(
         self,

@@ -7,8 +7,9 @@ from torch import Tensor
 
 class CommBackend(Protocol):
     def all_reduce(
-        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum"
-    ) -> Tensor: ...
+        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | Any: ...
 
     def reduce_scatter(
         self,

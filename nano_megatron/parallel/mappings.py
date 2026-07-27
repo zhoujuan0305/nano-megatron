@@ -50,9 +50,17 @@ class _CopyToTPRegion(torch.autograd.Function):
         if ctx.buffer_manager is not None:
             buf = ctx.buffer_manager.get_buffer(grad_output.shape, grad_output.dtype, grad_output.device)
             buf.copy_(grad_output)
-            ctx.backend.all_reduce(buf, group=ctx.group, op="sum")
+            work = ctx.backend.all_reduce(buf, group=ctx.group, op="sum", async_op=True)
+            # GPU-side fence: ensures NCCL kernel completes before downstream
+            # reads on the default stream.  When async_op is honoured, the
+            # result is a Work handle; guard for backends that may return the
+            # tensor directly (e.g. test stubs forcing sync mode).
+            if hasattr(work, "wait"):
+                work.wait()
             return buf, None, None, None
-        ctx.backend.all_reduce(grad_output, group=ctx.group, op="sum")
+        work = ctx.backend.all_reduce(grad_output, group=ctx.group, op="sum", async_op=True)
+        if hasattr(work, "wait"):
+            work.wait()
         return grad_output, None, None, None
 
 
@@ -70,9 +78,14 @@ class _ReduceFromTPRegion(torch.autograd.Function):
         if buffer_manager is not None:
             buf = buffer_manager.get_buffer(x.shape, x.dtype, x.device)
             buf.copy_(x)
-            backend.all_reduce(buf, group=group, op="sum")
+            work = backend.all_reduce(buf, group=group, op="sum", async_op=True)
+            # GPU-side fence: wait for NCCL kernel before returning the buffer.
+            if hasattr(work, "wait"):
+                work.wait()
             return buf
-        backend.all_reduce(x, group=group, op="sum")
+        work = backend.all_reduce(x, group=group, op="sum", async_op=True)
+        if hasattr(work, "wait"):
+            work.wait()
         return x
 
     @staticmethod

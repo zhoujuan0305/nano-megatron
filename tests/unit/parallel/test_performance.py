@@ -130,12 +130,13 @@ class TestCommunicationPattern:
 
     def _wrap_all_reduce(self, backend):
         """Return (counter_dict, context_manager) that counts all_reduce calls."""
-        count = {"n": 0}
+        count = {"n": 0, "async_op_values": []}
         orig = backend.all_reduce
 
-        def counting(tensor, *, group=None, op="sum"):
+        def counting(tensor, *, group=None, op="sum", async_op=False):
             count["n"] += 1
-            return orig(tensor, group=group, op=op)
+            count["async_op_values"].append(async_op)
+            return orig(tensor, group=group, op=op, async_op=async_op)
 
         return count, patch.object(backend, "all_reduce", counting)
 
@@ -181,6 +182,27 @@ class TestCommunicationPattern:
         with cm:
             lin(x)
         assert count["n"] == 1
+
+    def test_reduce_from_tp_forward_uses_async_op(self, monkeypatch):
+        """_ReduceFromTPRegion.forward must request async_op=True from the backend."""
+        ctx = _init_tp1(monkeypatch, "29560")
+        x = torch.randn(4, 8, dtype=torch.float32)
+        count, cm = self._wrap_all_reduce(ctx.backend)
+        with cm:
+            _ReduceFromTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend)
+        assert count["n"] == 1
+        assert count["async_op_values"] == [True]
+
+    def test_copy_to_tp_backward_uses_async_op(self, monkeypatch):
+        """_CopyToTPRegion.backward must request async_op=True from the backend."""
+        ctx = _init_tp1(monkeypatch, "29561")
+        x = torch.randn(4, 8, dtype=torch.float32, requires_grad=True)
+        y = _CopyToTPRegion.apply(x, ctx.tensor_parallel_group, ctx.backend)
+        count, cm = self._wrap_all_reduce(ctx.backend)
+        with cm:
+            y.sum().backward()
+        assert count["n"] == 1
+        assert count["async_op_values"] == [True]
 
 
 class TestPerformance:
