@@ -12,6 +12,8 @@ from nano_megatron.parallel.mappings import (
     RowParallelLinear,
     blockwise_column_shard,
     fused_qkv_column_shard,
+    register_sequence_parallel_grad_allreduce,
+    scatter_to_sequence_parallel_region,
 )
 from nano_megatron.parallel.vocab_parallel import (
     VocabParallelEmbedding,
@@ -63,6 +65,7 @@ class TPCausalSelfAttention(nn.Module):
         rank = ctx.tensor_parallel_rank
         group = ctx.tensor_parallel_group
         backend = ctx.backend
+        sp = ctx.sequence_parallel
         self.config = ref_attn.config
         
         # Support GQA (Group Query Attention)
@@ -96,21 +99,46 @@ class TPCausalSelfAttention(nn.Module):
                 group,
                 backend,
                 weight_is_local=True,
+                sequence_parallel=sp,
             )
         else:
             # Separate Q, K, V projections
             self.q_proj = ColumnParallelLinear(
-                ref_attn.q_proj.weight, ref_attn.q_proj.bias, rank, tp, group, backend
+                ref_attn.q_proj.weight,
+                ref_attn.q_proj.bias,
+                rank,
+                tp,
+                group,
+                backend,
+                sequence_parallel=sp,
             )
             self.k_proj = ColumnParallelLinear(
-                ref_attn.k_proj.weight, ref_attn.k_proj.bias, rank, tp, group, backend
+                ref_attn.k_proj.weight,
+                ref_attn.k_proj.bias,
+                rank,
+                tp,
+                group,
+                backend,
+                sequence_parallel=sp,
             )
             self.v_proj = ColumnParallelLinear(
-                ref_attn.v_proj.weight, ref_attn.v_proj.bias, rank, tp, group, backend
+                ref_attn.v_proj.weight,
+                ref_attn.v_proj.bias,
+                rank,
+                tp,
+                group,
+                backend,
+                sequence_parallel=sp,
             )
-        
+
         self.out_proj = RowParallelLinear(
-            ref_attn.out_proj.weight, ref_attn.out_proj.bias, rank, tp, group, backend
+            ref_attn.out_proj.weight,
+            ref_attn.out_proj.bias,
+            rank,
+            tp,
+            group,
+            backend,
+            sequence_parallel=sp,
         )
 
         # RoPE
@@ -184,6 +212,7 @@ class TPMLP(nn.Module):
         rank = ctx.tensor_parallel_rank
         group = ctx.tensor_parallel_group
         backend = ctx.backend
+        sp = ctx.sequence_parallel
         self.config = ref_mlp.config
         
         if self.config.gated_linear_unit:
@@ -201,14 +230,27 @@ class TPMLP(nn.Module):
                 group,
                 backend,
                 weight_is_local=True,
+                sequence_parallel=sp,
             )
         else:
             self.fc1 = ColumnParallelLinear(
-                ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, group, backend
+                ref_mlp.fc1.weight,
+                ref_mlp.fc1.bias,
+                rank,
+                tp,
+                group,
+                backend,
+                sequence_parallel=sp,
             )
-        
+
         self.fc2 = RowParallelLinear(
-            ref_mlp.fc2.weight, ref_mlp.fc2.bias, rank, tp, group, backend
+            ref_mlp.fc2.weight,
+            ref_mlp.fc2.bias,
+            rank,
+            tp,
+            group,
+            backend,
+            sequence_parallel=sp,
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -241,6 +283,17 @@ class TPTransformerBlock(nn.Module):
         self.layernorm_eps = config.layernorm_eps
         self.attn = TPCausalSelfAttention(ref_block.attn, ctx)
         self.mlp = TPMLP(ref_block.mlp, ctx)
+        # LN runs on sequence shards under SP; weight/bias grads are partial.
+        if ctx.sequence_parallel:
+            for p in (
+                self.ln1_weight,
+                self.ln1_bias,
+                self.ln2_weight,
+                self.ln2_bias,
+            ):
+                register_sequence_parallel_grad_allreduce(
+                    p, ctx.tensor_parallel_group, ctx.backend
+                )
 
     def _apply_norm(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
         """Apply normalization based on config."""
@@ -271,6 +324,9 @@ class TPGPT(nn.Module):
         self.config = config
         self._tp_group = ctx.tensor_parallel_group
         self._tp_backend = ctx.backend
+        self._sequence_parallel = ctx.sequence_parallel
+        self._tp_rank = ctx.tensor_parallel_rank
+        self._tp_size = ctx.tensor_parallel_size
         self.vocab_start_index, self.vocab_end_index = vocab_range_from_global(
             ctx.tensor_parallel_rank,
             ctx.tensor_parallel_size,
@@ -300,7 +356,15 @@ class TPGPT(nn.Module):
         self.ln_f_weight = Parameter(ref.ln_f_weight.data.clone())
         self.ln_f_bias = Parameter(ref.ln_f_bias.data.clone())
         self.layernorm_eps = config.layernorm_eps
-        # Column-parallel LM head: local logits [B, S, V/tp], no gather in forward.
+        if ctx.sequence_parallel:
+            register_sequence_parallel_grad_allreduce(
+                self.ln_f_weight, ctx.tensor_parallel_group, ctx.backend
+            )
+            register_sequence_parallel_grad_allreduce(
+                self.ln_f_bias, ctx.tensor_parallel_group, ctx.backend
+            )
+        # Column-parallel LM head: local logits [B, S, V/tp].
+        # With SP, gathers sequence shards internally before the matmul.
         self.lm_head = ColumnParallelLinear(
             ref.lm_head.weight,
             None,
@@ -308,6 +372,7 @@ class TPGPT(nn.Module):
             ctx.tensor_parallel_size,
             ctx.tensor_parallel_group,
             ctx.backend,
+            sequence_parallel=ctx.sequence_parallel,
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
@@ -344,12 +409,29 @@ class TPGPT(nn.Module):
             positions = torch.arange(seq_len, device=input_ids.device)
             positions = positions.unsqueeze(0).expand(batch, -1)
 
+        if self._sequence_parallel and seq_len % self._tp_size != 0:
+            raise ValueError(
+                f"seq_len ({seq_len}) must be divisible by tensor_parallel_size "
+                f"({self._tp_size}) when sequence_parallel is enabled"
+            )
+
         # Token embedding
         x = self.tok_emb(input_ids)
 
         # Position embedding (only for learned_absolute type)
         if self.pos_emb is not None:
             x = x + self.pos_emb(positions)
+
+        # Scatter sequence dim across TP ranks so activations stay sharded
+        # until Column gather / Row reduce-scatter inside each linear.
+        if self._sequence_parallel:
+            x = scatter_to_sequence_parallel_region(
+                x,
+                self._tp_group,
+                self._tp_backend,
+                self._tp_rank,
+                self._tp_size,
+            )
 
         for block in self.blocks:
             x = block(x, positions=positions)

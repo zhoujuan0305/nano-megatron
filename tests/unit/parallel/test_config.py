@@ -21,3 +21,14 @@ def test_world_size_mismatch_raises():
 def test_non_positive_raises():
     with pytest.raises(ValueError):
         ParallelConfig(tensor_parallel_size=0).validate(1)
+
+
+def test_sequence_parallel_default_false():
+    cfg = ParallelConfig()
+    assert cfg.sequence_parallel is False
+
+
+def test_sequence_parallel_true_does_not_affect_world_product():
+    cfg = ParallelConfig(tensor_parallel_size=2, sequence_parallel=True)
+    assert cfg.product_without_dp() == 2
+    assert cfg.resolved_data_parallel_size(4) == 2

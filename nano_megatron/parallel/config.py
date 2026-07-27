@@ -9,6 +9,7 @@ class ParallelConfig:
     pipeline_parallel_size: int = 1
     context_parallel_size: int = 1
     data_parallel_size: int | None = None
+    sequence_parallel: bool = False
     order: str = "tp-cp-dp-pp"
 
     def product_without_dp(self) -> int:

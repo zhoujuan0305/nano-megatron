@@ -32,6 +32,7 @@ class ParallelContext:
     data_parallel_group: Any
     pipeline_parallel_group: Any
     context_parallel_group: Any
+    sequence_parallel: bool
     data_context_parallel_group: Any
 
 
@@ -162,6 +163,7 @@ def initialize_parallel(
         data_parallel_group=dp_group,
         pipeline_parallel_group=pp_group,
         context_parallel_group=cp_group,
+        sequence_parallel=cfg.sequence_parallel,
         data_context_parallel_group=dp_cp_group,
     )
     _PARALLEL_CONTEXT = ctx

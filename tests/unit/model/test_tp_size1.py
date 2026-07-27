@@ -213,3 +213,79 @@ def test_tp_size1_fused_qkv_matches_reference(monkeypatch):
         assert torch.allclose(
             tp_grads[name], ref_grads[name], atol=1e-6, rtol=1e-5
         ), f"grad mismatch on {name}"
+
+
+def _init_tp1_sp(monkeypatch, port: str, *, sequence_parallel: bool):
+    import torch.distributed as dist
+
+    if is_parallel_initialized():
+        destroy_parallel()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", port)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    return initialize_parallel(
+        ParallelConfig(sequence_parallel=sequence_parallel),
+        dist_backend="gloo",
+    )
+
+
+def test_tp1_sequence_parallel_matches_reference(monkeypatch):
+    """tp=1 + SP=True is numerically identical to reference (scatter/gather identity)."""
+    ctx = _init_tp1_sp(monkeypatch, "29550", sequence_parallel=True)
+    assert ctx.sequence_parallel is True
+    torch.manual_seed(5)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    assert tp._sequence_parallel is True
+    assert tp._tp_rank == 0
+    assert tp._tp_size == 1
+
+    ids = torch.randint(0, 16, (2, 6))
+    ref_logits = ref(ids)
+    tp_logits = tp(ids)
+    assert tp_logits.shape == ref_logits.shape
+    assert torch.equal(tp_logits, ref_logits)
+
+    tp.shifted_cross_entropy(tp_logits, ids).backward()
+    shifted_cross_entropy(ref_logits, ids).backward()
+    tp_grads = _grads(tp)
+    ref_grads = _grads(ref)
+    assert set(tp_grads) == set(ref_grads)
+    for name in tp_grads:
+        assert torch.allclose(
+            tp_grads[name], ref_grads[name], atol=1e-6, rtol=1e-5
+        ), f"grad mismatch on {name}"
+
+
+def test_tp1_sequence_parallel_linears_flagged(monkeypatch):
+    ctx = _init_tp1_sp(monkeypatch, "29551", sequence_parallel=True)
+    torch.manual_seed(6)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    for block in tp.blocks:
+        assert block.attn.q_proj.sequence_parallel is True
+        assert block.attn.k_proj.sequence_parallel is True
+        assert block.attn.v_proj.sequence_parallel is True
+        assert block.attn.out_proj.sequence_parallel is True
+        assert block.mlp.fc1.sequence_parallel is True
+        assert block.mlp.fc2.sequence_parallel is True
+    assert tp.lm_head.sequence_parallel is True
+
+
+def test_tp1_default_sp_false_linears_unflagged(monkeypatch):
+    """Existing default path must keep sequence_parallel=False on all linears."""
+    ctx = _init_tp1(monkeypatch, "29552")
+    assert ctx.sequence_parallel is False
+    torch.manual_seed(7)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    assert tp._sequence_parallel is False
+    for block in tp.blocks:
+        assert block.attn.q_proj.sequence_parallel is False
+        assert block.attn.out_proj.sequence_parallel is False
+        assert block.mlp.fc1.sequence_parallel is False
+        assert block.mlp.fc2.sequence_parallel is False
+    assert tp.lm_head.sequence_parallel is False

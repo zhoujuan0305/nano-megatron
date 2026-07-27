@@ -19,6 +19,7 @@ class BenchmarkResult:
     framework: str
     model_name: str
     tp_size: int
+    sequence_parallel: bool
     batch_size: int
     seq_len: int
     hidden_size: int
@@ -33,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--framework", type=str, choices=["nano", "megatron", "both"], default="both")
     p.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
+    p.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Enable Megatron-style sequence parallelism (requires tp-size > 1; seq-len %% tp-size == 0)",
+    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--hidden-size", type=int, default=1024)
@@ -87,6 +93,15 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
         attention_dropout=0.0,
     )
 
+    if args.sequence_parallel:
+        if args.tp_size <= 1:
+            raise ValueError("sequence_parallel requires --tp-size > 1")
+        if args.seq_len % args.tp_size != 0:
+            raise ValueError(
+                f"seq_len ({args.seq_len}) must be divisible by tp_size ({args.tp_size}) "
+                "when sequence_parallel is enabled"
+            )
+
     if args.tp_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
@@ -94,7 +109,10 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
     ctx = None
     if dist.is_initialized():
         ctx = initialize_parallel(
-            ParallelConfig(tensor_parallel_size=args.tp_size),
+            ParallelConfig(
+                tensor_parallel_size=args.tp_size,
+                sequence_parallel=args.sequence_parallel,
+            ),
             dist_backend="nccl" if torch.cuda.is_available() else "gloo",
         )
 
@@ -114,7 +132,8 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
             f"[nano] params={n_params/1e6:.1f}M "
             f"fused_qkv={cfg.use_fused_qkv} pos={cfg.position_embedding_type} "
             f"glued={cfg.gated_linear_unit} bias={cfg.use_bias} "
-            f"dropout=({cfg.hidden_dropout},{cfg.attention_dropout})",
+            f"dropout=({cfg.hidden_dropout},{cfg.attention_dropout}) "
+            f"sp={args.sequence_parallel}",
             flush=True,
         )
 
@@ -160,11 +179,17 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
     if ctx is not None:
         destroy_parallel()
 
-    framework_name = "nano-megatron (TP)" if ctx is not None else "nano-megatron (ref)"
+    if ctx is None:
+        framework_name = "nano-megatron (ref)"
+    elif args.sequence_parallel:
+        framework_name = "nano-megatron (TP+SP)"
+    else:
+        framework_name = "nano-megatron (TP)"
     return BenchmarkResult(
         framework=framework_name,
         model_name="GPT",
         tp_size=args.tp_size,
+        sequence_parallel=args.sequence_parallel,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         hidden_size=args.hidden_size,
@@ -206,6 +231,15 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
     else:
         torch.cuda.set_device(local_rank)
 
+    if args.sequence_parallel:
+        if args.tp_size <= 1:
+            raise ValueError("sequence_parallel requires --tp-size > 1")
+        if args.seq_len % args.tp_size != 0:
+            raise ValueError(
+                f"seq_len ({args.seq_len}) must be divisible by tp_size ({args.tp_size}) "
+                "when sequence_parallel is enabled"
+            )
+
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=args.tp_size,
         pipeline_model_parallel_size=1,
@@ -215,18 +249,23 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
     # Match nano-megatron structural knobs. Leave TE kernels as Megatron's
     # optimized path; disable dropout so we are not measuring extra noise.
+    # SP is mutually exclusive with async TP all-reduce in Megatron.
     config = TransformerConfig(
         num_layers=args.num_layers,
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_heads,
         ffn_hidden_size=ffn_hidden_size,
+        tensor_model_parallel_size=args.tp_size,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
         layernorm_epsilon=1e-5,
         add_bias_linear=False,
         add_qkv_bias=False,
         activation_func=torch.nn.functional.silu,
         gated_linear_unit=True,
         normalization="LayerNorm",
-        sequence_parallel=False,
+        sequence_parallel=args.sequence_parallel,
+        tp_comm_overlap=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attention_softmax_in_fp32=True,
@@ -257,7 +296,8 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
             f"[megatron] params={n_params/1e6:.1f}M "
             f"dropout=({config.hidden_dropout},{config.attention_dropout}) "
             f"pos={model.position_embedding_type} "
-            f"glued={config.gated_linear_unit} bias={config.add_bias_linear}",
+            f"glued={config.gated_linear_unit} bias={config.add_bias_linear} "
+            f"sp={args.sequence_parallel}",
             flush=True,
         )
 
@@ -306,10 +346,14 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
     parallel_state.destroy_model_parallel()
 
+    framework_name = (
+        "Megatron-LM (TP+SP)" if args.sequence_parallel else "Megatron-LM (TP)"
+    )
     return BenchmarkResult(
-        framework="Megatron-LM",
+        framework=framework_name,
         model_name="GPT",
         tp_size=args.tp_size,
+        sequence_parallel=args.sequence_parallel,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         hidden_size=args.hidden_size,
@@ -323,7 +367,13 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
 def format_result_markdown(result: BenchmarkResult) -> str:
     """Format a benchmark result as markdown."""
-    return f"""| {result.framework} | {result.model_name} | TP{result.tp_size} | {result.batch_size} | {result.seq_len} | {result.hidden_size} | {result.num_layers} | {result.num_heads} | {result.tokens_per_sec:.2f} | {result.memory_mb:.2f} | {result.avg_step_time_ms:.2f} |"""
+    sp = "on" if result.sequence_parallel else "off"
+    return (
+        f"| {result.framework} | {result.model_name} | TP{result.tp_size} | SP {sp} | "
+        f"{result.batch_size} | {result.seq_len} | {result.hidden_size} | "
+        f"{result.num_layers} | {result.num_heads} | {result.tokens_per_sec:.2f} | "
+        f"{result.memory_mb:.2f} | {result.avg_step_time_ms:.2f} |"
+    )
 
 
 def write_performance_md(results: list[BenchmarkResult], output_path: str) -> None:
@@ -333,7 +383,13 @@ def write_performance_md(results: list[BenchmarkResult], output_path: str) -> No
     # Build results table
     results_table = ""
     for r in results:
-        results_table += f"| {r.framework} | {r.model_name} | TP{r.tp_size} | {r.batch_size} | {r.seq_len} | {r.hidden_size} | {r.num_layers} | {r.num_heads} | {r.tokens_per_sec:.2f} | {r.memory_mb:.2f} | {r.avg_step_time_ms:.2f} |\n"
+        sp = "on" if r.sequence_parallel else "off"
+        results_table += (
+            f"| {r.framework} | {r.model_name} | TP{r.tp_size} | SP {sp} | "
+            f"{r.batch_size} | {r.seq_len} | {r.hidden_size} | {r.num_layers} | "
+            f"{r.num_heads} | {r.tokens_per_sec:.2f} | {r.memory_mb:.2f} | "
+            f"{r.avg_step_time_ms:.2f} |\n"
+        )
 
     # Build analysis
     analysis = ""
@@ -369,8 +425,8 @@ def write_performance_md(results: list[BenchmarkResult], output_path: str) -> No
 
 ## Benchmark Results
 
-| Framework | Model | TP Size | Batch Size | Seq Len | Hidden Size | Num Layers | Num Heads | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
-|-----------|-------|---------|------------|---------|-------------|------------|-----------|------------|-------------|-------------------|
+| Framework | Model | TP Size | SP | Batch Size | Seq Len | Hidden Size | Num Layers | Num Heads | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|-------|---------|----|------------|---------|-------------|------------|-----------|------------|-------------|-------------------|
 {results_table}
 ## Analysis
 

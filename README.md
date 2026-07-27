@@ -6,7 +6,7 @@ Compact distributed training framework for studying Megatron-style parallelism.
 
 ## Performance
 
-On 4× RTX A6000 (FP32), nano-megatron reaches **0.96x–1.04x** of Megatron-LM throughput under matching GPT configs (345M / 760M / 1.3B, TP2 & TP4).
+On 4× RTX A6000 (FP32), nano-megatron reaches **0.93x–1.01x** of Megatron-LM throughput under matching GPT configs (345M / 760M / 1.3B, TP2 & TP4, with and without sequence parallel).
 
 Full tables, configs, and reproduction commands: **[performance.md](performance.md)**
 
@@ -64,4 +64,4 @@ PYTHONPATH=. python -m pytest tests/distributed tests/integration -v
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

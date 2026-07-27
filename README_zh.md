@@ -6,7 +6,7 @@ English README: [README.md](README.md)
 
 ## 性能
 
-在 4× RTX A6000（FP32）上，相同 GPT 配置（345M / 760M / 1.3B，TP2 与 TP4）下，nano-megatron 吞吐约为 Megatron-LM 的 **0.96x–1.04x**。
+在 4× RTX A6000（FP32）上，相同 GPT 配置（345M / 760M / 1.3B，TP2 与 TP4，含/不含 Sequence Parallel）下，nano-megatron 吞吐约为 Megatron-LM 的 **0.93x–1.01x**。
 
 完整表格、模型配置与复现命令见：**[performance.md](performance.md)**
 
@@ -64,4 +64,4 @@ PYTHONPATH=. python -m pytest tests/distributed tests/integration -v
 
 ## 许可证
 
-本项目采用 Apache License 2.0 许可证 - 详见 [LICENSE](LICENSE) 文件。
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件。

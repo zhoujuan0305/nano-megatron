@@ -22,6 +22,7 @@ def test_initialize_single_process(tmp_path, monkeypatch):
     assert ctx.world_size == 1
     assert ctx.tensor_parallel_rank == 0
     assert ctx.data_parallel_size == 1
+    assert ctx.sequence_parallel is False
     assert get_parallel_context() is ctx
     destroy_parallel()
     assert not is_parallel_initialized()
