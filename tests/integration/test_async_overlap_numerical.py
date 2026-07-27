@@ -78,8 +78,6 @@ def test_worker_async_overlap_numerical():
         is_parallel_initialized,
     )
     from nano_megatron.reference import ReferenceGPT, ReferenceGPTConfig
-    from nano_megatron.reference.loss import shifted_cross_entropy
-
     ws = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     assert ws == 2
@@ -115,7 +113,7 @@ def test_worker_async_overlap_numerical():
 
     TorchDistBackend.all_reduce = force_sync
     logits_sync = m(ids)
-    loss_sync = shifted_cross_entropy(logits_sync, ids)
+    loss_sync = m.shifted_cross_entropy(logits_sync, ids)
     loss_sync.backward()
     logits_sync_v = logits_sync.detach().clone()
     grads_sync = {
@@ -128,7 +126,7 @@ def test_worker_async_overlap_numerical():
     # --- Async path (default async_op=True from Task 2) ---
     TorchDistBackend.all_reduce = orig_all_reduce
     logits_async = m(ids)
-    loss_async = shifted_cross_entropy(logits_async, ids)
+    loss_async = m.shifted_cross_entropy(logits_async, ids)
     loss_async.backward()
     torch.cuda.synchronize()
     logits_async_v = logits_async.detach().clone()

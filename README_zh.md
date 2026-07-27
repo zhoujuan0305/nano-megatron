@@ -6,7 +6,7 @@ English README: [README.md](README.md)
 
 ## 性能
 
-在 4× RTX A6000（FP32）上，相同 GPT 配置（345M / 760M / 1.3B，TP2 与 TP4）下，nano-megatron 吞吐约为 Megatron-LM 的 **0.72x–0.94x**。
+在 4× RTX A6000（FP32）上，相同 GPT 配置（345M / 760M / 1.3B，TP2 与 TP4）下，nano-megatron 吞吐约为 Megatron-LM 的 **0.96x–1.04x**。
 
 完整表格、模型配置与复现命令见：**[performance.md](performance.md)**
 

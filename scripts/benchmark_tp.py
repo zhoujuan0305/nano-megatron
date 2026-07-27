@@ -62,29 +62,35 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
         destroy_parallel()
 
     ffn_hidden_size = args.ffn_hidden_size or 4 * args.hidden_size
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_rank0 = int(os.environ.get("RANK", 0)) == 0
+    device = torch.device(f"cuda:{local_rank}" if args.device == "cuda" else args.device)
 
-    # 使用 Megatron-LM 兼容的配置
+    # Align with Megatron-LM structural settings used in this benchmark.
     cfg = ReferenceGPTConfig(
         vocab_size=51200,
-        max_seq_len=args.seq_len,  # 对齐：使用相同的seq_len
+        max_seq_len=args.seq_len,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         ffn_hidden_size=ffn_hidden_size,
         layernorm_eps=1e-5,
         use_bias=False,
-        position_embedding_type='rope',
+        position_embedding_type="rope",
         rotary_dim=args.hidden_size // args.num_heads,
         rotary_base=10000,
-        activation_func='swiglu',
+        activation_func="swiglu",
         gated_linear_unit=True,
-        normalization='layernorm',
+        normalization="layernorm",
+        use_fused_qkv=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
     )
 
-    # 初始化分布式环境（如果需要）
     if args.tp_size > 1 and not dist.is_initialized():
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-    
+
     ctx = None
     if dist.is_initialized():
         ctx = initialize_parallel(
@@ -97,35 +103,49 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
     ref = ReferenceGPT(cfg)
     if ctx is not None:
-        model = build_tp_gpt_from_reference(ref, ctx).to(args.device)
+        model = build_tp_gpt_from_reference(ref, ctx).to(device)
     else:
-        model = ref.to(args.device)
+        model = ref.to(device)
+    model.train()
+
+    if is_rank0:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(
+            f"[nano] params={n_params/1e6:.1f}M "
+            f"fused_qkv={cfg.use_fused_qkv} pos={cfg.position_embedding_type} "
+            f"glued={cfg.gated_linear_unit} bias={cfg.use_bias} "
+            f"dropout=({cfg.hidden_dropout},{cfg.attention_dropout})",
+            flush=True,
+        )
 
     input_ids = torch.randint(
-        0, cfg.vocab_size, (args.batch_size, args.seq_len), device=args.device
+        0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
     )
 
-    # Warmup
+    def _compute_loss(logits, labels):
+        # TP path returns local-vocab logits; use vocab-parallel CE.
+        if ctx is not None and hasattr(model, "shifted_cross_entropy"):
+            return model.shifted_cross_entropy(logits, labels)
+        return shifted_cross_entropy(logits, labels)
+
     for _ in range(args.warmup_steps):
         logits = model(input_ids)
-        loss = shifted_cross_entropy(logits, input_ids)
+        loss = _compute_loss(logits, input_ids)
         loss.backward()
         model.zero_grad()
 
-    if args.device == "cuda":
+    if device.type == "cuda":
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
 
-    # Benchmark
-    torch.cuda.reset_peak_memory_stats() if args.device == "cuda" else None
     start_time = time.perf_counter()
-
     for _ in range(args.benchmark_steps):
         logits = model(input_ids)
-        loss = shifted_cross_entropy(logits, input_ids)
+        loss = _compute_loss(logits, input_ids)
         loss.backward()
         model.zero_grad()
 
-    if args.device == "cuda":
+    if device.type == "cuda":
         torch.cuda.synchronize()
     end_time = time.perf_counter()
 
@@ -133,10 +153,9 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
     avg_step_time = total_time / args.benchmark_steps
     total_tokens = args.benchmark_steps * args.batch_size * args.seq_len
     tokens_per_sec = total_tokens / total_time
-
-    memory_mb = 0.0
-    if args.device == "cuda":
-        memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    memory_mb = (
+        torch.cuda.max_memory_allocated() / (1024 * 1024) if device.type == "cuda" else 0.0
+    )
 
     if ctx is not None:
         destroy_parallel()
@@ -158,39 +177,44 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
 
 
 def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
-    """Benchmark Megatron-LM TP implementation."""
+    """Benchmark Megatron-LM TP implementation.
+
+    Config is aligned with nano-megatron: RoPE, SwiGLU, LayerNorm, no bias,
+    zero dropout, vocab-parallel output, shifted next-token CE.
+    """
     ffn_hidden_size = args.ffn_hidden_size or 4 * args.hidden_size
+    vocab_size = 51200
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_rank0 = int(os.environ.get("RANK", 0)) == 0
 
     from megatron.core import parallel_state
     from megatron.core.models.gpt.gpt_model import GPTModel
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_spec,
+    )
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 
-    # Initialize megatron distributed
-    # Megatron-LM requires proper initialization of all process groups
     parallel_state.destroy_model_parallel()
-    
+
     if not dist.is_initialized():
-        # Get rank and world_size from environment
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    
-    # Initialize Megatron model parallel
+    else:
+        torch.cuda.set_device(local_rank)
+
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=args.tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
     )
-    
-    # Initialize model parallel RNG
     model_parallel_cuda_manual_seed(42)
 
+    # Match nano-megatron structural knobs. Leave TE kernels as Megatron's
+    # optimized path; disable dropout so we are not measuring extra noise.
     config = TransformerConfig(
         num_layers=args.num_layers,
         hidden_size=args.hidden_size,
@@ -203,65 +227,82 @@ def benchmark_megatron(args: argparse.Namespace) -> BenchmarkResult:
         gated_linear_unit=True,
         normalization="LayerNorm",
         sequence_parallel=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_softmax_in_fp32=True,
+        apply_rope_fusion=False,
+        bias_activation_fusion=False,
+        masked_softmax_fusion=False,
+        bias_dropout_fusion=False,
+        fp16=False,
+        bf16=False,
+        params_dtype=torch.float32,
     )
 
-    # Use Megatron-LM's GPT model
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    
     model = GPTModel(
         config=config,
-        transformer_layer_spec=transformer_layer_spec,
-        vocab_size=51200,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=vocab_size,
         max_sequence_length=args.seq_len,
-    ).to(args.device)
+        position_embedding_type="rope",
+        rotary_base=10000,
+        parallel_output=True,
+        share_embeddings_and_output_weights=False,
+    ).cuda(local_rank)
+    model.train()
+
+    if is_rank0:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(
+            f"[megatron] params={n_params/1e6:.1f}M "
+            f"dropout=({config.hidden_dropout},{config.attention_dropout}) "
+            f"pos={model.position_embedding_type} "
+            f"glued={config.gated_linear_unit} bias={config.add_bias_linear}",
+            flush=True,
+        )
 
     input_ids = torch.randint(
-        0, 51200, (args.batch_size, args.seq_len), device=args.device
+        0, vocab_size, (args.batch_size, args.seq_len), device=f"cuda:{local_rank}"
     )
-    
-    position_ids = torch.arange(args.seq_len, device=args.device).unsqueeze(0).expand(args.batch_size, -1)
-    
-    # Create attention mask (causal mask)
-    attention_mask = torch.ones(
-        (args.batch_size, 1, args.seq_len, args.seq_len), device=args.device
-    ).bool()
+    position_ids = (
+        torch.arange(args.seq_len, device=input_ids.device)
+        .unsqueeze(0)
+        .expand(args.batch_size, -1)
+    )
+    # TE causal attention uses attn_mask_type=causal; mask is padding-style.
+    attention_mask = None
 
-    # Warmup
+    def _compute_loss(logits, labels):
+        # Align with nano shifted next-token CE: predict labels[:,1:] from logits[:,:-1].
+        # Megatron CE is over the last dim (vocab); [B,S,Vlocal] is fine when target is [B,S].
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        return vocab_parallel_cross_entropy(shift_logits, shift_labels).mean()
+
     for _ in range(args.warmup_steps):
         logits = model(input_ids, position_ids, attention_mask)
-        # Use Megatron-LM's vocab_parallel_cross_entropy for TP
-        loss = vocab_parallel_cross_entropy(logits, input_ids)
-        loss = loss.mean()
+        loss = _compute_loss(logits, input_ids)
         loss.backward()
         model.zero_grad()
 
-    if args.device == "cuda":
-        torch.cuda.synchronize()
-
-    # Benchmark
-    torch.cuda.reset_peak_memory_stats() if args.device == "cuda" else None
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
     start_time = time.perf_counter()
 
     for _ in range(args.benchmark_steps):
         logits = model(input_ids, position_ids, attention_mask)
-        # Use Megatron-LM's vocab_parallel_cross_entropy for TP
-        loss = vocab_parallel_cross_entropy(logits, input_ids)
-        loss = loss.mean()
+        loss = _compute_loss(logits, input_ids)
         loss.backward()
         model.zero_grad()
 
-    if args.device == "cuda":
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     end_time = time.perf_counter()
 
     total_time = end_time - start_time
     avg_step_time = total_time / args.benchmark_steps
     total_tokens = args.benchmark_steps * args.batch_size * args.seq_len
     tokens_per_sec = total_tokens / total_time
-
-    memory_mb = 0.0
-    if args.device == "cuda":
-        memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
     parallel_state.destroy_model_parallel()
 
@@ -373,42 +414,50 @@ def main() -> None:
     if args.ffn_hidden_size is None:
         args.ffn_hidden_size = 4 * args.hidden_size
 
+    # Only rank 0 prints aggregate-facing lines to avoid interleaved multi-rank noise.
+    is_rank0 = int(os.environ.get("RANK", 0)) == 0
     results = []
 
     if args.framework in ["nano", "both"]:
-        print("Benchmarking nano-megatron...")
+        if is_rank0:
+            print("Benchmarking nano-megatron...", flush=True)
         try:
             nano_result = benchmark_nano_megatron(args)
             results.append(nano_result)
-            print(f"  Tokens/sec: {nano_result.tokens_per_sec:.2f}")
-            print(f"  Memory: {nano_result.memory_mb:.2f} MB")
-            print(f"  Avg step time: {nano_result.avg_step_time_ms:.2f} ms")
+            if is_rank0:
+                print(f"  Tokens/sec: {nano_result.tokens_per_sec:.2f}")
+                print(f"  Memory: {nano_result.memory_mb:.2f} MB")
+                print(f"  Avg step time: {nano_result.avg_step_time_ms:.2f} ms")
         except Exception as e:
-            print(f"  Error: {e}")
-            import traceback
-            traceback.print_exc()
+            if is_rank0:
+                print(f"  Error: {e}")
+                import traceback
+                traceback.print_exc()
+            raise
 
     if args.framework in ["megatron", "both"]:
-        print("Benchmarking Megatron-LM...")
+        if is_rank0:
+            print("Benchmarking Megatron-LM...", flush=True)
         try:
             megatron_result = benchmark_megatron(args)
             results.append(megatron_result)
-            print(f"  Tokens/sec: {megatron_result.tokens_per_sec:.2f}")
-            print(f"  Memory: {megatron_result.memory_mb:.2f} MB")
-            print(f"  Avg step time: {megatron_result.avg_step_time_ms:.2f} ms")
+            if is_rank0:
+                print(f"  Tokens/sec: {megatron_result.tokens_per_sec:.2f}")
+                print(f"  Memory: {megatron_result.memory_mb:.2f} MB")
+                print(f"  Avg step time: {megatron_result.avg_step_time_ms:.2f} ms")
         except Exception as e:
-            print(f"  Error: {e}")
-            import traceback
-            traceback.print_exc()
+            if is_rank0:
+                print(f"  Error: {e}")
+                import traceback
+                traceback.print_exc()
+            raise
 
-    if results:
-        if args.output:
+    if is_rank0:
+        if results and args.output:
             write_performance_md(results, args.output)
             print(f"\nResults written to {args.output}")
-        else:
-            print("\nNo output file specified (use --output to save results)")
-    else:
-        print("No benchmark results to write.")
+        elif not results:
+            print("No benchmark results to write.")
 
 
 if __name__ == "__main__":

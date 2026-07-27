@@ -5,6 +5,7 @@
 | Item | Value |
 |------|-------|
 | GPU | NVIDIA RTX A6000 (4x, 48GB each) |
+| Python env | `/workspace/envs/megatron` |
 | PyTorch | 2.10.0a0+a36e1d39eb.nv26.01.42222806 |
 | CUDA | 13.1 |
 | Python | 3.12.3 |
@@ -12,8 +13,6 @@
 | Precision | FP32 |
 | Batch / Seq | see each model section |
 | Warmup / Measure | 3 / 10 steps |
-
-Both frameworks use the same architecture settings per model (RoPE, SwiGLU, LayerNorm, no bias) for a fair comparison.
 
 ---
 
@@ -34,25 +33,26 @@ Both frameworks use the same architecture settings per model (RoPE, SwiGLU, Laye
 | activation | SwiGLU (silu) | SwiGLU (silu) |
 | normalization | LayerNorm | LayerNorm |
 | bias | False | False |
-| Total Parameters | ~345M | ~345M |
+| Params / rank (TP2) | 253.9M | 253.9M |
+| Params / rank (TP4) | 127.0M | 127.0M |
 
 ### TP2
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 6,345 | 19,953 | 645.56 |
-| Megatron-LM | 6,761 | 22,598 | 605.81 |
+| nano-megatron | 7,426 | 16,234 | 551.56 |
+| Megatron-LM | 7,169 | 14,775 | 571.35 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.94x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **1.04x**
 
 ### TP4
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 7,851 | 14,577 | 521.72 |
-| Megatron-LM | 10,075 | 12,322 | 406.55 |
+| nano-megatron | 10,735 | 9,772 | 381.56 |
+| Megatron-LM | 10,650 | 8,288 | 384.58 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.78x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **1.01x**
 
 ---
 
@@ -73,25 +73,26 @@ Both frameworks use the same architecture settings per model (RoPE, SwiGLU, Laye
 | activation | SwiGLU (silu) | SwiGLU (silu) |
 | normalization | LayerNorm | LayerNorm |
 | bias | False | False |
-| Total Parameters | ~760M | ~760M |
+| Params / rank (TP2) | 531.8M | 531.8M |
+| Params / rank (TP4) | 266.0M | 266.0M |
 
 ### TP2
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 4,695 | 25,778 | 872.41 |
-| Megatron-LM | 5,409 | 26,849 | 757.25 |
+| nano-megatron | 5,624 | 20,799 | 728.34 |
+| Megatron-LM | 5,605 | 19,006 | 730.78 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.87x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **1.00x**
 
 ### TP4
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 5,683 | 18,962 | 720.70 |
-| Megatron-LM | 7,806 | 14,868 | 524.73 |
+| nano-megatron | 7,841 | 12,836 | 522.40 |
+| Megatron-LM | 8,103 | 10,792 | 505.48 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.73x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **0.97x**
 
 ---
 
@@ -113,7 +114,8 @@ Both frameworks use the same architecture settings per model (RoPE, SwiGLU, Laye
 | activation | SwiGLU (silu) | SwiGLU (silu) |
 | normalization | LayerNorm | LayerNorm |
 | bias | False | False |
-| Total Parameters | ~1.3B | ~1.3B |
+| Params / rank (TP2) | 910.4M | 910.4M |
+| Params / rank (TP4) | 455.3M | 455.3M |
 
 > TP2 uses `batch_size=1` to fit A6000 48GB; TP4 uses `batch_size=2`. Tokens/sec already normalizes by batch size.
 
@@ -121,40 +123,26 @@ Both frameworks use the same architecture settings per model (RoPE, SwiGLU, Laye
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 3,555 | 17,985 | 576.01 |
-| Megatron-LM | 4,182 | 17,410 | 489.69 |
+| nano-megatron | 4,209 | 14,466 | 486.60 |
+| Megatron-LM | 4,239 | 13,611 | 483.17 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.85x**
+**Throughput Ratio**: nano-megatron / Megatron-LM = **0.99x**
 
 ### TP4
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 4,327 | 23,538 | 946.57 |
-| Megatron-LM | 5,974 | 17,627 | 685.60 |
+| nano-megatron | 5,909 | 16,099 | 693.17 |
+| Megatron-LM | 6,125 | 13,504 | 668.72 |
 
-**Throughput Ratio**: nano-megatron / Megatron-LM = **0.72x**
-
----
-
-## 5. Summary
-
-| Model | Parallel | nano-megatron | Megatron-LM | Ratio |
-|-------|----------|---------------|-------------|-------|
-| 345M | TP2 | 6,345 | 6,761 | **0.94x** |
-| 345M | TP4 | 7,851 | 10,075 | **0.78x** |
-| 760M | TP2 | 4,695 | 5,409 | **0.87x** |
-| 760M | TP4 | 5,683 | 7,806 | **0.73x** |
-| 1.3B | TP2 | 3,555 | 4,182 | **0.85x** |
-| 1.3B | TP4 | 4,327 | 5,974 | **0.72x** |
-
-Gap widens with larger TP size (TP4 vs TP2), consistent with communication and kernel-fusion differences.
+**Throughput Ratio**: nano-megatron / Megatron-LM = **0.96x**
 
 ---
 
-## 6. Reproduction
+## 5. Reproduction
 
 ```bash
+source /workspace/envs/megatron/bin/activate
 export PYTHONPATH=/path/to/nano-megatron:/path/to/Megatron-LM:$PYTHONPATH
 
 # 345M TP2

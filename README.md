@@ -6,7 +6,7 @@ Compact distributed training framework for studying Megatron-style parallelism.
 
 ## Performance
 
-On 4× RTX A6000 (FP32), nano-megatron reaches **0.72x–0.94x** of Megatron-LM throughput under matching GPT configs (345M / 760M / 1.3B, TP2 & TP4).
+On 4× RTX A6000 (FP32), nano-megatron reaches **0.96x–1.04x** of Megatron-LM throughput under matching GPT configs (345M / 760M / 1.3B, TP2 & TP4).
 
 Full tables, configs, and reproduction commands: **[performance.md](performance.md)**
 

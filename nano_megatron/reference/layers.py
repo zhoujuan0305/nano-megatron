@@ -4,6 +4,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from nano_megatron.reference.config import ReferenceGPTConfig
@@ -15,13 +16,7 @@ def layer_norm(
     bias: Tensor | None,
     eps: float,
 ) -> Tensor:
-    mean = x.mean(-1, keepdim=True)
-    var = x.var(-1, unbiased=False, keepdim=True)
-    y = (x - mean) / torch.sqrt(var + eps)
-    y = y * weight
-    if bias is not None:
-        y = y + bias
-    return y
+    return F.layer_norm(x, (x.size(-1),), weight=weight, bias=bias, eps=eps)
 
 
 def rms_norm(

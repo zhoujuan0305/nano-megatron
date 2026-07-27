@@ -10,6 +10,13 @@ from nano_megatron.parallel.context import ParallelContext
 from nano_megatron.parallel.mappings import (
     ColumnParallelLinear,
     RowParallelLinear,
+    blockwise_column_shard,
+    fused_qkv_column_shard,
+)
+from nano_megatron.parallel.vocab_parallel import (
+    VocabParallelEmbedding,
+    vocab_parallel_cross_entropy,
+    vocab_range_from_global,
 )
 from nano_megatron.reference.config import ReferenceGPTConfig
 from nano_megatron.reference.layers import (
@@ -43,6 +50,10 @@ def _validate_tp_constraints(config: ReferenceGPTConfig, tp_size: int) -> None:
         raise ValueError(
             f"ffn_hidden_size ({config.ffn_hidden_size}) not divisible by tensor_parallel_size ({tp_size})"
         )
+    if config.vocab_size % tp_size != 0:
+        raise ValueError(
+            f"vocab_size ({config.vocab_size}) not divisible by tensor_parallel_size ({tp_size})"
+        )
 
 
 class TPCausalSelfAttention(nn.Module):
@@ -65,9 +76,26 @@ class TPCausalSelfAttention(nn.Module):
         self.local_num_kv_heads = self.num_kv_heads // tp
 
         if self.config.use_fused_qkv:
-            # Fused QKV projection
+            # Fused weight is [Q; K; V]; shard each block so local layout is
+            # [Q_r; K_r; V_r] matching the forward split below.
+            q_dim = self.hidden_size
+            kv_dim = self.num_kv_heads * self.head_dim
+            w_local, b_local = fused_qkv_column_shard(
+                ref_attn.qkv_proj.weight,
+                ref_attn.qkv_proj.bias,
+                rank,
+                tp,
+                q_dim,
+                kv_dim,
+            )
             self.qkv_proj = ColumnParallelLinear(
-                ref_attn.qkv_proj.weight, ref_attn.qkv_proj.bias, rank, tp, group, backend
+                w_local,
+                b_local,
+                rank,
+                tp,
+                group,
+                backend,
+                weight_is_local=True,
             )
         else:
             # Separate Q, K, V projections
@@ -159,9 +187,20 @@ class TPMLP(nn.Module):
         self.config = ref_mlp.config
         
         if self.config.gated_linear_unit:
-            # SwiGLU: fc1 outputs 2x ffn_hidden_size for gating
+            # SwiGLU fc1 is [gate; up]; shard each half so local is [gate_r; up_r]
+            # and swiglu's chunk(2) stays correct under TP.
+            ffn = ref_mlp.fc1.weight.shape[0] // 2
+            w_local, b_local = blockwise_column_shard(
+                ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, (ffn, ffn)
+            )
             self.fc1 = ColumnParallelLinear(
-                ref_mlp.fc1.weight, ref_mlp.fc1.bias, rank, tp, group, backend
+                w_local,
+                b_local,
+                rank,
+                tp,
+                group,
+                backend,
+                weight_is_local=True,
             )
         else:
             self.fc1 = ColumnParallelLinear(
@@ -230,27 +269,66 @@ class TPGPT(nn.Module):
         super().__init__()
         _validate_tp_constraints(config, ctx.tensor_parallel_size)
         self.config = config
-        self.tok_emb = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.tok_emb.weight.data.copy_(ref.tok_emb.weight.data)
-        
+        self._tp_group = ctx.tensor_parallel_group
+        self._tp_backend = ctx.backend
+        self.vocab_start_index, self.vocab_end_index = vocab_range_from_global(
+            ctx.tensor_parallel_rank,
+            ctx.tensor_parallel_size,
+            config.vocab_size,
+        )
+        # Vocab-parallel embedding (tp=1 is a full table + identity all-reduce).
+        self.tok_emb = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            tp_rank=ctx.tensor_parallel_rank,
+            tp_size=ctx.tensor_parallel_size,
+            group=ctx.tensor_parallel_group,
+            backend=ctx.backend,
+            weight=ref.tok_emb.weight,
+        )
+
         # Only use position embedding for learned_absolute type
         if config.position_embedding_type == 'learned_absolute':
             self.pos_emb = nn.Embedding(config.max_seq_len, config.hidden_size)
             self.pos_emb.weight.data.copy_(ref.pos_emb.weight.data)
         else:
             self.pos_emb = None
-            
+
         self.blocks = nn.ModuleList(
             [TPTransformerBlock(config, ctx, rb) for rb in ref.blocks]
         )
         self.ln_f_weight = Parameter(ref.ln_f_weight.data.clone())
         self.ln_f_bias = Parameter(ref.ln_f_bias.data.clone())
         self.layernorm_eps = config.layernorm_eps
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.lm_head.weight.data.copy_(ref.lm_head.weight.data)
+        # Column-parallel LM head: local logits [B, S, V/tp], no gather in forward.
+        self.lm_head = ColumnParallelLinear(
+            ref.lm_head.weight,
+            None,
+            ctx.tensor_parallel_rank,
+            ctx.tensor_parallel_size,
+            ctx.tensor_parallel_group,
+            ctx.backend,
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
         self.to(dtype=torch.float32)
+
+    def shifted_cross_entropy(
+        self,
+        logits: Tensor,
+        labels: Tensor,
+        ignore_index: int = -100,
+    ) -> Tensor:
+        """Vocab-parallel shifted CE matching reference mean reduction."""
+        return vocab_parallel_cross_entropy(
+            logits,
+            labels,
+            vocab_start_index=self.vocab_start_index,
+            vocab_end_index=self.vocab_end_index,
+            group=self._tp_group,
+            backend=self._tp_backend,
+            ignore_index=ignore_index,
+        )
 
     def forward(
         self,
@@ -265,23 +343,23 @@ class TPGPT(nn.Module):
         if positions is None:
             positions = torch.arange(seq_len, device=input_ids.device)
             positions = positions.unsqueeze(0).expand(batch, -1)
-        
+
         # Token embedding
         x = self.tok_emb(input_ids)
-        
+
         # Position embedding (only for learned_absolute type)
         if self.pos_emb is not None:
             x = x + self.pos_emb(positions)
-        
+
         for block in self.blocks:
             x = block(x, positions=positions)
-        
+
         # Final normalization
         if self.config.normalization == 'rmsnorm':
             final_ln = rms_norm(x, self.ln_f_weight, self.layernorm_eps)
         else:
             final_ln = layer_norm(x, self.ln_f_weight, self.ln_f_bias, self.layernorm_eps)
-        
+
         return self.lm_head(final_ln)
 
 

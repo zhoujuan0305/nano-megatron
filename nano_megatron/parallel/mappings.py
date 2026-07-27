@@ -111,6 +111,65 @@ def column_shard(
     return w_local, b_local
 
 
+def blockwise_column_shard(
+    weight: Tensor,
+    bias: Tensor | None,
+    tp_rank: int,
+    tp_size: int,
+    block_sizes: tuple[int, ...],
+) -> tuple[Tensor, Tensor | None]:
+    """Shard a column-parallel weight whose rows are concatenated logical blocks.
+
+    Contiguous column_shard cuts across block boundaries. For layouts such as
+    fused QKV ``[Q; K; V]`` or SwiGLU fc1 ``[gate; up]``, each block must be
+    sharded independently so the local rows stay ``[block0_r; block1_r; ...]``.
+    """
+    out_full, _ = weight.shape
+    expected = sum(block_sizes)
+    if out_full != expected:
+        raise ValueError(
+            f"column out dim ({out_full}) != sum(block_sizes) ({expected})"
+        )
+    for i, dim in enumerate(block_sizes):
+        if dim % tp_size != 0:
+            raise ValueError(
+                f"block_sizes[{i}] ({dim}) not divisible by tp_size ({tp_size})"
+            )
+    w_parts = weight.data.split(list(block_sizes), dim=0)
+    w_local = torch.cat(
+        [
+            part[tp_rank * (dim // tp_size) : (tp_rank + 1) * (dim // tp_size)]
+            for part, dim in zip(w_parts, block_sizes)
+        ],
+        dim=0,
+    ).clone()
+    b_local: Tensor | None = None
+    if bias is not None:
+        b_parts = bias.data.split(list(block_sizes), dim=0)
+        b_local = torch.cat(
+            [
+                part[tp_rank * (dim // tp_size) : (tp_rank + 1) * (dim // tp_size)]
+                for part, dim in zip(b_parts, block_sizes)
+            ],
+            dim=0,
+        ).clone()
+    return w_local, b_local
+
+
+def fused_qkv_column_shard(
+    weight: Tensor,
+    bias: Tensor | None,
+    tp_rank: int,
+    tp_size: int,
+    q_dim: int,
+    kv_dim: int,
+) -> tuple[Tensor, Tensor | None]:
+    """Shard fused QKV weight laid out as [Q; K; V] into [Q_r; K_r; V_r]."""
+    return blockwise_column_shard(
+        weight, bias, tp_rank, tp_size, (q_dim, kv_dim, kv_dim)
+    )
+
+
 def row_shard(
     weight: Tensor, bias: Tensor | None, tp_rank: int, tp_size: int
 ) -> tuple[Tensor, Tensor | None]:
@@ -134,9 +193,15 @@ class ColumnParallelLinear(nn.Module):
         tp_size: int,
         group: Any,
         backend: CommBackend,
+        *,
+        weight_is_local: bool = False,
     ) -> None:
         super().__init__()
-        w_local, b_local = column_shard(weight, bias, tp_rank, tp_size)
+        if weight_is_local:
+            w_local = weight.data.clone()
+            b_local = bias.data.clone() if bias is not None else None
+        else:
+            w_local, b_local = column_shard(weight, bias, tp_rank, tp_size)
         self.weight = nn.Parameter(w_local)
         self.bias = nn.Parameter(b_local) if b_local is not None else None
         self.tp_rank = tp_rank
