@@ -60,5 +60,11 @@ class TorchDistBackend:
         dist.recv(tensor, src, group=group)
         return tensor
 
+    def broadcast(
+        self, tensor: Tensor, src: int, *, group: Any | None = None
+    ) -> Tensor:
+        dist.broadcast(tensor, src=src, group=group)
+        return tensor
+
     def barrier(self, *, group: Any | None = None) -> None:
         dist.barrier(group=group)

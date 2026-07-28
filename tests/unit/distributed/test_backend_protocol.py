@@ -72,3 +72,27 @@ def test_all_reduce_async_returns_work(monkeypatch):
     # Drain the async work so other tests start from a clean state.
     out.wait()
     monkeypatch.undo()
+
+
+def test_broadcast_method_exists():
+    backend: CommBackend = TorchDistBackend()
+    assert hasattr(backend, "broadcast")
+    assert callable(backend.broadcast)
+
+
+def test_broadcast_calls_dist_broadcast(monkeypatch):
+    import torch.distributed as dist
+
+    captured = {}
+
+    def fake_broadcast(tensor, src, group=None):
+        captured["src"] = src
+        captured["group"] = group
+        return None
+
+    monkeypatch.setattr(dist, "broadcast", fake_broadcast)
+    backend = TorchDistBackend()
+    t = torch.ones(3, dtype=torch.float32)
+    out = backend.broadcast(t, src=0, group=None)
+    assert captured["src"] == 0
+    assert out is t
