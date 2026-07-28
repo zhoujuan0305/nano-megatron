@@ -43,7 +43,25 @@ class GradBucket:
         self._ready.add(idx)
         return len(self._ready) == len(self._params)
 
-    def sync(self, backend: CommBackend, group: Any, dp_size: int) -> None:
+    def sync(
+        self,
+        backend: CommBackend,
+        group: Any,
+        dp_size: int,
+        *,
+        group_size: int | None = None,
+    ) -> None:
+        """All-reduce grads then mean-divide.
+
+        *dp_size* is the historical name for the mean divisor (typically
+        ``data_parallel_size``).  *group_size* is the communication group
+        size used only to decide whether to skip the collective.  When
+        *group_size* is ``None``, it defaults to *dp_size* (pure-DP
+        backward compatible).
+
+        Pure CP (``dp_size=1``, ``group_size=cp_size>1``) still all-reduces
+        over the DP×CP group and divides by 1.
+        """
         if self._coalesced:
             return
         missing = [i for i, p in enumerate(self._params) if p.grad is None]
@@ -52,9 +70,15 @@ class GradBucket:
                 f"GradBucket.sync: {len(missing)} parameter(s) have grad=None "
                 f"(unused params not supported)"
             )
-        if dp_size < 1:
-            raise ValueError(f"dp_size must be >= 1, got {dp_size}")
-        if dp_size == 1:
+        mean_divisor = dp_size
+        if group_size is None:
+            group_size = mean_divisor
+        if mean_divisor < 1 or group_size < 1:
+            raise ValueError(
+                f"mean_divisor and group_size must be >= 1, "
+                f"got mean_divisor={mean_divisor}, group_size={group_size}"
+            )
+        if group_size == 1:
             self._coalesced = True
             return
 
@@ -67,7 +91,7 @@ class GradBucket:
             flat[offset : offset + n].copy_(g.reshape(-1))
             offset += n
         backend.all_reduce(flat, group=group, op="sum")
-        flat.div_(dp_size)
+        flat.div_(mean_divisor)
         offset = 0
         for p in self._params:
             g = p.grad

@@ -64,5 +64,7 @@ def test_causal_mask_upper_is_neg_inf():
     k = torch.randn(1, 2, 2, 4)
     scores = causal_attn_scores(q, k, scale=1.0)
     assert scores.shape == (1, 2, 2, 2)
-    assert torch.isneginf(scores[..., 0, 1]).all()
-    assert not torch.isneginf(scores[..., 1, 0]).any()
+    # dtype.min (not -inf) keeps bf16/fp16 scores in-dtype for matmul.
+    neg = torch.finfo(scores.dtype).min
+    assert torch.equal(scores[..., 0, 1], torch.full_like(scores[..., 0, 1], neg))
+    assert not (scores[..., 1, 0] == neg).any()

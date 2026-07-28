@@ -7,6 +7,12 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 
 from nano_megatron.parallel.context import ParallelContext
+from nano_megatron.parallel.context_parallel import (
+    causal_attn_scores_cp,
+    gather_from_context_parallel_region,
+    local_sequence_range,
+    scatter_to_context_parallel_region,
+)
 from nano_megatron.parallel.mappings import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -67,7 +73,11 @@ class TPCausalSelfAttention(nn.Module):
         backend = ctx.backend
         sp = ctx.sequence_parallel
         self.config = ref_attn.config
-        
+        self._cp_rank = ctx.context_parallel_rank
+        self._cp_size = ctx.context_parallel_size
+        self._cp_group = ctx.context_parallel_group
+        self._cp_backend = ctx.backend
+
         # Support GQA (Group Query Attention)
         self.num_heads = ref_attn.num_heads
         self.num_kv_heads = ref_attn.num_kv_heads
@@ -198,9 +208,35 @@ class TPCausalSelfAttention(nn.Module):
         k = self._repeat_kv(k, self.num_heads_per_group)
         v = self._repeat_kv(v, self.num_heads_per_group)
 
-        scores = causal_attn_scores(q, k, scale=self.scale)
-        probs = softmax_last(scores)
-        context = torch.matmul(probs, v)
+        # CP: all-gather KV along sequence so each rank attends over full keys
+        # with a shifted causal mask for its local query shard.
+        if self._cp_size > 1:
+            k_full = gather_from_context_parallel_region(
+                k,
+                self._cp_group,
+                self._cp_backend,
+                self._cp_rank,
+                self._cp_size,
+                seq_dim=2,
+            )
+            v_full = gather_from_context_parallel_region(
+                v,
+                self._cp_group,
+                self._cp_backend,
+                self._cp_rank,
+                self._cp_size,
+                seq_dim=2,
+            )
+            query_start = self._cp_rank * q.size(2)
+            scores = causal_attn_scores_cp(
+                q, k_full, scale=self.scale, query_start=query_start
+            )
+            probs = softmax_last(scores)
+            context = torch.matmul(probs, v_full)
+        else:
+            scores = causal_attn_scores(q, k, scale=self.scale)
+            probs = softmax_last(scores)
+            context = torch.matmul(probs, v)
         attn_out = self.out_proj(self._merge_heads(context))
         return attn_out
 
@@ -327,6 +363,10 @@ class TPGPT(nn.Module):
         self._sequence_parallel = ctx.sequence_parallel
         self._tp_rank = ctx.tensor_parallel_rank
         self._tp_size = ctx.tensor_parallel_size
+        self._cp_rank = ctx.context_parallel_rank
+        self._cp_size = ctx.context_parallel_size
+        self._cp_group = ctx.context_parallel_group
+        self._cp_backend = ctx.backend
         self.vocab_start_index, self.vocab_end_index = vocab_range_from_global(
             ctx.tensor_parallel_rank,
             ctx.tensor_parallel_size,
@@ -384,7 +424,23 @@ class TPGPT(nn.Module):
         labels: Tensor,
         ignore_index: int = -100,
     ) -> Tensor:
-        """Vocab-parallel shifted CE matching reference mean reduction."""
+        """Vocab-parallel shifted CE matching reference mean reduction.
+
+        Under CP, local logits are all-gathered along the sequence dim first.
+        ``labels`` must be the full ``[B, S]`` sequence (not CP-sharded).
+        """
+        if self._cp_size > 1:
+            # Every CP rank computes the same global-mean CE on full logits, so
+            # dL/dlogits_full is identical; backward must split (not sum).
+            logits = gather_from_context_parallel_region(
+                logits,
+                self._cp_group,
+                self._cp_backend,
+                self._cp_rank,
+                self._cp_size,
+                seq_dim=1,
+                grad_op="split",
+            )
         return vocab_parallel_cross_entropy(
             logits,
             labels,
@@ -414,6 +470,11 @@ class TPGPT(nn.Module):
                 f"seq_len ({seq_len}) must be divisible by tensor_parallel_size "
                 f"({self._tp_size}) when sequence_parallel is enabled"
             )
+        if self._cp_size > 1 and seq_len % self._cp_size != 0:
+            raise ValueError(
+                f"seq_len ({seq_len}) must be divisible by context_parallel_size "
+                f"({self._cp_size})"
+            )
 
         # Token embedding
         x = self.tok_emb(input_ids)
@@ -432,6 +493,21 @@ class TPGPT(nn.Module):
                 self._tp_rank,
                 self._tp_size,
             )
+        elif self._cp_size > 1:
+            # CP: shard activations along sequence; keep global position indices
+            # for RoPE (local slice of the full arange / caller positions).
+            x = scatter_to_context_parallel_region(
+                x,
+                self._cp_group,
+                self._cp_backend,
+                self._cp_rank,
+                self._cp_size,
+                seq_dim=1,
+            )
+            start, end = local_sequence_range(
+                self._cp_rank, self._cp_size, seq_len
+            )
+            positions = positions[:, start:end]
 
         for block in self.blocks:
             x = block(x, positions=positions)

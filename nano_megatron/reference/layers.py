@@ -59,8 +59,8 @@ def apply_rotary_emb(
     # x: [B, H, S, D], freqs: [B, S, D/2]
     # Reshape freqs to broadcast with x
     # freqs: [B, S, D/2] -> [B, 1, S, D/2]
-    freqs = freqs.unsqueeze(1)
-    
+    freqs = freqs.to(dtype=x.dtype).unsqueeze(1)
+
     cos = torch.cos(freqs)  # [B, 1, S, D/2]
     sin = torch.sin(freqs)  # [B, 1, S, D/2]
     
@@ -105,7 +105,7 @@ def causal_attn_scores(q: Tensor, k: Tensor, scale: float) -> Tensor:
         torch.ones(seq_len, seq_len, device=scores.device, dtype=torch.bool),
         diagonal=1,
     )
-    scores = scores.masked_fill(causal_mask, float("-inf"))
+    scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
     return scores
 
 

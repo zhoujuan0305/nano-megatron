@@ -38,6 +38,14 @@ class ParallelConfig:
 
     def validate(self, world_size: int) -> None:
         self._check_positive_sizes()
+        if self.sequence_parallel and self.context_parallel_size > 1:
+            raise ValueError(
+                "sequence_parallel is not supported with context_parallel_size > 1"
+            )
+        if self.pipeline_parallel_size > 1 and self.context_parallel_size > 1:
+            raise ValueError(
+                "pipeline_parallel is not supported with context_parallel_size > 1"
+            )
         dp = self.resolved_data_parallel_size(world_size)
         product = self.product_without_dp() * dp
         if product != world_size:

@@ -32,8 +32,15 @@ class DistributedDataParallel(nn.Module):
         self.add_module("module", module)
         self._ctx = ctx
         self._backend: CommBackend = ctx.backend
-        self._dp_group = ctx.data_parallel_group
-        self._dp_size = ctx.data_parallel_size
+        # Sync over DP×CP so CP partial weight grads are summed.  Mean-divide
+        # by data_parallel_size only: with global-mean loss, CP shards' weight
+        # grads already sum (not average) to the full-sequence gradient.
+        # group_size must be dp*cp so pure CP (dp=1, cp>1) still all-reduces.
+        self._dp_group = ctx.data_context_parallel_group
+        self._mean_divisor = ctx.data_parallel_size
+        self._sync_group_size = (
+            ctx.data_parallel_size * ctx.context_parallel_size
+        )
         self._buckets: list[GradBucket] = build_buckets(module, bucket_cap_mb)
         self._param_to_bucket: dict[nn.Parameter, GradBucket] = {
             p: bucket for bucket in self._buckets for p in bucket.params
@@ -71,8 +78,13 @@ class DistributedDataParallel(nn.Module):
 
     def _broadcast_params(self) -> None:
         device = self._param_device()
+        # Leader is the rank with dp_rank==0 and cp_rank==0 in this DP×CP group.
+        is_leader = (
+            self._ctx.data_parallel_rank == 0
+            and self._ctx.context_parallel_rank == 0
+        )
         leader = torch.tensor(
-            [self._ctx.rank if self._ctx.data_parallel_rank == 0 else -1],
+            [self._ctx.rank if is_leader else -1],
             dtype=torch.long,
             device=device,
         )
@@ -94,7 +106,12 @@ class DistributedDataParallel(nn.Module):
         # New grads this iteration — allow finish_grad_sync to run again.
         self._sync_done = False
         if bucket.mark_ready(param):
-            bucket.sync(self._backend, self._dp_group, self._dp_size)
+            bucket.sync(
+                self._backend,
+                self._dp_group,
+                self._mean_divisor,
+                group_size=self._sync_group_size,
+            )
 
     def _register_grad_hooks(self) -> None:
         use_post_accumulate = hasattr(
@@ -162,7 +179,12 @@ class DistributedDataParallel(nn.Module):
                     f"finish_grad_sync rank={self._ctx.rank}: "
                     f"missing grads for {names}"
                 )
-            bucket.sync(self._backend, self._dp_group, self._dp_size)
+            bucket.sync(
+                self._backend,
+                self._dp_group,
+                self._mean_divisor,
+                group_size=self._sync_group_size,
+            )
         for bucket in self._buckets:
             bucket.reset()
         self._sync_done = True

@@ -86,12 +86,44 @@ def test_mark_ready_and_sync_mean():
 
 
 def test_sync_dp_size_one_noop():
+    """group_size defaults to dp_size; both 1 → skip collective."""
     p = nn.Parameter(torch.zeros(2))
     p.grad = torch.tensor([1.0, 2.0])
     bucket = GradBucket([p])
     backend = _FakeBackend()
     bucket.mark_ready(p)
     bucket.sync(backend, group=None, dp_size=1)
+    assert len(backend.calls) == 0
+    assert torch.equal(p.grad, torch.tensor([1.0, 2.0]))
+    assert bucket.coalesced is True
+
+
+def test_sync_pure_cp_mean_divisor_one_still_all_reduces():
+    """Pure CP: mean_divisor=1, group_size=2 still all-reduces and /1.
+
+    With dp=1 and cp=2 the DP×CP group has size 2, so grads must be summed
+    across CP ranks.  Mean-divide stays 1 (global-mean loss already accounts
+    for the full sequence via split-grad gather).
+    """
+    p = nn.Parameter(torch.zeros(2))
+    p.grad = torch.tensor([1.0, 2.0])
+    bucket = GradBucket([p])
+    backend = _FakeBackend()  # doubles on all_reduce (simulates 2-rank sum)
+    bucket.mark_ready(p)
+    bucket.sync(backend, group=None, dp_size=1, group_size=2)
+    # all_reduce *2, then / mean_divisor=1 → doubled
+    assert torch.equal(p.grad, torch.tensor([2.0, 4.0]))
+    assert bucket.coalesced is True
+    assert len(backend.calls) == 1
+
+
+def test_sync_group_size_one_skips_even_if_mean_divisor_larger():
+    """Skip is gated on group_size, not mean_divisor alone."""
+    p = nn.Parameter(torch.zeros(2))
+    p.grad = torch.tensor([1.0, 2.0])
+    bucket = GradBucket([p])
+    backend = _FakeBackend()
+    bucket.sync(backend, group=None, dp_size=2, group_size=1)
     assert len(backend.calls) == 0
     assert torch.equal(p.grad, torch.tensor([1.0, 2.0]))
     assert bucket.coalesced is True
@@ -106,6 +138,23 @@ def test_sync_raises_if_grad_missing():
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "grad" in str(e).lower()
+
+
+def test_sync_raises_invalid_sizes():
+    p = nn.Parameter(torch.zeros(2))
+    p.grad = torch.ones(2)
+    bucket = GradBucket([p])
+    backend = _FakeBackend()
+    try:
+        bucket.sync(backend, group=None, dp_size=0)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "mean_divisor" in str(e) or "group_size" in str(e)
+    try:
+        bucket.sync(backend, group=None, dp_size=1, group_size=0)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "group_size" in str(e) or "mean_divisor" in str(e)
 
 
 def test_reset_clears_state():

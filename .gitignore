@@ -12,3 +12,4 @@ docs/
 *.pt
 !tests/**/fixtures/*.pt
 .worktrees/
+sdd

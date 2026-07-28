@@ -1,4 +1,10 @@
 from nano_megatron.parallel.config import ParallelConfig
+from nano_megatron.parallel.context_parallel import (
+    causal_attn_scores_cp,
+    gather_from_context_parallel_region,
+    local_sequence_range,
+    scatter_to_context_parallel_region,
+)
 from nano_megatron.parallel.context import (
     ParallelContext,
     destroy_parallel,
@@ -38,9 +44,11 @@ __all__ = [
     "RowParallelLinear",
     "VocabParallelEmbedding",
     "blockwise_column_shard",
+    "causal_attn_scores_cp",
     "column_shard",
     "destroy_parallel",
     "fused_qkv_column_shard",
+    "gather_from_context_parallel_region",
     "gather_from_sequence_parallel_region",
     "generate_masked_orthogonal_rank_groups",
     "get_parallel_context",
@@ -48,10 +56,12 @@ __all__ = [
     "is_parallel_initialized",
     "is_pipeline_first_stage",
     "is_pipeline_last_stage",
+    "local_sequence_range",
     "pipeline_next_rank",
     "pipeline_prev_rank",
     "reduce_scatter_to_sequence_parallel_region",
     "row_shard",
+    "scatter_to_context_parallel_region",
     "scatter_to_sequence_parallel_region",
     "vocab_parallel_cross_entropy",
     "vocab_range_from_global",

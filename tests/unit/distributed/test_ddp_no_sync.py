@@ -25,6 +25,9 @@ def _make_ctx(backend, dp_size=2):
         data_parallel_rank=0,
         data_parallel_size=dp_size,
         data_parallel_group="dp",
+        context_parallel_rank=0,
+        context_parallel_size=1,
+        data_context_parallel_group="dp_cp",
         backend=backend,
     )
 
