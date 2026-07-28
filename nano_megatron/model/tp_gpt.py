@@ -24,6 +24,7 @@ from nano_megatron.parallel.mappings import (
 from nano_megatron.parallel.vocab_parallel import (
     VocabParallelEmbedding,
     vocab_parallel_cross_entropy,
+    vocab_parallel_cross_entropy_from_shifted,
     vocab_range_from_global,
 )
 from nano_megatron.reference.config import ReferenceGPTConfig
@@ -426,30 +427,67 @@ class TPGPT(nn.Module):
     ) -> Tensor:
         """Vocab-parallel shifted CE matching reference mean reduction.
 
-        Under CP, local logits are all-gathered along the sequence dim first.
         ``labels`` must be the full ``[B, S]`` sequence (not CP-sharded).
+        Under CP, logits stay local ``[B, S_loc, V]``; each rank scores only its
+        local prediction pairs and scales the sum so DDP mean over the DP×CP
+        group recovers full-sequence mean-CE gradients.
         """
-        if self._cp_size > 1:
-            # Every CP rank computes the same global-mean CE on full logits, so
-            # dL/dlogits_full is identical; backward must split (not sum).
-            logits = gather_from_context_parallel_region(
+        if self._cp_size == 1:
+            return vocab_parallel_cross_entropy(
                 logits,
-                self._cp_group,
-                self._cp_backend,
-                self._cp_rank,
-                self._cp_size,
-                seq_dim=1,
-                grad_op="split",
+                labels,
+                vocab_start_index=self.vocab_start_index,
+                vocab_end_index=self.vocab_end_index,
+                group=self._tp_group,
+                backend=self._tp_backend,
+                ignore_index=ignore_index,
             )
-        return vocab_parallel_cross_entropy(
-            logits,
-            labels,
+
+        if logits.dim() != 3:
+            raise ValueError(
+                f"expected logits [B, S_loc, V], got shape {tuple(logits.shape)}"
+            )
+        if labels.dim() != 2 or labels.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"labels shape {tuple(labels.shape)} incompatible with logits "
+                f"{tuple(logits.shape)}"
+            )
+        local_seq = logits.shape[1]
+        full_seq = local_seq * self._cp_size
+        if labels.shape[1] != full_seq:
+            raise ValueError(
+                f"labels seq_len ({labels.shape[1]}) must equal full sequence "
+                f"({full_seq}) under CP; CP-local labels are not supported"
+            )
+
+        start, end = local_sequence_range(
+            self._cp_rank, self._cp_size, full_seq
+        )
+        # Global i uses local logit[:, i - start] and labels[:, i + 1] for
+        # i in [start, end) with i < S - 1 (standard shifted CE).
+        pred_end = min(end, full_seq - 1)
+        if start >= pred_end:
+            return logits.sum() * 0.0
+
+        shift_logits = logits[:, : pred_end - start, :].contiguous()
+        shift_labels = labels[:, start + 1 : pred_end + 1].contiguous()
+        local_sum = vocab_parallel_cross_entropy_from_shifted(
+            shift_logits,
+            shift_labels,
             vocab_start_index=self.vocab_start_index,
             vocab_end_index=self.vocab_end_index,
             group=self._tp_group,
             backend=self._tp_backend,
             ignore_index=ignore_index,
+            reduction="sum",
         )
+        global_valid = (labels[:, 1:] != ignore_index).sum().to(
+            dtype=local_sum.dtype
+        )
+        if global_valid.item() == 0:
+            return local_sum * 0.0
+        # Local shard only; *cp_size offsets DDP mean over the DP×CP group.
+        return local_sum * float(self._cp_size) / global_valid
 
     def forward(
         self,

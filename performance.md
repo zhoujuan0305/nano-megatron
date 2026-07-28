@@ -18,7 +18,7 @@
 | DP note | micro-batch per DP rank; global tok/s = local × dp_size |
 | PP note | non-interleaved 1F1B; local_bs = sum of microbatches; tok/s = local_bs × seq / wall (× dp if DP) |
 | PP P2P | nano: sync `send`/`recv`; Megatron: schedule P2P (TE kernels on Megatron path) |
-| CP note | nano: contiguous all-gather KV; Megatron: TE FlashAttention + zigzag pack; `seq_len % (2·cp) == 0`; tok/s = batch × seq × dp / wall (CP does not multiply data) |
+| CP note | nano: contiguous all-gather KV, local CE, single-buffer AG; Megatron: TE FlashAttention + zigzag pack; `seq_len % (2·cp) == 0`; tok/s = batch × seq × dp / wall (CP does not multiply data) |
 | CP precision | Megatron TE CP requires bf16/fp16; CP tables use **BF16 on both sides** for a fair comparison |
 | DP / PP / CP memory | nano and Megatron run in **separate torchrun processes** (no in-process `--framework both`) |
 | Env | `CUDA_DEVICE_MAX_CONNECTIONS=1` (recommended for Megatron TP/SP/DP/PP/CP) |
@@ -142,43 +142,43 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/be
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 12,663 | 9,209 | 323.45 |
+| nano-megatron | 13,408 | 7,809 | 305.49 |
 | Megatron-LM | 25,678 | 5,765 | 159.52 |
 
-**Throughput Ratio** (nano / Megatron): **0.49x**  
-**Memory Ratio** (nano / Megatron): **1.60x**
+**Throughput Ratio** (nano / Megatron): **0.52x**  
+**Memory Ratio** (nano / Megatron): **1.35x**
 
 ### CP4 (tp=1, BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 15,056 | 6,289 | 272.04 |
+| nano-megatron | 17,018 | 4,691 | 240.69 |
 | Megatron-LM | 19,515 | 3,863 | 209.89 |
 
-**Throughput Ratio** (nano / Megatron): **0.77x**  
-**Memory Ratio** (nano / Megatron): **1.63x**
+**Throughput Ratio** (nano / Megatron): **0.87x**  
+**Memory Ratio** (nano / Megatron): **1.21x**
 
 ### TP2×CP2 (BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 18,138 | 5,047 | 225.83 |
+| nano-megatron | 19,656 | 4,347 | 208.38 |
 | Megatron-LM | 30,458 | 3,109 | 134.48 |
 
-**Throughput Ratio** (nano / Megatron): **0.60x**  
-**Memory Ratio** (nano / Megatron): **1.62x**
+**Throughput Ratio** (nano / Megatron): **0.65x**  
+**Memory Ratio** (nano / Megatron): **1.40x**
 
 ### CP2×DP2 (BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
 |-----------|--------------------|---------------------|-------------|-------------------|
-| nano-megatron | 11,303 | 22,607 | 9,209 | 362.37 |
+| nano-megatron | 11,976 | 23,953 | 7,809 | 342.00 |
 | Megatron-LM | 20,773 | 41,546 | 5,765 | 197.18 |
 
-**Throughput Ratio** (nano / Megatron, global): **0.54x**  
-**Memory Ratio** (nano / Megatron): **1.60x**
+**Throughput Ratio** (nano / Megatron, global): **0.58x**  
+**Memory Ratio** (nano / Megatron): **1.35x**
 
-> CP section is **BF16** (Megatron TE FlashAttention CP requires half precision). nano uses contiguous all-gather KV; Megatron uses zigzag CP packing + TE kernels. Gap is expected until nano adds ring/Flash CP kernels.
+> CP section is **BF16** (Megatron TE FlashAttention CP requires half precision). nano: contiguous AG KV + local CE + single-buffer AG; Megatron: zigzag CP + TE kernels. Gap expected until ring/Flash CP.
 
 ---
 
@@ -295,41 +295,41 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/be
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 9,126 | 11,723 | 448.85 |
+| nano-megatron | 9,539 | 10,401 | 429.39 |
 | Megatron-LM | 15,003 | 9,287 | 273.01 |
 
-**Throughput Ratio** (nano / Megatron): **0.61x**  
-**Memory Ratio** (nano / Megatron): **1.26x**
+**Throughput Ratio** (nano / Megatron): **0.64x**  
+**Memory Ratio** (nano / Megatron): **1.12x**
 
 ### CP4 (tp=1, BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 10,013 | 8,195 | 409.06 |
+| nano-megatron | 10,892 | 6,740 | 376.07 |
 | Megatron-LM | 13,446 | 6,735 | 304.63 |
 
-**Throughput Ratio** (nano / Megatron): **0.74x**  
-**Memory Ratio** (nano / Megatron): **1.22x**
+**Throughput Ratio** (nano / Megatron): **0.81x**  
+**Memory Ratio** (nano / Megatron): **1.00x**
 
 ### TP2×CP2 (BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 12,629 | 6,518 | 324.33 |
+| nano-megatron | 13,224 | 5,854 | 309.74 |
 | Megatron-LM | 18,991 | 4,961 | 215.68 |
 
-**Throughput Ratio** (nano / Megatron): **0.67x**  
-**Memory Ratio** (nano / Megatron): **1.31x**
+**Throughput Ratio** (nano / Megatron): **0.70x**  
+**Memory Ratio** (nano / Megatron): **1.18x**
 
 ### CP2×DP2 (BF16, batch=2, seq=2048)
 
 | Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
 |-----------|--------------------|---------------------|-------------|-------------------|
-| nano-megatron | 7,729 | 15,458 | 11,724 | 529.94 |
+| nano-megatron | 8,007 | 16,015 | 10,400 | 511.53 |
 | Megatron-LM | 11,558 | 23,116 | 9,287 | 354.38 |
 
-**Throughput Ratio** (nano / Megatron, global): **0.67x**  
-**Memory Ratio** (nano / Megatron): **1.26x**
+**Throughput Ratio** (nano / Megatron, global): **0.69x**  
+**Memory Ratio** (nano / Megatron): **1.12x**
 
 ---
 
@@ -449,40 +449,40 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/be
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 5,532 | 10,922 | 370.18 |
+| nano-megatron | 5,665 | 10,922 | 361.55 |
 | Megatron-LM | 7,754 | 10,092 | 264.11 |
 
-**Throughput Ratio** (nano / Megatron): **0.71x**  
+**Throughput Ratio** (nano / Megatron): **0.73x**  
 **Memory Ratio** (nano / Megatron): **1.08x**
 
 ### CP4 (tp=1, BF16, batch=1, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 4,638 | 10,677 | 441.54 |
+| nano-megatron | 4,797 | 10,677 | 426.90 |
 | Megatron-LM | 5,432 | 8,628 | 377.05 |
 
-**Throughput Ratio** (nano / Megatron): **0.85x**  
+**Throughput Ratio** (nano / Megatron): **0.88x**  
 **Memory Ratio** (nano / Megatron): **1.24x**
 
 ### TP2×CP2 (BF16, batch=1, seq=2048)
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 6,709 | 5,663 | 305.25 |
+| nano-megatron | 6,912 | 5,663 | 296.29 |
 | Megatron-LM | 8,497 | 5,267 | 241.03 |
 
-**Throughput Ratio** (nano / Megatron): **0.79x**  
+**Throughput Ratio** (nano / Megatron): **0.81x**  
 **Memory Ratio** (nano / Megatron): **1.08x**
 
 ### CP2×DP2 (BF16, batch=1, seq=2048)
 
 | Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
 |-----------|--------------------|---------------------|-------------|-------------------|
-| nano-megatron | 3,979 | 7,959 | 10,922 | 514.66 |
+| nano-megatron | 4,063 | 8,127 | 10,922 | 504.02 |
 | Megatron-LM | 5,076 | 10,152 | 10,092 | 403.48 |
 
-**Throughput Ratio** (nano / Megatron, global): **0.78x**  
+**Throughput Ratio** (nano / Megatron, global): **0.80x**  
 **Memory Ratio** (nano / Megatron): **1.08x**
 
 ---

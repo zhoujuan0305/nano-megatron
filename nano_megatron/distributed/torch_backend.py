@@ -53,6 +53,16 @@ class TorchDistBackend:
         dist.all_gather(tensor_list, tensor, group=group)
         return tensor_list
 
+    def all_gather_into_tensor(
+        self,
+        output: Tensor,
+        input: Tensor,
+        *,
+        group: Any | None = None,
+    ) -> Tensor:
+        dist.all_gather_into_tensor(output, input, group=group)
+        return output
+
     def send(self, tensor: Tensor, dst: int, *, group: Any | None = None) -> None:
         dist.send(tensor, dst, group=group)
 

@@ -32,15 +32,14 @@ class DistributedDataParallel(nn.Module):
         self.add_module("module", module)
         self._ctx = ctx
         self._backend: CommBackend = ctx.backend
-        # Sync over DP×CP so CP partial weight grads are summed.  Mean-divide
-        # by data_parallel_size only: with global-mean loss, CP shards' weight
-        # grads already sum (not average) to the full-sequence gradient.
+        # Sync over DP×CP.  Local-CE under CP scales loss by cp_size so that
+        # mean (not sum) over the full DP×CP group recovers full-sequence grads.
         # group_size must be dp*cp so pure CP (dp=1, cp>1) still all-reduces.
         self._dp_group = ctx.data_context_parallel_group
-        self._mean_divisor = ctx.data_parallel_size
-        self._sync_group_size = (
+        self._mean_divisor = (
             ctx.data_parallel_size * ctx.context_parallel_size
         )
+        self._sync_group_size = self._mean_divisor
         self._buckets: list[GradBucket] = build_buckets(module, bucket_cap_mb)
         self._param_to_bucket: dict[nn.Parameter, GradBucket] = {
             p: bucket for bucket in self._buckets for p in bucket.params

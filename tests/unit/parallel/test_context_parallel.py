@@ -318,3 +318,127 @@ def test_local_sequence_range_invalid_cp_rank():
     # cp_size < 1 is a separate check
     with pytest.raises(ValueError, match="cp_size must be >= 1"):
         local_sequence_range(0, 0, 8)
+
+
+# ---------------------------------------------------------------------------
+# gather forward: single-buffer all_gather_into_tensor (no list+cat)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGatherBackend:
+    """Mock backend: records gather API usage and fills output for cp_size>1."""
+
+    def __init__(self, shards: list[torch.Tensor]):
+        self.shards = shards
+        self.into_calls: list[dict] = []
+        self.list_all_gather_calls: list[dict] = []
+
+    def all_gather_into_tensor(self, output, input, *, group=None):
+        self.into_calls.append(
+            {"output": output, "input": input, "group": group}
+        )
+        # Simulate multi-rank gather into a single buffer along dim 0.
+        # Avoid torch.cat so tests can assert the production path never cats.
+        offset = 0
+        for shard in self.shards:
+            n = shard.size(0)
+            output[offset : offset + n].copy_(shard)
+            offset += n
+        if offset != output.size(0):
+            raise AssertionError(
+                f"mock filled {offset} rows but output has {output.size(0)}"
+            )
+        return output
+
+    def all_gather(self, tensor_list, tensor, *, group=None):
+        self.list_all_gather_calls.append(
+            {"tensor_list": tensor_list, "tensor": tensor, "group": group}
+        )
+        raise AssertionError(
+            "gather forward must use all_gather_into_tensor, not list all_gather"
+        )
+
+    def reduce_scatter(self, output, input_list, *, group=None, op="sum"):
+        raise AssertionError("not used in forward gather test")
+
+
+def test_gather_forward_uses_all_gather_into_tensor_no_cat(monkeypatch):
+    """cp_size>1 gather must use single-buffer all_gather_into_tensor, not list+cat."""
+    from nano_megatron.parallel.context_parallel import (
+        _GatherFromContextParallelRegion,
+    )
+
+    cp_size = 2
+    seq_dim = 1
+    # Local shards as they would appear on each rank before gather (seq on dim 1).
+    shard0 = torch.arange(0, 8, dtype=torch.float32).view(1, 4, 2)
+    shard1 = torch.arange(100, 108, dtype=torch.float32).view(1, 4, 2)
+    # After movedim(seq_dim→0), shards are [S_loc, B, ...] for mock fill along dim 0.
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+    backend = _RecordingGatherBackend(shards_dim0)
+
+    cat_calls: list[tuple] = []
+    real_cat = torch.cat
+
+    def tracking_cat(*args, **kwargs):
+        cat_calls.append((args, kwargs))
+        return real_cat(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", tracking_cat)
+
+    expected = real_cat([shard0, shard1], dim=seq_dim)
+
+    # Rank 0 local input
+    x = shard0.clone()
+    out = _GatherFromContextParallelRegion.apply(
+        x, None, backend, 0, cp_size, seq_dim, "reduce_scatter"
+    )
+
+    assert len(backend.list_all_gather_calls) == 0, (
+        "list all_gather must not be used on gather forward path"
+    )
+    assert len(backend.into_calls) == 1, (
+        f"expected one all_gather_into_tensor call, got {len(backend.into_calls)}"
+    )
+    call = backend.into_calls[0]
+    # Output buffer first dim is cp_size * local_seq
+    assert call["output"].shape[0] == cp_size * shard0.size(seq_dim)
+    assert call["input"].shape[0] == shard0.size(seq_dim)
+    assert call["input"].is_contiguous()
+
+    assert torch.equal(out, expected)
+    assert cat_calls == [], (
+        f"torch.cat must not be used on gather forward path, calls={cat_calls!r}"
+    )
+
+
+def test_gather_forward_into_tensor_seq_dim_2(monkeypatch):
+    """Single-buffer gather works when sequence is on dim 2 ([B, H, S, D])."""
+    from nano_megatron.parallel.context_parallel import (
+        _GatherFromContextParallelRegion,
+    )
+
+    cp_size = 2
+    seq_dim = 2
+    shard0 = torch.arange(0, 16, dtype=torch.float32).view(1, 2, 4, 2)
+    shard1 = torch.arange(200, 216, dtype=torch.float32).view(1, 2, 4, 2)
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+    backend = _RecordingGatherBackend(shards_dim0)
+
+    real_cat = torch.cat
+    cat_calls: list = []
+
+    def tracking_cat(*args, **kwargs):
+        cat_calls.append(True)
+        return real_cat(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", tracking_cat)
+
+    expected = real_cat([shard0, shard1], dim=seq_dim)
+    out = _GatherFromContextParallelRegion.apply(
+        shard0.clone(), None, backend, 0, cp_size, seq_dim, "split"
+    )
+    assert len(backend.into_calls) == 1
+    assert len(backend.list_all_gather_calls) == 0
+    assert torch.equal(out, expected)
+    assert cat_calls == []

@@ -28,6 +28,14 @@ class CommBackend(Protocol):
         group: Any | None = None,
     ) -> list[Tensor]: ...
 
+    def all_gather_into_tensor(
+        self,
+        output: Tensor,
+        input: Tensor,
+        *,
+        group: Any | None = None,
+    ) -> Tensor: ...
+
     def send(self, tensor: Tensor, dst: int, *, group: Any | None = None) -> None: ...
 
     def recv(self, tensor: Tensor, src: int, *, group: Any | None = None) -> Tensor: ...

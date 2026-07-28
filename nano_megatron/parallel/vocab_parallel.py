@@ -176,6 +176,58 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+def vocab_parallel_cross_entropy_from_shifted(
+    shift_logits: Tensor,
+    shift_labels: Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: Any,
+    backend: CommBackend,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+) -> Tensor:
+    """CE over already-shifted local-vocab logits.
+
+    ``shift_logits`` / ``shift_labels`` are paired prediction positions
+    ``[B, T, local_V]`` / ``[B, T]``.  ``reduction`` is ``"mean"`` or ``"sum"``
+    over non-ignored tokens.
+    """
+    if reduction not in ("mean", "sum"):
+        raise ValueError(
+            f"reduction must be 'mean' or 'sum', got {reduction!r}"
+        )
+    if shift_logits.dim() != 3:
+        raise ValueError(
+            f"expected shift_logits [B, T, local_V], got shape "
+            f"{tuple(shift_logits.shape)}"
+        )
+    if shift_labels.shape != shift_logits.shape[:2]:
+        raise ValueError(
+            f"shift_labels shape {tuple(shift_labels.shape)} incompatible with "
+            f"shift_logits {tuple(shift_logits.shape)}"
+        )
+    local_v = shift_logits.size(-1)
+    logits_2d = shift_logits.reshape(-1, local_v)
+    labels_1d = shift_labels.reshape(-1)
+    per_token = _VocabParallelCrossEntropy.apply(
+        logits_2d,
+        labels_1d,
+        vocab_start_index,
+        vocab_end_index,
+        ignore_index,
+        group,
+        backend,
+    )
+    valid = labels_1d != ignore_index
+    if not valid.any():
+        # Keep a connected graph when every label is ignored.
+        return per_token.sum() * 0.0
+    if reduction == "sum":
+        return per_token[valid].sum()
+    return per_token[valid].mean()
+
+
 def vocab_parallel_cross_entropy(
     vocab_parallel_logits: Tensor,
     target: Tensor,
@@ -203,20 +255,13 @@ def vocab_parallel_cross_entropy(
         )
     shift_logits = vocab_parallel_logits[:, :-1, :].contiguous()
     shift_labels = target[:, 1:].contiguous()
-    local_v = shift_logits.size(-1)
-    logits_2d = shift_logits.view(-1, local_v)
-    labels_1d = shift_labels.view(-1)
-    per_token = _VocabParallelCrossEntropy.apply(
-        logits_2d,
-        labels_1d,
-        vocab_start_index,
-        vocab_end_index,
-        ignore_index,
-        group,
-        backend,
+    return vocab_parallel_cross_entropy_from_shifted(
+        shift_logits,
+        shift_labels,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_end_index,
+        group=group,
+        backend=backend,
+        ignore_index=ignore_index,
+        reduction="mean",
     )
-    valid = labels_1d != ignore_index
-    if not valid.any():
-        # Keep a connected graph when every label is ignored.
-        return per_token.sum() * 0.0
-    return per_token[valid].mean()

@@ -116,3 +116,61 @@ def test_tp_cp_rejects_nondivisible_seq_len(monkeypatch):
     ids = torch.randint(0, 16, (2, 5))  # 5 % 2 != 0
     with pytest.raises(ValueError, match="context_parallel_size"):
         tp(ids)
+
+
+def test_tp_cp_local_ce_rejects_local_labels(monkeypatch):
+    """Under CP, labels must be full-sequence; local-only labels raise."""
+    ctx = _init_cp1(monkeypatch, "29614")
+    torch.manual_seed(4)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    tp._cp_size = 2
+    tp._cp_rank = 0
+    # Local logits [B, S/2, V] with full-seq labels would be OK; local labels not.
+    logits = torch.randn(2, 4, 16, requires_grad=True)
+    local_labels = torch.randint(0, 16, (2, 4))
+    with pytest.raises(ValueError, match="full sequence"):
+        tp.shifted_cross_entropy(logits, local_labels)
+
+
+def test_tp_cp_local_ce_pairs_and_scale(monkeypatch):
+    """Local CP CE pairs (logit_i, label_{i+1}) and scales by cp/global_valid."""
+    ctx = _init_cp1(monkeypatch, "29615")
+    torch.manual_seed(5)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    # Simulate cp=2 rank0 on a fixed full sequence without running CP forward.
+    tp._cp_size = 2
+    tp._cp_rank = 0
+    b, s, v = 2, 8, 16
+    full_logits = torch.randn(b, s, v, requires_grad=True)
+    labels = torch.randint(0, v, (b, s))
+    local = full_logits[:, 0:4, :].contiguous()
+    loss_local = tp.shifted_cross_entropy(local, labels)
+
+    # Manual: positions i=0..3 → logit[:, i] vs labels[:, i+1], sum * 2 / (B*(S-1))
+    from nano_megatron.parallel.vocab_parallel import (
+        vocab_parallel_cross_entropy_from_shifted,
+    )
+    shift_logits = local[:, :4, :]
+    shift_labels = labels[:, 1:5]
+    local_sum = vocab_parallel_cross_entropy_from_shifted(
+        shift_logits,
+        shift_labels,
+        vocab_start_index=0,
+        vocab_end_index=v,
+        group=tp._tp_group,
+        backend=tp._tp_backend,
+        reduction="sum",
+    )
+    expected = local_sum * 2.0 / (labels[:, 1:] != -100).sum().to(local_sum.dtype)
+    assert torch.allclose(loss_local, expected, atol=1e-6, rtol=1e-5)
+
+    # Mean of rank0+rank1 scaled losses equals full mean CE.
+    tp._cp_rank = 1
+    local1 = full_logits[:, 4:8, :].contiguous()
+    loss1 = tp.shifted_cross_entropy(local1, labels)
+    ref_loss = shifted_cross_entropy(full_logits, labels)
+    assert torch.allclose(
+        (loss_local + loss1) * 0.5, ref_loss, atol=1e-5, rtol=1e-4
+    )

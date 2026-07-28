@@ -172,15 +172,23 @@ def test_launch_cp2_vs_reference_forward_backward_gloo():
     _run_torchrun(2, "test_worker_cp2_vs_reference_forward_backward_gloo")
 
 
+def _cp_mean_loss(loss: torch.Tensor, ctx) -> torch.Tensor:
+    """Mean scaled local-CE losses over the CP group → global mean CE value."""
+    out = loss.detach().clone()
+    if ctx.context_parallel_size > 1:
+        ctx.backend.all_reduce(out, group=ctx.context_parallel_group, op="sum")
+        out = out / ctx.context_parallel_size
+    return out
+
+
 @pytest.mark.skipif(
     os.environ.get("NANO_MEGATRON_CP_WORKER") != "1", reason="worker only"
 )
 def test_worker_cp2_vs_reference_forward_backward_gloo():
-    """CP=2: gathered logits/loss match ref; DDP-summed grads match full ref grads.
+    """CP=2: local CE (no logits gather) matches ref loss/grads after DDP mean.
 
-    With global-mean CE on gathered logits (split-grad), each CP rank holds
-    sequence-shard *partial* weight grads.  DDP over DP×CP (dp=1, cp=2) sums
-    them (mean_divisor=1) to recover full-sequence gradients.
+    Local CE scales ``local_sum * cp_size / global_valid`` so DDP mean over
+    DP×CP recovers full-sequence mean-CE gradients.
     """
     from nano_megatron.distributed import DistributedDataParallel
     from nano_megatron.model import build_tp_gpt_from_reference
@@ -213,7 +221,7 @@ def test_worker_cp2_vs_reference_forward_backward_gloo():
     torch.manual_seed(1)
     ids = torch.randint(0, cfg.vocab_size, (2, 8))
 
-    # Forward: local seq logits → gather CP → full [B, S, V]
+    # Forward: local seq logits; optional gather only for logits check.
     local_logits = ddp(ids)
     assert local_logits.shape == (2, 4, cfg.vocab_size)
     full_logits = _gather_cp_seq_logits(local_logits, ctx)
@@ -224,21 +232,38 @@ def test_worker_cp2_vs_reference_forward_backward_gloo():
         f"logits mismatch: max_abs={(full_logits - ref_logits).abs().max().item()}"
     )
 
-    # Loss: CP path gathers logits internally; must match ref mean CE.
-    cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    # CE must not all-gather logits.
+    def _gather_forbidden(*_a, **_k):
+        raise AssertionError(
+            "shifted_cross_entropy must not call gather_from_context_parallel_region"
+        )
+
+    import nano_megatron.model.tp_gpt as tp_gpt_mod
+
+    orig_gather = tp_gpt_mod.gather_from_context_parallel_region
+    tp_gpt_mod.gather_from_context_parallel_region = _gather_forbidden
+    try:
+        cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    finally:
+        tp_gpt_mod.gather_from_context_parallel_region = orig_gather
+
     ref_loss = shifted_cross_entropy(ref_logits, ids)
-    assert torch.allclose(cp_loss, ref_loss, atol=ATOL, rtol=RTOL), (
-        f"loss mismatch: cp={cp_loss.item()} ref={ref_loss.item()}"
+    cp_loss_mean = _cp_mean_loss(cp_loss, ctx)
+    assert torch.allclose(cp_loss_mean, ref_loss, atol=ATOL, rtol=RTOL), (
+        f"loss mismatch: cp_mean={cp_loss_mean.item()} ref={ref_loss.item()}"
     )
 
-    # Backward + DDP sum over CP → full grads.
+    # Backward + DDP mean over CP → full grads.
     ref.zero_grad(set_to_none=True)
     ref_loss.backward()
 
     ddp.zero_grad(set_to_none=True)
-    # Recompute so autograd graph is live (local_logits already used above).
     local_logits = ddp(ids)
-    cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    tp_gpt_mod.gather_from_context_parallel_region = _gather_forbidden
+    try:
+        cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    finally:
+        tp_gpt_mod.gather_from_context_parallel_region = orig_gather
     cp_loss.backward()
     ddp.finish_grad_sync()
 
@@ -262,7 +287,7 @@ def test_launch_cp2_tp2_vs_reference_gloo():
     os.environ.get("NANO_MEGATRON_CP_WORKER") != "1", reason="worker only"
 )
 def test_worker_cp2_tp2_vs_reference_gloo():
-    """world=4, tp=2, cp=2: seq-gathered local-vocab logits and DDP grads vs ref."""
+    """world=4, tp=2, cp=2: local CE + DDP mean grads vs ref."""
     from nano_megatron.distributed import DistributedDataParallel
     from nano_megatron.model import build_tp_gpt_from_reference
     from nano_megatron.parallel import (
@@ -273,6 +298,7 @@ def test_worker_cp2_tp2_vs_reference_gloo():
     )
     from nano_megatron.reference import ReferenceGPT
     from nano_megatron.reference.loss import shifted_cross_entropy
+    import nano_megatron.model.tp_gpt as tp_gpt_mod
 
     if is_parallel_initialized():
         destroy_parallel()
@@ -311,11 +337,22 @@ def test_worker_cp2_tp2_vs_reference_gloo():
         f"max_abs={(full_seq_logits - expected).abs().max().item()}"
     )
 
-    # Loss vs full-vocab ref CE (vocab-parallel CE is global-mean equivalent).
-    cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    def _gather_forbidden(*_a, **_k):
+        raise AssertionError(
+            "shifted_cross_entropy must not call gather_from_context_parallel_region"
+        )
+
+    orig_gather = tp_gpt_mod.gather_from_context_parallel_region
+    tp_gpt_mod.gather_from_context_parallel_region = _gather_forbidden
+    try:
+        cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    finally:
+        tp_gpt_mod.gather_from_context_parallel_region = orig_gather
+
     ref_loss = shifted_cross_entropy(ref_logits, ids)
-    assert torch.allclose(cp_loss, ref_loss, atol=ATOL, rtol=RTOL), (
-        f"loss mismatch: cp={cp_loss.item()} ref={ref_loss.item()}"
+    cp_loss_mean = _cp_mean_loss(cp_loss, ctx)
+    assert torch.allclose(cp_loss_mean, ref_loss, atol=ATOL, rtol=RTOL), (
+        f"loss mismatch: cp_mean={cp_loss_mean.item()} ref={ref_loss.item()}"
     )
 
     ref.zero_grad(set_to_none=True)
@@ -323,7 +360,11 @@ def test_worker_cp2_tp2_vs_reference_gloo():
 
     ddp.zero_grad(set_to_none=True)
     local_logits = ddp(ids)
-    cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    tp_gpt_mod.gather_from_context_parallel_region = _gather_forbidden
+    try:
+        cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids)
+    finally:
+        tp_gpt_mod.gather_from_context_parallel_region = orig_gather
     cp_loss.backward()
     ddp.finish_grad_sync()
 
@@ -353,9 +394,9 @@ def test_launch_cp2_dp2_ddp_gloo():
     os.environ.get("NANO_MEGATRON_CP_WORKER") != "1", reason="worker only"
 )
 def test_worker_cp2_dp2_ddp_gloo():
-    """world=4, cp=2, dp=2: same data within CP group; DDP mean over dp.
+    """world=4, cp=2, dp=2: same data within CP group; DDP mean over dp*cp.
 
-    Group size = dp*cp = 4; mean_divisor = data_parallel_size = 2.
+    Group size = dp*cp = 4; mean_divisor = 4 (local CE *cp scale).
     Baseline: single-process global-batch mean CE grads.
     """
     from nano_megatron.distributed import DistributedDataParallel
@@ -368,6 +409,7 @@ def test_worker_cp2_dp2_ddp_gloo():
     )
     from nano_megatron.reference import ReferenceGPT
     from nano_megatron.reference.loss import shifted_cross_entropy
+    import nano_megatron.model.tp_gpt as tp_gpt_mod
 
     if is_parallel_initialized():
         destroy_parallel()
@@ -405,7 +447,18 @@ def test_worker_cp2_dp2_ddp_gloo():
     ddp.zero_grad(set_to_none=True)
     local_logits = ddp(ids_local)
     assert local_logits.shape == (local_bs, seq // ctx.context_parallel_size, cfg.vocab_size)
-    cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids_local)
+
+    def _gather_forbidden(*_a, **_k):
+        raise AssertionError(
+            "shifted_cross_entropy must not call gather_from_context_parallel_region"
+        )
+
+    orig_gather = tp_gpt_mod.gather_from_context_parallel_region
+    tp_gpt_mod.gather_from_context_parallel_region = _gather_forbidden
+    try:
+        cp_loss = ddp.module.shifted_cross_entropy(local_logits, ids_local)
+    finally:
+        tp_gpt_mod.gather_from_context_parallel_region = orig_gather
     cp_loss.backward()
     ddp.finish_grad_sync()
 

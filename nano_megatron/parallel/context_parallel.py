@@ -145,10 +145,14 @@ class _GatherFromContextParallelRegion(torch.autograd.Function):
         if cp_size == 1:
             return x
         _check_seq_tensor(x, seq_dim)
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(cp_size)]
-        backend.all_gather(gathered, x, group=group)
-        return torch.cat(gathered, dim=seq_dim)
+        # Single output buffer: gather along dim 0 then restore seq_dim.
+        # Avoids list all_gather + torch.cat D2D copies.
+        x_in = x.movedim(seq_dim, 0).contiguous()
+        out_shape = list(x_in.shape)
+        out_shape[0] *= cp_size
+        out = x_in.new_empty(out_shape)
+        backend.all_gather_into_tensor(out, x_in, group=group)
+        return out.movedim(0, seq_dim)
 
     @staticmethod
     def backward(
