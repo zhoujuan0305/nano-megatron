@@ -13,13 +13,15 @@
 | Precision | FP32 |
 | Batch / Seq | see each model section |
 | Warmup / Measure | 3 / 10 steps |
-| Parallel modes | TP, TP+SP, DP, TP×DP |
+| Parallel modes | TP, TP+SP, DP, TP×DP, PP, TP×PP |
 | SP note | SP reuses the TP group; `seq_len % tp_size == 0` required |
 | DP note | micro-batch per DP rank; global tok/s = local × dp_size |
-| DP memory | nano and Megatron run in **separate torchrun processes** (no in-process `--framework both`) |
-| Env | `CUDA_DEVICE_MAX_CONNECTIONS=1` (recommended for Megatron TP/SP/DP) |
+| PP note | non-interleaved 1F1B; local_bs = sum of microbatches; tok/s = local_bs × seq / wall (× dp if DP) |
+| PP P2P | nano: sync `send`/`recv`; Megatron: schedule P2P (TE kernels on Megatron path) |
+| DP / PP memory | nano and Megatron run in **separate torchrun processes** (no in-process `--framework both`) |
+| Env | `CUDA_DEVICE_MAX_CONNECTIONS=1` (recommended for Megatron TP/SP/DP/PP) |
 
-Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts/benchmark_dp.py` (DP / TP×DP, isolated `--framework nano` then `--framework megatron`).
+Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/benchmark_dp.py` (DP / TP×DP, isolated `--framework nano` then `--framework megatron`), and `scripts/benchmark_pp.py` (PP / TP×PP, isolated runs).
 
 ---
 
@@ -44,6 +46,9 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 | Params / rank (TP2) | 253.9M | 253.9M |
 | Params / rank (TP4) | 127.0M | 127.0M |
 | Params / rank (DP, tp=1) | 507.6M | 507.6M |
+| Params / rank (PP2) | 253.8M | 253.8M |
+| Params / rank (PP4) | 153.1M | 153.1M |
+| Params / rank (TP2×PP2) | 126.9M | 126.9M |
 
 ### TP2
 
@@ -97,6 +102,38 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 **Throughput Ratio** (nano / Megatron, global): **1.01x**  
 **Memory Ratio** (nano / Megatron): **1.03x**
 
+### PP2 (tp=1, local_bs=8, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 9,318 | 9,945 | 879.17 |
+| Megatron-LM | 9,084 | 10,687 | 901.85 |
+
+**Throughput Ratio** (nano / Megatron): **1.03x**  
+**Memory Ratio** (nano / Megatron): **0.93x**
+
+### PP4 (tp=1, local_bs=8, seq=1024, microbatches=8)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 16,416 | 5,201 | 499.02 |
+| Megatron-LM | 15,792 | 5,586 | 518.75 |
+
+**Throughput Ratio** (nano / Megatron): **1.04x**  
+**Memory Ratio** (nano / Megatron): **0.93x**
+
+### TP2×PP2 (local_bs=8, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 15,669 | 5,782 | 522.83 |
+| Megatron-LM | 16,994 | 5,771 | 482.06 |
+
+**Throughput Ratio** (nano / Megatron): **0.92x**  
+**Memory Ratio** (nano / Megatron): **1.00x**
+
+> PP runs use `seq_len=1024` and `local_bs=8` (sum of microbatches). Schedule is non-interleaved 1F1B on both sides. Megatron path uses Transformer Engine layers; nano uses sync P2P.
+
 ---
 
 ## 3. GPT 760M
@@ -120,6 +157,9 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 | Params / rank (TP2) | 531.8M | 531.8M |
 | Params / rank (TP4) | 266.0M | 266.0M |
 | Params / rank (DP, tp=1) | 1063.4M | 1063.4M |
+| Params / rank (PP2) | 531.7M | 531.7M |
+| Params / rank (PP4) | 305.2M | 305.2M |
+| Params / rank (TP2×PP2) | 265.9M | 265.9M |
 
 ### TP2
 
@@ -173,6 +213,36 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 **Throughput Ratio** (nano / Megatron, global): **0.98x**  
 **Memory Ratio** (nano / Megatron): **0.99x**
 
+### PP2 (tp=1, local_bs=8, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 6,372 | 14,334 | 1,285.64 |
+| Megatron-LM | 6,321 | 15,443 | 1,296.00 |
+
+**Throughput Ratio** (nano / Megatron): **1.01x**  
+**Memory Ratio** (nano / Megatron): **0.93x**
+
+### PP4 (tp=1, local_bs=8, seq=1024, microbatches=8)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 10,735 | 7,505 | 763.13 |
+| Megatron-LM | 10,458 | 8,081 | 783.32 |
+
+**Throughput Ratio** (nano / Megatron): **1.03x**  
+**Memory Ratio** (nano / Megatron): **0.93x**
+
+### TP2×PP2 (local_bs=8, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 10,846 | 8,364 | 755.32 |
+| Megatron-LM | 11,792 | 8,345 | 694.74 |
+
+**Throughput Ratio** (nano / Megatron): **0.92x**  
+**Memory Ratio** (nano / Megatron): **1.00x**
+
 ---
 
 ## 4. GPT 1.3B
@@ -197,8 +267,11 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 | Params / rank (TP2) | 910.4M | 910.4M |
 | Params / rank (TP4) | 455.3M | 455.3M |
 | Params / rank (DP, tp=1) | 1820.5M | 1820.5M |
+| Params / rank (PP2) | 910.3M | 910.3M |
+| Params / rank (PP4) | 507.6M | 507.6M |
+| Params / rank (TP2×PP2) | 455.2M | 455.2M |
 
-> TP2 uses `batch_size=1` to fit A6000 48GB; TP4 uses `batch_size=2`. DP and TP2×DP2 use `batch_size=1` (full or half replica). Tokens/sec already normalizes by batch size.
+> TP2 uses `batch_size=1` to fit A6000 48GB; TP4 uses `batch_size=2`. DP and TP2×DP2 use `batch_size=1` (full or half replica). PP / TP×PP use `local_bs=4`, `seq_len=1024`. Tokens/sec already normalizes by batch size.
 
 ### TP2
 
@@ -251,6 +324,36 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`) and `scripts
 
 **Throughput Ratio** (nano / Megatron, global): **0.97x**  
 **Memory Ratio** (nano / Megatron): **0.86x**
+
+### PP2 (tp=1, local_bs=4, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 4,245 | 13,273 | 964.94 |
+| Megatron-LM | 4,227 | 14,071 | 969.02 |
+
+**Throughput Ratio** (nano / Megatron): **1.00x**  
+**Memory Ratio** (nano / Megatron): **0.94x**
+
+### PP4 (tp=1, local_bs=4, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 6,235 | 8,661 | 656.96 |
+| Megatron-LM | 6,146 | 9,261 | 666.45 |
+
+**Throughput Ratio** (nano / Megatron): **1.01x**  
+**Memory Ratio** (nano / Megatron): **0.94x**
+
+### TP2×PP2 (local_bs=4, seq=1024, microbatches=4)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 7,285 | 7,449 | 562.25 |
+| Megatron-LM | 7,900 | 7,479 | 518.50 |
+
+**Throughput Ratio** (nano / Megatron): **0.92x**  
+**Memory Ratio** (nano / Megatron): **1.00x**
 
 ---
 
@@ -343,4 +446,41 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
 # 345M DP4 / TP2×DP2: nproc=4, --dp-size 4 or --tp-size 2 --dp-size 2
 # 760M: --hidden-size 1536 --ffn-hidden-size 6144 --batch-size 2
 # 1.3B: --hidden-size 2048 --ffn-hidden-size 8192 --batch-size 1
+
+# --- PP / TP×PP (scripts/benchmark_pp.py) ---
+# Fair peak memory: run nano and megatron in separate processes.
+
+# 345M PP2
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  scripts/benchmark_pp.py --framework nano --pp-size 2 --tp-size 1 \
+  --batch-size 8 --num-microbatches 4 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  scripts/benchmark_pp.py --framework megatron --pp-size 2 --tp-size 1 \
+  --batch-size 8 --num-microbatches 4 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+
+# 345M PP4
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/benchmark_pp.py --framework nano --pp-size 4 --tp-size 1 \
+  --batch-size 8 --num-microbatches 8 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/benchmark_pp.py --framework megatron --pp-size 4 --tp-size 1 \
+  --batch-size 8 --num-microbatches 8 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+
+# 345M TP2×PP2
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/benchmark_pp.py --framework nano --pp-size 2 --tp-size 2 \
+  --batch-size 8 --num-microbatches 4 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/benchmark_pp.py --framework megatron --pp-size 2 --tp-size 2 \
+  --batch-size 8 --num-microbatches 4 --seq-len 1024 \
+  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+
+# 760M: same PP knobs as 345M with --hidden-size 1536 --ffn-hidden-size 6144
+# 1.3B: --hidden-size 2048 --ffn-hidden-size 8192 --batch-size 4
+#   (PP2/PP4/TP2×PP2 all use local_bs=4, seq=1024; PP4 uses --num-microbatches 4)
 ```

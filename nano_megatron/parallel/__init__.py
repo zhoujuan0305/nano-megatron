@@ -5,6 +5,10 @@ from nano_megatron.parallel.context import (
     get_parallel_context,
     initialize_parallel,
     is_parallel_initialized,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+    pipeline_next_rank,
+    pipeline_prev_rank,
 )
 from nano_megatron.parallel.mappings import (
     CommunicationBuffer,
@@ -42,6 +46,10 @@ __all__ = [
     "get_parallel_context",
     "initialize_parallel",
     "is_parallel_initialized",
+    "is_pipeline_first_stage",
+    "is_pipeline_last_stage",
+    "pipeline_next_rank",
+    "pipeline_prev_rank",
     "reduce_scatter_to_sequence_parallel_region",
     "row_shard",
     "scatter_to_sequence_parallel_region",

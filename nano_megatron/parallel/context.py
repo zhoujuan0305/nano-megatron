@@ -187,3 +187,52 @@ def destroy_parallel() -> None:
     if _DIST_INITIALIZED_BY_US and dist.is_initialized():
         dist.destroy_process_group()
     _DIST_INITIALIZED_BY_US = False
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-parallel helpers
+# ---------------------------------------------------------------------------
+
+def _encode_rank(ctx: ParallelContext, *, pp_rank: int) -> int:
+    """Reconstruct a global rank with a different pipeline-parallel rank.
+
+    Only valid for the default ``tp-cp-dp-pp`` order used by
+    :class:`RankGenerator`.
+    """
+    tp = ctx.tensor_parallel_size
+    cp = ctx.context_parallel_size
+    dp = ctx.data_parallel_size
+    return (
+        ctx.tensor_parallel_rank
+        + tp * (ctx.context_parallel_rank + cp * (ctx.data_parallel_rank + dp * pp_rank))
+    )
+
+
+def is_pipeline_first_stage(ctx: ParallelContext) -> bool:
+    """Return ``True`` if *ctx* is on the first PP stage (rank 0)."""
+    return ctx.pipeline_parallel_rank == 0
+
+
+def is_pipeline_last_stage(ctx: ParallelContext) -> bool:
+    """Return ``True`` if *ctx* is on the last PP stage."""
+    return ctx.pipeline_parallel_rank == ctx.pipeline_parallel_size - 1
+
+
+def pipeline_prev_rank(ctx: ParallelContext) -> int | None:
+    """Global rank of the previous PP stage (same tp/cp/dp).
+
+    Returns ``None`` if this is the first stage or ``pp_size == 1``.
+    """
+    if ctx.pipeline_parallel_size <= 1 or ctx.pipeline_parallel_rank == 0:
+        return None
+    return _encode_rank(ctx, pp_rank=ctx.pipeline_parallel_rank - 1)
+
+
+def pipeline_next_rank(ctx: ParallelContext) -> int | None:
+    """Global rank of the next PP stage (same tp/cp/dp).
+
+    Returns ``None`` if this is the last stage or ``pp_size == 1``.
+    """
+    if ctx.pipeline_parallel_size <= 1 or is_pipeline_last_stage(ctx):
+        return None
+    return _encode_rank(ctx, pp_rank=ctx.pipeline_parallel_rank + 1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -8,7 +9,9 @@ from torch import Tensor
 
 from nano_megatron.distributed.backend import CommBackend
 from nano_megatron.distributed.bucket import GradBucket, build_buckets
-from nano_megatron.parallel.context import ParallelContext
+
+if TYPE_CHECKING:
+    from nano_megatron.parallel.context import ParallelContext
 
 
 class DistributedDataParallel(nn.Module):
@@ -43,9 +46,22 @@ class DistributedDataParallel(nn.Module):
         # True once finish_grad_sync completes (or no-ops) for this iteration.
         # Cleared on forward / first grad-ready mark so a new iteration can sync.
         self._sync_done: bool = True
+        # When False, grad hooks skip mark_ready so buckets accumulate without
+        # triggering all_reduce.  Managed by no_sync() context manager.
+        self._require_backward_grad_sync: bool = True
 
         self._broadcast_params()
         self._register_grad_hooks()
+
+    @contextmanager
+    def no_sync(self) -> Iterator[None]:
+        """Defer bucket mark_ready/sync; grads still accumulate on .grad."""
+        prev = self._require_backward_grad_sync
+        self._require_backward_grad_sync = False
+        try:
+            yield
+        finally:
+            self._require_backward_grad_sync = prev
 
     def _param_device(self) -> torch.device:
         try:
@@ -71,6 +87,9 @@ class DistributedDataParallel(nn.Module):
     def _on_param_grad_ready(self, param: nn.Parameter) -> None:
         bucket = self._param_to_bucket.get(param)
         if bucket is None:
+            return
+        if not self._require_backward_grad_sync:
+            self._sync_done = False
             return
         # New grads this iteration — allow finish_grad_sync to run again.
         self._sync_done = False
