@@ -388,6 +388,62 @@ Fair compare with FA on both sides: nano `--precision bf16 --attn-backend flash`
 **Throughput Ratio** (nano / Megatron, global): **0.69x**  
 **Memory Ratio** (nano / Megatron): **1.12x**
 
+> Legacy CP rows: nano **unfused** AG-KV. Current FA numbers: **§3.1**.
+
+### 3.1 BF16 + FlashAttention (760M)
+
+Same knobs as §3 (`batch=2`, `seq=2048`). nano `--precision bf16 --attn-backend flash`; Megatron TE BF16.
+
+#### TP2 (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 17,630 | 7,438 | 232.33 |
+| Megatron-LM | 19,070 | 6,654 | 214.78 |
+
+**Throughput Ratio** (nano / Megatron): **0.92x**  
+**Memory Ratio** (nano / Megatron): **1.12x**
+
+#### TP2 + SP (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 16,516 | 5,978 | 248.00 |
+| Megatron-LM | 18,544 | 6,077 | 220.89 |
+
+**Throughput Ratio** (nano / Megatron): **0.89x**  
+**Memory Ratio** (nano / Megatron): **0.98x**
+
+#### TP4 (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 20,956 | 4,930 | 195.45 |
+| Megatron-LM | 23,556 | 3,958 | 173.89 |
+
+**Throughput Ratio** (nano / Megatron): **0.89x**  
+**Memory Ratio** (nano / Megatron): **1.25x**
+
+#### DP2 (tp=1, BF16 + FA)
+
+| Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
+|-----------|--------------------|---------------------|-------------|-------------------|
+| nano-megatron | 9,583 | 19,167 | 10,913 | 427.41 |
+| Megatron-LM | 9,774 | 19,549 | 14,097 | 419.06 |
+
+**Throughput Ratio** (nano / Megatron, global): **0.98x**  
+**Memory Ratio** (nano / Megatron): **0.77x**
+
+#### CP2 (tp=1, BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron (AG-KV + chunked FA) | 12,422 | 7,349 | 329.75 |
+| Megatron-LM (TE zigzag + FA) | 14,997 | 9,287 | 273.12 |
+
+**Throughput Ratio** (nano / Megatron): **0.83x**  
+**Memory Ratio** (nano / Megatron): **0.79x**
+
 ---
 
 ## 4. GPT 1.3B
@@ -542,6 +598,62 @@ Fair compare with FA on both sides: nano `--precision bf16 --attn-backend flash`
 **Throughput Ratio** (nano / Megatron, global): **0.80x**  
 **Memory Ratio** (nano / Megatron): **1.08x**
 
+> Legacy CP rows: nano **unfused** AG-KV. Current FA numbers: **§4.1**.
+
+### 4.1 BF16 + FlashAttention (1.3B)
+
+Same knobs as §4 (`TP2 batch=1`, `TP4 batch=2`, `DP/CP batch=1`, `seq=2048`). nano `--precision bf16 --attn-backend flash`; Megatron TE BF16.
+
+#### TP2 (BF16 + FA, batch=1)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 11,289 | 5,755 | 181.41 |
+| Megatron-LM | 12,594 | 5,296 | 162.62 |
+
+**Throughput Ratio** (nano / Megatron): **0.90x**  
+**Memory Ratio** (nano / Megatron): **1.09x**
+
+#### TP2 + SP (BF16 + FA, batch=1)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 10,852 | 4,787 | 188.73 |
+| Megatron-LM | 12,181 | 4,912 | 168.14 |
+
+**Throughput Ratio** (nano / Megatron): **0.89x**  
+**Memory Ratio** (nano / Megatron): **0.97x**
+
+#### TP4 (BF16 + FA, batch=2)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 14,457 | 6,572 | 283.31 |
+| Megatron-LM | 16,584 | 5,309 | 246.98 |
+
+**Throughput Ratio** (nano / Megatron): **0.87x**  
+**Memory Ratio** (nano / Megatron): **1.24x**
+
+#### DP2 (tp=1, BF16 + FA, batch=1)
+
+| Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
+|-----------|--------------------|---------------------|-------------|-------------------|
+| nano-megatron | 5,106 | 10,211 | 10,633 | 401.13 |
+| Megatron-LM | 5,400 | 10,799 | 13,210 | 379.29 |
+
+**Throughput Ratio** (nano / Megatron, global): **0.95x**  
+**Memory Ratio** (nano / Megatron): **0.80x**
+
+#### CP2 (tp=1, BF16 + FA, batch=1)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron (AG-KV + chunked FA) | 6,420 | 10,921 | 318.98 |
+| Megatron-LM (TE zigzag + FA) | 7,702 | 10,092 | 265.90 |
+
+**Throughput Ratio** (nano / Megatron): **0.83x**  
+**Memory Ratio** (nano / Megatron): **1.08x**
+
 ---
 
 ## 5. Reproduction
@@ -567,6 +679,8 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
 # DP2 / CP2 BF16+FA: add --precision bf16; nano also --attn-backend flash
 #   scripts/benchmark_dp.py --framework nano|megatron --dp-size 2 ...
 #   scripts/benchmark_cp.py --framework nano|megatron --cp-size 2 ...
+# 760M: --hidden-size 1536 --ffn-hidden-size 6144 --batch-size 2
+# 1.3B: --hidden-size 2048 --ffn-hidden-size 8192 --batch-size 1 (TP2/DP/CP); TP4 batch=2
 
 # --- TP / SP FP32 baseline (scripts/benchmark_tp.py) ---
 
