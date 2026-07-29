@@ -60,8 +60,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="Compute dtype. bf16 enables FlashAttention on both sides.",
+    )
+    p.add_argument(
+        "--attn-backend",
+        type=str,
+        choices=["auto", "flash", "unfused"],
+        default="auto",
+        help="nano attention backend (ignored by Megatron).",
+    )
     p.add_argument("--output", type=str, default=None)
     return p.parse_args()
+
+
+def _dtype(args: argparse.Namespace) -> torch.dtype:
+    return torch.bfloat16 if args.precision == "bf16" else torch.float32
 
 
 def _resolve_dp(args: argparse.Namespace) -> int:
@@ -163,17 +181,19 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         use_fused_qkv=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        attn_backend=args.attn_backend,
     )
 
     torch.manual_seed(42)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(42)
 
+    dtype = _dtype(args)
     ref = ReferenceGPT(cfg)
     if args.tp_size > 1:
-        model = build_tp_gpt_from_reference(ref, ctx).to(device)
+        model = build_tp_gpt_from_reference(ref, ctx).to(device=device, dtype=dtype)
     else:
-        model = ref.to(device)
+        model = ref.to(device=device, dtype=dtype)
     ddp = DistributedDataParallel(model, ctx, bucket_cap_mb=args.bucket_cap_mb)
     ddp.train()
 
@@ -181,7 +201,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         n_params = sum(p.numel() for p in ddp.module.parameters())
         print(
             f"[nano] params/rank={n_params/1e6:.1f}M tp={args.tp_size} dp={dp_size} "
-            f"bucket_cap_mb={args.bucket_cap_mb}",
+            f"bucket_cap_mb={args.bucket_cap_mb} precision={args.precision} "
+            f"attn_backend={cfg.attn_backend}",
             flush=True,
         )
 
@@ -284,8 +305,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         masked_softmax_fusion=False,
         bias_dropout_fusion=False,
         fp16=False,
-        bf16=False,
-        params_dtype=torch.float32,
+        bf16=(args.precision == "bf16"),
+        params_dtype=_dtype(args),
     )
 
     model = GPTModel(
@@ -298,6 +319,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         parallel_output=True,
         share_embeddings_and_output_weights=False,
     ).cuda(local_rank)
+    if args.precision == "bf16":
+        model = model.bfloat16()
 
     # Align with nano: mean grads (average_in_collective), no overlap, no ZeRO.
     ddp_config = DistributedDataParallelConfig(
@@ -313,7 +336,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
     if is_rank0:
         n_params = sum(p.numel() for p in model.parameters())
         print(
-            f"[megatron] params/rank={n_params/1e6:.1f}M tp={args.tp_size} dp={dp_size}",
+            f"[megatron] params/rank={n_params/1e6:.1f}M tp={args.tp_size} dp={dp_size} "
+            f"precision={args.precision}",
             flush=True,
         )
 

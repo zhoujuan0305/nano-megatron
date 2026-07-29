@@ -43,6 +43,28 @@ Full tables, configs, and reproduction commands: **[performance.md](performance.
 pip install -e ".[dev]"
 ```
 
+### Optional: FlashAttention
+
+`flash-attn` is an optional dependency. Install it separately for faster half-precision attention:
+
+```bash
+pip install flash-attn
+```
+
+Set the attention backend in `ReferenceGPTConfig`:
+
+```python
+config = ReferenceGPTConfig(attn_backend="auto")  # default
+```
+
+| `attn_backend` | Behaviour |
+|----------------|-----------|
+| `"auto"` | Uses FlashAttention when CUDA + fp16/bf16 + `flash-attn` installed; falls back to unfused otherwise |
+| `"flash"` | Requires CUDA + fp16/bf16 + `flash-attn`; raises `RuntimeError` if unavailable |
+| `"unfused"` | Always uses the reference scores→softmax→matmul path |
+
+**Context Parallel (CP) notes:** The CP flash path uses contiguous all-gather + chunked FA (not TE zigzag ring). `attention_dropout > 0` with `cp > 1` is **unsupported** in the flash CP path (the chunked backward cannot propagate dropout RNG state).
+
 ### Run Reference Model
 
 ```bash

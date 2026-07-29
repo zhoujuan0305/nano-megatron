@@ -6,6 +6,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
 
+from nano_megatron.parallel.attention_backend import (
+    flash_causal_attention,
+    flash_ring_causal_attention,
+    resolve_attention_backend,
+    unfused_causal_attention,
+)
 from nano_megatron.parallel.context import ParallelContext
 from nano_megatron.parallel.context_parallel import (
     causal_attn_scores_cp,
@@ -33,7 +39,6 @@ from nano_megatron.reference.layers import (
     MLP,
     TransformerBlock,
     apply_rotary_emb,
-    causal_attn_scores,
     gelu_erf,
     layer_norm,
     precompute_freqs_cis,
@@ -209,9 +214,30 @@ class TPCausalSelfAttention(nn.Module):
         k = self._repeat_kv(k, self.num_heads_per_group)
         v = self._repeat_kv(v, self.num_heads_per_group)
 
-        # CP: all-gather KV along sequence so each rank attends over full keys
-        # with a shifted causal mask for its local query shard.
-        if self._cp_size > 1:
+        # Attention: flash (cp=1 or contiguous CP ring/chunked) or unfused AG-KV.
+        requested = getattr(self.config, "attn_backend", "auto")
+        backend = resolve_attention_backend(
+            requested=requested,
+            dtype=q.dtype,
+            device=q.device,
+            return_activations=False,
+        )
+        dropout_p = float(getattr(self.config, "attention_dropout", 0.0))
+        if backend == "flash" and self._cp_size > 1:
+            # Contiguous CP: AG-KV + chunked flash (not P2P ring).
+            context = flash_ring_causal_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                cp_group=self._cp_group,
+                cp_rank=self._cp_rank,
+                cp_size=self._cp_size,
+                backend=self._cp_backend,
+                dropout_p=dropout_p,
+            )
+        elif self._cp_size > 1:
+            # Unfused CP: all-gather KV; shifted causal mask on local Q shard.
             k_full = gather_from_context_parallel_region(
                 k,
                 self._cp_group,
@@ -234,10 +260,12 @@ class TPCausalSelfAttention(nn.Module):
             )
             probs = softmax_last(scores)
             context = torch.matmul(probs, v_full)
+        elif backend == "flash":
+            context = flash_causal_attention(
+                q, k, v, scale=self.scale, dropout_p=dropout_p
+            )
         else:
-            scores = causal_attn_scores(q, k, scale=self.scale)
-            probs = softmax_last(scores)
-            context = torch.matmul(probs, v)
+            context = unfused_causal_attention(q, k, v, scale=self.scale)
         attn_out = self.out_proj(self._merge_heads(context))
         return attn_out
 

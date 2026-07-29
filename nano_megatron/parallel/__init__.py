@@ -1,3 +1,10 @@
+from nano_megatron.parallel.attention_backend import (
+    flash_attn_available,
+    flash_causal_attention,
+    flash_ring_causal_attention,
+    resolve_attention_backend,
+    unfused_causal_attention,
+)
 from nano_megatron.parallel.config import ParallelConfig
 from nano_megatron.parallel.context_parallel import (
     causal_attn_scores_cp,
@@ -47,6 +54,9 @@ __all__ = [
     "causal_attn_scores_cp",
     "column_shard",
     "destroy_parallel",
+    "flash_attn_available",
+    "flash_causal_attention",
+    "flash_ring_causal_attention",
     "fused_qkv_column_shard",
     "gather_from_context_parallel_region",
     "gather_from_sequence_parallel_region",
@@ -60,9 +70,11 @@ __all__ = [
     "pipeline_next_rank",
     "pipeline_prev_rank",
     "reduce_scatter_to_sequence_parallel_region",
+    "resolve_attention_backend",
     "row_shard",
     "scatter_to_context_parallel_region",
     "scatter_to_sequence_parallel_region",
+    "unfused_causal_attention",
     "vocab_parallel_cross_entropy",
     "vocab_range_from_global",
 ]

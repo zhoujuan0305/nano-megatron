@@ -43,6 +43,28 @@ CP 段双方均为 BF16（Megatron TE FlashAttention CP 需要半精度）。nan
 pip install -e ".[dev]"
 ```
 
+### 可选：FlashAttention
+
+`flash-attn` 是可选依赖。单独安装以加速半精度注意力：
+
+```bash
+pip install flash-attn
+```
+
+在 `ReferenceGPTConfig` 中设置注意力后端：
+
+```python
+config = ReferenceGPTConfig(attn_backend="auto")  # 默认
+```
+
+| `attn_backend` | 行为 |
+|----------------|------|
+| `"auto"` | 当 CUDA + fp16/bf16 + `flash-attn` 已安装时使用 FlashAttention；否则回退到 unfused |
+| `"flash"` | 要求 CUDA + fp16/bf16 + `flash-attn`；不可用时抛出 `RuntimeError` |
+| `"unfused"` | 始终使用参考实现：scores→softmax→matmul |
+
+**上下文并行（CP）说明：** CP flash 路径使用连续 all-gather + 分块 FA（非 TE zigzag ring）。`attention_dropout > 0` 且 `cp > 1` 时，flash CP 路径**不支持**（分块反向传播无法传递 dropout RNG 状态）。
+
 ### 运行参考模型
 
 ```bash

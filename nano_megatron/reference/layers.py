@@ -7,6 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from nano_megatron.parallel.attention_backend import (
+    flash_causal_attention,
+    resolve_attention_backend,
+    unfused_causal_attention,
+)
 from nano_megatron.reference.config import ReferenceGPTConfig
 
 
@@ -222,14 +227,36 @@ class CausalSelfAttention(nn.Module):
         k = self._repeat_kv(k, self.num_heads_per_group)
         v = self._repeat_kv(v, self.num_heads_per_group)
 
-        scores = causal_attn_scores(q, k, scale=self.scale)
-        probs = softmax_last(scores)
-        context = torch.matmul(probs, v)
+        backend = resolve_attention_backend(
+            requested=self.config.attn_backend,
+            dtype=q.dtype,
+            device=q.device,
+            return_activations=return_activations,
+        )
+        scores: Tensor | None = None
+        probs: Tensor | None = None
+        if backend == "flash":
+            context = flash_causal_attention(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                dropout_p=self.config.attention_dropout,
+            )
+        elif return_activations:
+            # Unfused internals keep scores/probs for activation capture.
+            scores = causal_attn_scores(q, k, scale=self.scale)
+            probs = softmax_last(scores)
+            context = torch.matmul(probs, v)
+        else:
+            context = unfused_causal_attention(q, k, v, scale=self.scale)
+
         attn_out = self.out_proj(self._merge_heads(context))
 
         if not return_activations:
             return attn_out
 
+        assert scores is not None and probs is not None
         acts: dict[str, Tensor] = {
             "q": q,
             "k": k,

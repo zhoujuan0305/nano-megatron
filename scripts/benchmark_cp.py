@@ -76,7 +76,14 @@ def parse_args() -> argparse.Namespace:
         choices=["bf16", "fp32"],
         default="bf16",
         help="Compute dtype. Megatron TE CP requires bf16/fp16; default bf16 "
-        "for a fair nano vs Megatron CP comparison.",
+        "for a fair FlashAttention comparison.",
+    )
+    p.add_argument(
+        "--attn-backend",
+        type=str,
+        choices=["auto", "flash", "unfused"],
+        default="auto",
+        help="nano attention backend (ignored by Megatron).",
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
@@ -216,6 +223,7 @@ def benchmark_nano(
         use_fused_qkv=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        attn_backend=args.attn_backend,
     )
 
     torch.manual_seed(42)
@@ -233,7 +241,8 @@ def benchmark_nano(
         n_params = sum(p.numel() for p in ddp.module.parameters())
         print(
             f"[nano] params/rank={n_params/1e6:.1f}M "
-            f"tp={args.tp_size} cp={cp_size} dp={dp_size} precision={args.precision}",
+            f"tp={args.tp_size} cp={cp_size} dp={dp_size} precision={args.precision} "
+            f"attn_backend={cfg.attn_backend}",
             flush=True,
         )
 
