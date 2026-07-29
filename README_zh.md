@@ -29,11 +29,11 @@ English README: [README.md](README.md)
 | DP / TP×DP | FP32 | **0.97x – 1.05x** |
 | PP | FP32 | **1.00x – 1.04x** |
 | TP×PP | FP32 | **约 0.92x** |
-| CP / CP×TP / CP×DP | BF16 | **0.49x – 0.85x** |
+| TP / TP+SP (345M) | **BF16 + FA** | **0.89x – 0.92x** |
+| DP2 (345M) | **BF16 + FA** | **约 1.01x**（显存 **0.81x**） |
+| CP2 (345M) | **BF16 + FA** | **约 0.81x**（显存 **0.83x**；unfused 约 0.52x） |
 
-CP 段双方均为 BF16（Megatron TE FlashAttention CP 需要半精度）。nano 为连续分片 + all-gather KV；Megatron 为 zigzag + TE kernel。
-
-完整表格、模型配置与复现命令见：**[performance.md](performance.md)**
+BF16+FA：nano 使用可选 `flash-attn`（`attn_backend=flash`）；Megatron 为 TE FlashAttention。nano CP FA 为 AG-KV + 分块 FA（非 P2P ring）。完整表格见 **[performance.md](performance.md)** §2.1
 
 ## 快速开始
 

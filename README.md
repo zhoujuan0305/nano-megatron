@@ -29,11 +29,11 @@ On 4× RTX A6000, under matching GPT configs (345M / 760M / 1.3B):
 | DP / TP×DP | FP32 | **0.97x – 1.05x** |
 | PP | FP32 | **1.00x – 1.04x** |
 | TP×PP | FP32 | **~0.92x** |
-| CP / CP×TP / CP×DP | BF16 | **0.49x – 0.85x** |
+| TP / TP+SP (345M) | **BF16 + FA** | **0.89x – 0.92x** |
+| DP2 (345M) | **BF16 + FA** | **~1.01x** (mem **0.81x**) |
+| CP2 (345M) | **BF16 + FA** | **~0.81x** (mem **0.83x**; was ~0.52x unfused) |
 
-CP uses BF16 on both sides (Megatron TE FlashAttention CP requires half precision). nano CP is contiguous all-gather KV; Megatron uses zigzag + TE kernels.
-
-Full tables, configs, and reproduction commands: **[performance.md](performance.md)**
+BF16+FA: nano uses optional `flash-attn` (`attn_backend=flash`); Megatron uses TE FlashAttention. nano CP FA is AG-KV + chunked FA (not P2P ring). Full tables: **[performance.md](performance.md)** §2.1
 
 ## Quick Start
 

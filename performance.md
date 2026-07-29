@@ -10,7 +10,7 @@
 | CUDA | 13.1 |
 | Python | 3.12.3 |
 | OS | Linux |
-| Precision | FP32 (TP/DP/PP); **BF16 (CP only)** |
+| Precision | FP32 (TP/DP/PP baseline); **BF16 + FlashAttention** (FA section + CP) |
 | Batch / Seq | see each model section |
 | Warmup / Measure | 3 / 10 steps |
 | Parallel modes | TP, TP+SP, DP, TP×DP, PP, TP×PP, **CP, CP×TP, CP×DP** |
@@ -18,12 +18,13 @@
 | DP note | micro-batch per DP rank; global tok/s = local × dp_size |
 | PP note | non-interleaved 1F1B; local_bs = sum of microbatches; tok/s = local_bs × seq / wall (× dp if DP) |
 | PP P2P | nano: sync `send`/`recv`; Megatron: schedule P2P (TE kernels on Megatron path) |
-| CP note | nano: contiguous all-gather KV, local CE, single-buffer AG; Megatron: TE FlashAttention + zigzag pack; `seq_len % (2·cp) == 0`; tok/s = batch × seq × dp / wall (CP does not multiply data) |
-| CP precision | Megatron TE CP requires bf16/fp16; CP tables use **BF16 on both sides** for a fair comparison |
+| Attention | nano: optional `flash-attn` via `attn_backend=auto\|flash\|unfused` (default auto); Megatron: TE DotProductAttention (Flash in bf16/fp16) |
+| CP note | nano FA path: contiguous **AG-KV + chunked FlashAttention** (not P2P ring); unfused fallback: AG-KV + matmul softmax; Megatron: TE FlashAttention + zigzag pack; `seq_len % (2·cp) == 0`; tok/s = batch × seq × dp / wall |
+| CP precision | Megatron TE CP requires bf16/fp16; FA/CP fair tables use **BF16 on both sides** |
 | DP / PP / CP memory | nano and Megatron run in **separate torchrun processes** (no in-process `--framework both`) |
 | Env | `CUDA_DEVICE_MAX_CONNECTIONS=1` (recommended for Megatron TP/SP/DP/PP/CP) |
 
-Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/benchmark_dp.py` (DP / TP×DP, isolated runs), `scripts/benchmark_pp.py` (PP / TP×PP, isolated runs), and `scripts/benchmark_cp.py` (CP / CP×TP / CP×DP, isolated runs, BF16).
+Measured with `scripts/benchmark_tp.py` (TP/SP; FP32 or `--precision bf16 --attn-backend flash`), `scripts/benchmark_dp.py` (DP / TP×DP, isolated), `scripts/benchmark_pp.py` (PP / TP×PP, isolated), and `scripts/benchmark_cp.py` (CP / CP×TP / CP×DP, isolated, BF16).
 
 ---
 
@@ -138,47 +139,103 @@ Measured with `scripts/benchmark_tp.py` (TP/SP, `--framework both`), `scripts/be
 
 > PP runs use `seq_len=1024` and `local_bs=8` (sum of microbatches). Schedule is non-interleaved 1F1B on both sides. Megatron path uses Transformer Engine layers; nano uses sync P2P.
 
-### CP2 (tp=1, BF16, batch=2, seq=2048)
+### CP2 (tp=1, BF16, batch=2, seq=2048) — legacy unfused nano
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 13,408 | 7,809 | 305.49 |
+| nano-megatron (unfused AG-KV) | 13,408 | 7,809 | 305.49 |
 | Megatron-LM | 25,678 | 5,765 | 159.52 |
 
 **Throughput Ratio** (nano / Megatron): **0.52x**  
 **Memory Ratio** (nano / Megatron): **1.35x**
 
-### CP4 (tp=1, BF16, batch=2, seq=2048)
+### CP4 (tp=1, BF16, batch=2, seq=2048) — legacy unfused nano
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 17,018 | 4,691 | 240.69 |
+| nano-megatron (unfused AG-KV) | 17,018 | 4,691 | 240.69 |
 | Megatron-LM | 19,515 | 3,863 | 209.89 |
 
 **Throughput Ratio** (nano / Megatron): **0.87x**  
 **Memory Ratio** (nano / Megatron): **1.21x**
 
-### TP2×CP2 (BF16, batch=2, seq=2048)
+### TP2×CP2 (BF16, batch=2, seq=2048) — legacy unfused nano
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron | 19,656 | 4,347 | 208.38 |
+| nano-megatron (unfused AG-KV) | 19,656 | 4,347 | 208.38 |
 | Megatron-LM | 30,458 | 3,109 | 134.48 |
 
 **Throughput Ratio** (nano / Megatron): **0.65x**  
 **Memory Ratio** (nano / Megatron): **1.40x**
 
-### CP2×DP2 (BF16, batch=2, seq=2048)
+### CP2×DP2 (BF16, batch=2, seq=2048) — legacy unfused nano
 
 | Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
 |-----------|--------------------|---------------------|-------------|-------------------|
-| nano-megatron | 11,976 | 23,953 | 7,809 | 342.00 |
+| nano-megatron (unfused AG-KV) | 11,976 | 23,953 | 7,809 | 342.00 |
 | Megatron-LM | 20,773 | 41,546 | 5,765 | 197.18 |
 
 **Throughput Ratio** (nano / Megatron, global): **0.58x**  
 **Memory Ratio** (nano / Megatron): **1.35x**
 
-> CP section is **BF16** (Megatron TE FlashAttention CP requires half precision). nano: contiguous AG KV + local CE + single-buffer AG; Megatron: zigzag CP + TE kernels. Gap expected until ring/Flash CP.
+> Legacy CP rows above are **BF16** with nano **unfused** AG-KV (pre–flash-attn). Prefer **§2.1 BF16 + FlashAttention** for current FA numbers. Megatron path is zigzag CP + TE Flash.
+
+### 2.1 BF16 + FlashAttention (345M)
+
+Fair compare with FA on both sides: nano `--precision bf16 --attn-backend flash`; Megatron TE BF16 (FlashAttention). Same model knobs as §2 (`batch=2`, `seq=2048` unless noted). Measured 2026-07-29 on the same A6000 node.
+
+#### TP2 (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 28,580 | 5,119 | 143.32 |
+| Megatron-LM | 31,152 | 4,532 | 131.48 |
+
+**Throughput Ratio** (nano / Megatron): **0.92x**  
+**Memory Ratio** (nano / Megatron): **1.13x**
+
+#### TP2 + SP (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 26,725 | 4,146 | 153.26 |
+| Megatron-LM | 30,085 | 4,147 | 136.15 |
+
+**Throughput Ratio** (nano / Megatron): **0.89x**  
+**Memory Ratio** (nano / Megatron): **1.00x**
+
+#### TP4 (BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron | 31,655 | 3,360 | 129.40 |
+| Megatron-LM | 35,699 | 2,681 | 114.74 |
+
+**Throughput Ratio** (nano / Megatron): **0.89x**  
+**Memory Ratio** (nano / Megatron): **1.25x**
+
+#### DP2 (tp=1, BF16 + FA)
+
+| Framework | Tokens/sec (local) | Tokens/sec (global) | Memory (MB) | Avg Step Time (ms) |
+|-----------|--------------------|---------------------|-------------|-------------------|
+| nano-megatron | 16,747 | 33,494 | 7,432 | 244.58 |
+| Megatron-LM | 16,553 | 33,105 | 9,173 | 247.45 |
+
+**Throughput Ratio** (nano / Megatron, global): **1.01x**  
+**Memory Ratio** (nano / Megatron): **0.81x**
+
+#### CP2 (tp=1, BF16 + FA)
+
+| Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
+|-----------|------------|-------------|-------------------|
+| nano-megatron (AG-KV + chunked FA) | 20,718 | 4,788 | 197.70 |
+| Megatron-LM (TE zigzag + FA) | 25,594 | 5,765 | 160.04 |
+
+**Throughput Ratio** (nano / Megatron): **0.81x**  
+**Memory Ratio** (nano / Megatron): **0.83x**
+
+> FA lift on nano CP2 vs legacy unfused: ~13.4k → **20.7k** tok/s (~1.5×); mem 7.8 GB → **4.8 GB**. Remaining CP gap vs Megatron is mostly **AG+chunked FA vs TE ring/zigzag**, not missing Flash kernels. TP still trails TE fused Linear/LN (~8–11%). DP stays ~parity thr with lower nano DDP memory.
 
 ---
 
@@ -494,7 +551,24 @@ source /workspace/envs/megatron/bin/activate
 export PYTHONPATH=/path/to/nano-megatron:/path/to/Megatron-LM:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# --- TP / SP (scripts/benchmark_tp.py) ---
+# --- BF16 + FlashAttention (345M; §2.1) ---
+# Optional: pip install flash-attn. Fair peak memory: separate nano / megatron jobs.
+
+# TP2 BF16+FA
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  scripts/benchmark_tp.py --framework nano --tp-size 2 --precision bf16 --attn-backend flash \
+  --batch-size 2 --seq-len 2048 --hidden-size 1024 --num-layers 24 \
+  --num-heads 16 --ffn-hidden-size 4096
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  scripts/benchmark_tp.py --framework megatron --tp-size 2 --precision bf16 \
+  --batch-size 2 --seq-len 2048 --hidden-size 1024 --num-layers 24 \
+  --num-heads 16 --ffn-hidden-size 4096
+
+# DP2 / CP2 BF16+FA: add --precision bf16; nano also --attn-backend flash
+#   scripts/benchmark_dp.py --framework nano|megatron --dp-size 2 ...
+#   scripts/benchmark_cp.py --framework nano|megatron --cp-size 2 ...
+
+# --- TP / SP FP32 baseline (scripts/benchmark_tp.py) ---
 
 # 345M TP2
 python -m torch.distributed.run --standalone --nproc_per_node=2 \
