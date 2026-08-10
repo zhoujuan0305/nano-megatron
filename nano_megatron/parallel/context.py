@@ -28,6 +28,8 @@ class ParallelContext:
     pipeline_parallel_rank: int
     context_parallel_size: int
     context_parallel_rank: int
+    # CP sequence pack mode: "zigzag" | "contiguous" (from ParallelConfig).
+    context_parallel_pack: str
     tensor_parallel_group: Any
     data_parallel_group: Any
     pipeline_parallel_group: Any
@@ -159,6 +161,7 @@ def initialize_parallel(
         pipeline_parallel_rank=parts["pp"],
         context_parallel_size=cfg.context_parallel_size,
         context_parallel_rank=parts["cp"],
+        context_parallel_pack=cfg.context_parallel_pack,
         tensor_parallel_group=tp_group,
         data_parallel_group=dp_group,
         pipeline_parallel_group=pp_group,

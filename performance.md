@@ -19,7 +19,7 @@
 | PP note | non-interleaved 1F1B; local_bs = sum of microbatches; tok/s = local_bs × seq / wall (× dp if DP) |
 | PP P2P | nano: sync `send`/`recv`; Megatron: schedule P2P (TE kernels on Megatron path) |
 | Attention | nano: optional `flash-attn` via `attn_backend=auto\|flash\|unfused` (default auto); Megatron: TE DotProductAttention (Flash in bf16/fp16) |
-| CP note | nano FA path: contiguous **AG-KV + chunked FlashAttention** (not P2P ring); unfused fallback: AG-KV + matmul softmax; Megatron: TE FlashAttention + zigzag pack; `seq_len % (2·cp) == 0`; tok/s = batch × seq × dp / wall |
+| CP note | nano FA path: **AG-KV + multi-block FlashAttention** (not P2P ring). Default multi-block mode **`prefix-concat`** (`NANO_CP_FA_CHUNK=prefix`): non-causal KV blocks are concatenated into one FA call plus one causal FA (≤2 launches per Q-shard); `legacy` = one FA launch per KV block. Sequence pack default **`contiguous`** (`zigzag` DualChunkSwap via `context_parallel_pack` / `--cp-pack`). Unfused fallback: AG-KV + matmul softmax. Megatron: TE FA + zigzag ring. `seq_len % (2·cp) == 0` for zigzag-compatible benches. tok/s = batch × seq × dp / wall. |
 | CP precision | Megatron TE CP requires bf16/fp16; FA/CP fair tables use **BF16 on both sides** |
 | DP / PP / CP memory | nano and Megatron run in **separate torchrun processes** (no in-process `--framework both`) |
 | Env | `CUDA_DEVICE_MAX_CONNECTIONS=1` (recommended for Megatron TP/SP/DP/PP/CP) |
@@ -229,13 +229,13 @@ Fair compare with FA on both sides: nano `--precision bf16 --attn-backend flash`
 
 | Framework | Tokens/sec | Memory (MB) | Avg Step Time (ms) |
 |-----------|------------|-------------|-------------------|
-| nano-megatron (AG-KV + chunked FA) | 20,718 | 4,788 | 197.70 |
+| nano-megatron (AG-KV + prefix multi-block FA, pack=contiguous) | 20,718 | 4,788 | 197.70 |
 | Megatron-LM (TE zigzag + FA) | 25,594 | 5,765 | 160.04 |
 
 **Throughput Ratio** (nano / Megatron): **0.81x**  
 **Memory Ratio** (nano / Megatron): **0.83x**
 
-> FA lift on nano CP2 vs legacy unfused: ~13.4k → **20.7k** tok/s (~1.5×); mem 7.8 GB → **4.8 GB**. Remaining CP gap vs Megatron is mostly **AG+chunked FA vs TE ring/zigzag**, not missing Flash kernels. TP still trails TE fused Linear/LN (~8–11%). DP stays ~parity thr with lower nano DDP memory.
+> FA lift on nano CP2 vs legacy unfused: ~13.4k → **20.7k** tok/s (~1.5×); mem 7.8 GB → **4.8 GB**. Default path is pack=`contiguous` + `NANO_CP_FA_CHUNK=prefix`. Prefix-concat reduces multi-block FA launches (≤2 per Q-shard); zigzag pack is available for A/B and is near parity with contiguous under prefix mode on CP2 345M lab medians. Remaining gap vs Megatron is mostly **AG+multi-block FA vs TE ring/fused path**, not missing Flash kernels. TP still trails TE fused Linear/LN (~8–11%). DP stays ~parity thr with lower nano DDP memory.
 
 ---
 

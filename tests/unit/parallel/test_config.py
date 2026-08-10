@@ -44,3 +44,25 @@ def test_reject_pp_with_cp():
     cfg = ParallelConfig(context_parallel_size=2, pipeline_parallel_size=2)
     with pytest.raises(ValueError, match="pipeline"):
         cfg.validate(world_size=4)
+
+
+def test_context_parallel_pack_default_contiguous():
+    cfg = ParallelConfig()
+    assert cfg.context_parallel_pack == "contiguous"
+
+
+def test_context_parallel_pack_contiguous_ok():
+    cfg = ParallelConfig(context_parallel_size=2, context_parallel_pack="contiguous")
+    cfg.validate(world_size=2)
+    assert cfg.context_parallel_pack == "contiguous"
+
+
+def test_context_parallel_pack_zigzag_ok():
+    cfg = ParallelConfig(context_parallel_size=2, context_parallel_pack="zigzag")
+    cfg.validate(world_size=2)
+
+
+def test_context_parallel_pack_invalid_raises():
+    cfg = ParallelConfig(context_parallel_pack="ring")
+    with pytest.raises(ValueError, match="context_parallel_pack"):
+        cfg.validate(world_size=1)

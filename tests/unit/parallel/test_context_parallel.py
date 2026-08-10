@@ -14,6 +14,13 @@ from nano_megatron.parallel.context_parallel import (
     gather_from_context_parallel_region,
     local_sequence_range,
     scatter_to_context_parallel_region,
+    unpermute_ag_to_global,
+    zigzag_ag_to_global_index,
+    zigzag_global_to_ag_index,
+    zigzag_half_ag_starts,
+    zigzag_half_ag_token_start,
+    zigzag_half_ids,
+    zigzag_local_token_indices,
 )
 from nano_megatron.reference.layers import causal_attn_scores
 
@@ -203,7 +210,7 @@ def test_scatter_backward_pad_zeros_autograd(monkeypatch):
     backend = _NoCollectiveBackend()
     # rank 1 of cp_size=2: local shard is x[:, 4:8, :]
     y = _ScatterToContextParallelRegion.apply(
-        x, ctx.context_parallel_group, backend, 1, 2, 1
+        x, ctx.context_parallel_group, backend, 1, 2, 1, "contiguous"
     )
     assert y.shape == (1, 4, 2)
     assert torch.equal(y, x.detach()[:, 4:8, :])
@@ -391,7 +398,7 @@ def test_gather_forward_uses_all_gather_into_tensor_no_cat(monkeypatch):
     # Rank 0 local input
     x = shard0.clone()
     out = _GatherFromContextParallelRegion.apply(
-        x, None, backend, 0, cp_size, seq_dim, "reduce_scatter"
+        x, None, backend, 0, cp_size, seq_dim, "reduce_scatter", "contiguous"
     )
 
     assert len(backend.list_all_gather_calls) == 0, (
@@ -436,9 +443,533 @@ def test_gather_forward_into_tensor_seq_dim_2(monkeypatch):
 
     expected = real_cat([shard0, shard1], dim=seq_dim)
     out = _GatherFromContextParallelRegion.apply(
-        shard0.clone(), None, backend, 0, cp_size, seq_dim, "split"
+        shard0.clone(), None, backend, 0, cp_size, seq_dim, "split", "contiguous"
     )
     assert len(backend.into_calls) == 1
     assert len(backend.list_all_gather_calls) == 0
     assert torch.equal(out, expected)
     assert cat_calls == []
+
+
+# ---------------------------------------------------------------------------
+# zigzag_half_ids
+# ---------------------------------------------------------------------------
+
+
+def test_zigzag_half_ids_cp2():
+    assert zigzag_half_ids(0, 2) == (0, 3)
+    assert zigzag_half_ids(1, 2) == (1, 2)
+
+
+def test_zigzag_half_ids_cp4():
+    # rank r owns halves (r, 2*cp-1-r)
+    assert zigzag_half_ids(0, 4) == (0, 7)
+    assert zigzag_half_ids(1, 4) == (1, 6)
+    assert zigzag_half_ids(2, 4) == (2, 5)
+    assert zigzag_half_ids(3, 4) == (3, 4)
+
+
+def test_zigzag_half_ids_symmetry():
+    """Each pair (r, 2*cp-1-r) should be the mirror of each other."""
+    cp_size = 4
+    for r in range(cp_size):
+        first, second = zigzag_half_ids(r, cp_size)
+        assert first + second == 2 * cp_size - 1
+
+
+def test_zigzag_half_ids_invalid():
+    with pytest.raises(ValueError):
+        zigzag_half_ids(-1, 2)
+    with pytest.raises(ValueError):
+        zigzag_half_ids(2, 2)
+    with pytest.raises(ValueError):
+        zigzag_half_ids(0, 0)
+
+
+# ---------------------------------------------------------------------------
+# zigzag_local_token_indices — CP2 S=8
+# ---------------------------------------------------------------------------
+
+
+def test_zigzag_local_token_indices_cp2_s8():
+    # S=8 → H=2; rank0 [0,1,6,7]; rank1 [2,3,4,5]
+    assert zigzag_local_token_indices(0, 2, 8).tolist() == [0, 1, 6, 7]
+    assert zigzag_local_token_indices(1, 2, 8).tolist() == [2, 3, 4, 5]
+
+
+def test_zigzag_local_token_indices_cp4_s16():
+    # S=16, cp=4 → H=2.  Half-chunks: 0:[0,1] 1:[2,3] 2:[4,5] 3:[6,7]
+    #                    4:[8,9] 5:[10,11] 6:[12,13] 7:[14,15]
+    # rank0 halves (0,7): [0,1,14,15]
+    # rank1 halves (1,6): [2,3,12,13]
+    # rank2 halves (2,5): [4,5,10,11]
+    # rank3 halves (3,4): [6,7,8,9]
+    assert zigzag_local_token_indices(0, 4, 16).tolist() == [0, 1, 14, 15]
+    assert zigzag_local_token_indices(1, 4, 16).tolist() == [2, 3, 12, 13]
+    assert zigzag_local_token_indices(2, 4, 16).tolist() == [4, 5, 10, 11]
+    assert zigzag_local_token_indices(3, 4, 16).tolist() == [6, 7, 8, 9]
+
+
+def test_zigzag_local_token_indices_nondivisible():
+    """S % (2*cp) != 0 must raise."""
+    with pytest.raises(ValueError, match=r"2 \* cp_size|not divisible"):
+        zigzag_local_token_indices(0, 2, 7)
+    with pytest.raises(ValueError):
+        zigzag_local_token_indices(0, 4, 14)
+
+
+def test_zigzag_local_token_indices_invalid_rank():
+    with pytest.raises(ValueError):
+        zigzag_local_token_indices(-1, 2, 8)
+    with pytest.raises(ValueError):
+        zigzag_local_token_indices(2, 2, 8)
+
+
+def test_zigzag_local_token_indices_dtype_device():
+    t = zigzag_local_token_indices(0, 2, 8, device="cpu", dtype=torch.int32)
+    assert t.dtype == torch.int32
+    assert t.device.type == "cpu"
+
+
+def test_zigzag_local_token_indices_covers_all():
+    """Every global index [0, S) appears exactly once across all ranks."""
+    cp_size, S = 4, 16
+    all_ids = []
+    for r in range(cp_size):
+        all_ids.extend(zigzag_local_token_indices(r, cp_size, S).tolist())
+    assert sorted(all_ids) == list(range(S))
+
+
+# ---------------------------------------------------------------------------
+# zigzag_half_ag_token_start / zigzag_half_ag_starts / unpermute_ag_to_global
+# ---------------------------------------------------------------------------
+
+
+def test_zigzag_half_ag_token_start_cp2_s8():
+    """CP2 S=8 H=2: AG = [0,1,6,7 | 2,3,4,5]; half starts at AG offsets."""
+    cp, H = 2, 2
+    # half0@0, half1@4, half2@6, half3@2
+    assert zigzag_half_ag_token_start(0, cp, H) == 0
+    assert zigzag_half_ag_token_start(1, cp, H) == 4
+    assert zigzag_half_ag_token_start(2, cp, H) == 6
+    assert zigzag_half_ag_token_start(3, cp, H) == 2
+    assert zigzag_half_ag_starts(cp, H) == [0, 4, 6, 2]
+
+
+def test_zigzag_half_ag_token_start_cp4_s16():
+    """CP4 S=16 H=2: AG rank-concat of zigzag locals."""
+    cp, S, H = 4, 16, 2
+    starts = zigzag_half_ag_starts(cp, H)
+    assert len(starts) == 2 * cp
+    # Build AG from local indices; each half slice must match global half.
+    locals_ = [zigzag_local_token_indices(r, cp, S) for r in range(cp)]
+    ag = torch.cat(locals_)
+    for g in range(2 * cp):
+        start = zigzag_half_ag_token_start(g, cp, H)
+        assert start == starts[g]
+        assert ag[start : start + H].tolist() == list(range(g * H, (g + 1) * H))
+
+
+def test_zigzag_half_ag_token_start_matches_ag_to_global_perm():
+    """starts[g] equals perm inverse: first AG index of global half g."""
+    for cp, H in ((2, 2), (4, 2), (4, 3), (1, 4)):
+        perm = zigzag_ag_to_global_index(cp, H)  # global[i] = ag[perm[i]]
+        starts = zigzag_half_ag_starts(cp, H)
+        for g in range(2 * cp):
+            # Global tokens g*H .. (g+1)*H-1 come from AG at perm[g*H + t]
+            expected = int(perm[g * H].item())
+            assert starts[g] == expected
+            for t in range(H):
+                assert int(perm[g * H + t].item()) == expected + t
+
+
+def test_zigzag_half_ag_token_start_invalid():
+    with pytest.raises(ValueError):
+        zigzag_half_ag_token_start(-1, 2, 2)
+    with pytest.raises(ValueError):
+        zigzag_half_ag_token_start(4, 2, 2)
+    with pytest.raises(ValueError):
+        zigzag_half_ag_token_start(0, 2, 0)
+    with pytest.raises(ValueError):
+        zigzag_half_ag_token_start(0, 0, 2)
+
+
+def test_unpermute_ag_to_global_cp2_s8():
+    cp, S = 2, 8
+    H = S // (2 * cp)
+    locals_ = [zigzag_local_token_indices(r, cp, S) for r in range(cp)]
+    ag = torch.cat(locals_).view(1, S).float()
+    # Also as [B, S, D]
+    ag_bd = ag.unsqueeze(-1).expand(1, S, 2).contiguous()
+    out = unpermute_ag_to_global(ag_bd, cp, seq_dim=1)
+    assert out[0, :, 0].tolist() == list(range(S))
+    # Roundtrip property via starts
+    for g in range(2 * cp):
+        start = zigzag_half_ag_token_start(g, cp, H)
+        assert ag_bd[0, start : start + H, 0].tolist() == list(
+            range(g * H, (g + 1) * H)
+        )
+
+
+def test_unpermute_ag_to_global_cp4_and_seq_dim():
+    cp, S = 4, 16
+    locals_ = [zigzag_local_token_indices(r, cp, S) for r in range(cp)]
+    ag = torch.cat(locals_).float()
+    # seq on dim 2: [1, 2, S]
+    x = ag.view(1, 1, S).expand(1, 2, S).contiguous()
+    out = unpermute_ag_to_global(x, cp, seq_dim=2)
+    assert out[0, 0].tolist() == list(range(S))
+
+
+def test_unpermute_ag_to_global_cp1_identity():
+    x = torch.arange(8.0).view(1, 4, 2)
+    assert torch.equal(unpermute_ag_to_global(x, 1, seq_dim=1), x)
+
+
+# ---------------------------------------------------------------------------
+# zigzag_ag_to_global_index / zigzag_global_to_ag_index roundtrip
+# ---------------------------------------------------------------------------
+
+
+def test_zigzag_ag_to_global_roundtrip_cp2():
+    cp, S = 2, 8
+    H = S // (2 * cp)
+    locals = [zigzag_local_token_indices(r, cp, S) for r in range(cp)]
+    ag = torch.cat(locals)  # rank order
+    perm = zigzag_ag_to_global_index(cp, H)
+    assert ag[perm].tolist() == list(range(S))
+    inv = zigzag_global_to_ag_index(cp, H)
+    assert torch.equal(ag, torch.arange(S)[inv])
+
+
+def test_zigzag_ag_to_global_roundtrip_cp4():
+    cp, S = 4, 16
+    H = S // (2 * cp)
+    locals = [zigzag_local_token_indices(r, cp, S) for r in range(cp)]
+    ag = torch.cat(locals)
+    perm = zigzag_ag_to_global_index(cp, H)
+    assert ag[perm].tolist() == list(range(S))
+    inv = zigzag_global_to_ag_index(cp, H)
+    assert torch.equal(ag, torch.arange(S)[inv])
+
+
+def test_zigzag_ag_to_global_shape():
+    cp, H = 4, 3
+    perm = zigzag_ag_to_global_index(cp, H)
+    assert perm.shape == (cp * 2 * H,)
+    inv = zigzag_global_to_ag_index(cp, H)
+    assert inv.shape == (cp * 2 * H,)
+
+
+def test_zigzag_ag_to_global_is_permutation():
+    """The output must be a valid permutation (unique values, full range)."""
+    cp, H = 4, 3
+    perm = zigzag_ag_to_global_index(cp, H)
+    n = cp * 2 * H
+    assert perm.unique().numel() == n
+    assert perm.min() == 0
+    assert perm.max() == n - 1
+
+
+def test_zigzag_ag_to_global_roundtrip_cp1():
+    """cp=1 degenerates: rank owns everything, AG layout = global order."""
+    cp, S = 1, 4
+    H = S // (2 * cp)
+    loc = zigzag_local_token_indices(0, cp, S)
+    assert loc.tolist() == list(range(S))
+    perm = zigzag_ag_to_global_index(cp, H)
+    assert perm.tolist() == list(range(S))
+    inv = zigzag_global_to_ag_index(cp, H)
+    assert inv.tolist() == list(range(S))
+
+
+# ---------------------------------------------------------------------------
+# pack mode: validation + zigzag scatter/gather
+# ---------------------------------------------------------------------------
+
+
+class _NoCollectiveBackend:
+    """Backend that fails if any collective is invoked."""
+
+    def all_gather(self, *args, **kwargs):
+        raise AssertionError("unexpected all_gather")
+
+    def all_gather_into_tensor(self, *args, **kwargs):
+        raise AssertionError("unexpected all_gather_into_tensor")
+
+    def all_reduce(self, *args, **kwargs):
+        raise AssertionError("unexpected all_reduce")
+
+    def reduce_scatter(self, *args, **kwargs):
+        raise AssertionError("unexpected reduce_scatter")
+
+
+class _RecordingRSBackend(_RecordingGatherBackend):
+    """Extends gather mock with reduce_scatter recording."""
+
+    def __init__(self, shards: list[torch.Tensor]):
+        super().__init__(shards)
+        self.rs_calls: list[dict] = []
+
+    def reduce_scatter(self, output, input_list, *, group=None, op="sum"):
+        self.rs_calls.append(
+            {"output": output, "input_list": input_list, "group": group, "op": op}
+        )
+        # Sum corresponding chunks (simulate multi-rank contribution of one rank's view).
+        acc = input_list[0].clone()
+        for t in input_list[1:]:
+            acc = acc + t
+        output.copy_(acc)
+        return output
+
+
+def test_scatter_invalid_pack(monkeypatch):
+    ctx = _init_cp1(monkeypatch, "29810")
+    x = torch.randn(2, 8, 4)
+    with pytest.raises(ValueError, match="pack"):
+        scatter_to_context_parallel_region(
+            x, ctx.context_parallel_group, ctx.backend, 0, 1, pack="round_robin"
+        )
+
+
+def test_gather_invalid_pack(monkeypatch):
+    ctx = _init_cp1(monkeypatch, "29811")
+    x = torch.randn(2, 8, 4)
+    with pytest.raises(ValueError, match="pack"):
+        gather_from_context_parallel_region(
+            x, ctx.context_parallel_group, ctx.backend, 0, 1, pack="round_robin"
+        )
+
+
+def test_scatter_gather_zigzag_identity_cp1(monkeypatch):
+    """cp_size=1 + pack=zigzag is identity (same as contiguous)."""
+    ctx = _init_cp1(monkeypatch, "29812")
+    x = torch.randn(2, 8, 4, requires_grad=True)
+    y = scatter_to_context_parallel_region(
+        x, ctx.context_parallel_group, ctx.backend, 0, 1, pack="zigzag"
+    )
+    assert torch.equal(y, x)
+    z = gather_from_context_parallel_region(
+        y, ctx.context_parallel_group, ctx.backend, 0, 1, pack="zigzag"
+    )
+    assert torch.equal(z, x)
+    z.sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+
+
+def test_scatter_zigzag_forward_backward_no_collective():
+    """Zigzag scatter uses index_select; backward pads zeros at zigzag indices.
+
+    No collective is required — dummy group/backend are fine for cp_size>1.
+    """
+    backend = _NoCollectiveBackend()
+    x = torch.arange(16.0).view(1, 8, 2).requires_grad_(True)
+    # rank 0 of cp2: local [0,1,6,7]
+    y = scatter_to_context_parallel_region(
+        x, None, backend, 0, 2, seq_dim=1, pack="zigzag"
+    )
+    expected_y = x.detach()[:, [0, 1, 6, 7], :]
+    assert torch.equal(y, expected_y)
+    y.sum().backward()
+    expected_grad = torch.zeros_like(x)
+    expected_grad[:, [0, 1, 6, 7], :] = 1.0
+    assert torch.equal(x.grad, expected_grad)
+
+
+def test_scatter_zigzag_forward_backward_rank1():
+    """Zigzag scatter rank 1 of cp2 owns [2,3,4,5]."""
+    backend = _NoCollectiveBackend()
+    x = torch.arange(16.0).view(1, 8, 2).requires_grad_(True)
+    y = scatter_to_context_parallel_region(
+        x, None, backend, 1, 2, seq_dim=1, pack="zigzag"
+    )
+    assert torch.equal(y, x.detach()[:, [2, 3, 4, 5], :])
+    (y * torch.arange(1, 9, dtype=y.dtype).view(1, 4, 2)).sum().backward()
+    expected_grad = torch.zeros_like(x)
+    expected_grad[:, [2, 3, 4, 5], :] = torch.arange(1, 9, dtype=x.dtype).view(1, 4, 2)
+    assert torch.equal(x.grad, expected_grad)
+
+
+def test_scatter_zigzag_seq_dim_2():
+    """Zigzag scatter works when sequence is on dim 2."""
+    backend = _NoCollectiveBackend()
+    x = torch.arange(32.0).view(1, 2, 8, 2).requires_grad_(True)
+    y = scatter_to_context_parallel_region(
+        x, None, backend, 0, 2, seq_dim=2, pack="zigzag"
+    )
+    assert y.shape == (1, 2, 4, 2)
+    assert torch.equal(y, x.detach()[:, :, [0, 1, 6, 7], :])
+    y.sum().backward()
+    expected = torch.zeros_like(x)
+    expected[:, :, [0, 1, 6, 7], :] = 1.0
+    assert torch.equal(x.grad, expected)
+
+
+def test_scatter_zigzag_math_matches_helper():
+    """Document: zigzag scatter shard equals index_select with helper indices."""
+    x = torch.arange(32.0).view(1, 16, 2)
+    for rank in range(4):
+        idx = zigzag_local_token_indices(rank, 4, 16)
+        expected = x.index_select(1, idx)
+        y = scatter_to_context_parallel_region(
+            x, None, _NoCollectiveBackend(), rank, 4, seq_dim=1, pack="zigzag"
+        )
+        assert torch.equal(y, expected)
+
+
+def test_scatter_contiguous_default_unchanged(monkeypatch):
+    """Default pack=contiguous keeps narrow behavior (bit-identical path)."""
+    from nano_megatron.parallel.context_parallel import (
+        _ScatterToContextParallelRegion,
+    )
+
+    backend = _NoCollectiveBackend()
+    x = torch.arange(16.0).view(1, 8, 2).requires_grad_(True)
+    # Public API default
+    y = scatter_to_context_parallel_region(x, None, backend, 1, 2, seq_dim=1)
+    assert torch.equal(y, x.detach()[:, 4:8, :])
+    y.sum().backward()
+    expected = torch.zeros_like(x)
+    expected[:, 4:8, :] = 1.0
+    assert torch.equal(x.grad, expected)
+
+    # Direct Function still accepts pack for internal callers
+    x2 = torch.arange(16.0).view(1, 8, 2).requires_grad_(True)
+    y2 = _ScatterToContextParallelRegion.apply(
+        x2, None, backend, 0, 2, 1, "contiguous"
+    )
+    assert torch.equal(y2, x2.detach()[:, 0:4, :])
+
+
+def test_gather_zigzag_forward_keeps_ag_layout():
+    """Zigzag gather: AG rank-concat only (no full-sequence unpermute)."""
+    cp_size = 2
+    seq_dim = 1
+    S = 8
+    # Local zigzag shards
+    full = torch.arange(S * 2, dtype=torch.float32).view(1, S, 2)
+    shard0 = full.index_select(1, zigzag_local_token_indices(0, cp_size, S))
+    shard1 = full.index_select(1, zigzag_local_token_indices(1, cp_size, S))
+    # AG layout = rank-concat of locals
+    ag = torch.cat([shard0, shard1], dim=seq_dim)
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+    backend = _RecordingGatherBackend(shards_dim0)
+
+    out = gather_from_context_parallel_region(
+        shard0.clone(), None, backend, 0, cp_size, seq_dim=seq_dim, pack="zigzag"
+    )
+    assert len(backend.into_calls) == 1
+    assert torch.equal(out, ag)
+    # Optional helper restores global order for tests / unfused.
+    assert torch.equal(unpermute_ag_to_global(out, cp_size, seq_dim=seq_dim), full)
+
+
+def test_scatter_gather_zigzag_roundtrip_via_unpermute():
+    """scatter zig → gather AG → unpermute_ag_to_global → original."""
+    cp_size = 2
+    seq_dim = 1
+    S = 8
+    full = torch.arange(S * 2, dtype=torch.float32).view(1, S, 2)
+    locals_ = [
+        scatter_to_context_parallel_region(
+            full, None, _NoCollectiveBackend(), r, cp_size, seq_dim=seq_dim, pack="zigzag"
+        )
+        for r in range(cp_size)
+    ]
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in locals_]
+    backend = _RecordingGatherBackend(shards_dim0)
+    ag = gather_from_context_parallel_region(
+        locals_[0].clone(),
+        None,
+        backend,
+        0,
+        cp_size,
+        seq_dim=seq_dim,
+        pack="zigzag",
+    )
+    restored = unpermute_ag_to_global(ag, cp_size, seq_dim=seq_dim)
+    assert torch.equal(restored, full)
+
+
+def test_gather_zigzag_backward_split_ag_chunk():
+    """Zigzag gather bwd split: local AG chunk (same as contiguous)."""
+    cp_size = 2
+    seq_dim = 1
+    S = 8
+    full = torch.arange(S * 2, dtype=torch.float32).view(1, S, 2)
+    shard0 = full.index_select(1, zigzag_local_token_indices(0, cp_size, S))
+    shard1 = full.index_select(1, zigzag_local_token_indices(1, cp_size, S))
+    ag = torch.cat([shard0, shard1], dim=seq_dim)
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+
+    for rank, local in ((0, shard0), (1, shard1)):
+        backend = _RecordingGatherBackend(shards_dim0)
+        x = local.clone().requires_grad_(True)
+        y = gather_from_context_parallel_region(
+            x,
+            None,
+            backend,
+            rank,
+            cp_size,
+            seq_dim=seq_dim,
+            grad_op="split",
+            pack="zigzag",
+        )
+        assert torch.equal(y.detach(), ag)
+        # Upstream grad in AG layout (matches forward output layout).
+        grad_ag = torch.arange(100, 100 + S * 2, dtype=torch.float32).view(1, S, 2)
+        y.backward(grad_ag)
+        chunk = S // cp_size
+        expected_local = grad_ag.narrow(seq_dim, rank * chunk, chunk).contiguous()
+        assert torch.equal(x.grad, expected_local)
+
+
+def test_gather_zigzag_backward_reduce_scatter_no_inv_perm():
+    """Zigzag gather bwd RS: chunk AG grad directly (no inv-permute)."""
+    cp_size = 2
+    seq_dim = 1
+    S = 8
+    full = torch.arange(S * 2, dtype=torch.float32).view(1, S, 2)
+    shard0 = full.index_select(1, zigzag_local_token_indices(0, cp_size, S))
+    shard1 = full.index_select(1, zigzag_local_token_indices(1, cp_size, S))
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+    backend = _RecordingRSBackend(shards_dim0)
+
+    x = shard0.clone().requires_grad_(True)
+    y = gather_from_context_parallel_region(
+        x,
+        None,
+        backend,
+        0,
+        cp_size,
+        seq_dim=seq_dim,
+        grad_op="reduce_scatter",
+        pack="zigzag",
+    )
+    # Grad matches AG forward layout.
+    grad_ag = torch.arange(100, 100 + S * 2, dtype=torch.float32).view(1, S, 2)
+    y.backward(grad_ag)
+
+    assert len(backend.rs_calls) == 1
+    call = backend.rs_calls[0]
+    expected_chunks = [c.contiguous() for c in grad_ag.chunk(cp_size, dim=seq_dim)]
+    assert len(call["input_list"]) == cp_size
+    for got, exp in zip(call["input_list"], expected_chunks):
+        assert torch.equal(got, exp)
+    expected_local = sum(expected_chunks)
+    assert torch.equal(x.grad, expected_local)
+
+
+def test_gather_contiguous_pack_default_still_ag_order(monkeypatch):
+    """Default pack=contiguous gather keeps AG rank-concat order (no unpermute)."""
+    cp_size = 2
+    seq_dim = 1
+    shard0 = torch.arange(0, 8, dtype=torch.float32).view(1, 4, 2)
+    shard1 = torch.arange(100, 108, dtype=torch.float32).view(1, 4, 2)
+    shards_dim0 = [s.movedim(seq_dim, 0).contiguous() for s in (shard0, shard1)]
+    backend = _RecordingGatherBackend(shards_dim0)
+    out = gather_from_context_parallel_region(
+        shard0.clone(), None, backend, 0, cp_size, seq_dim=seq_dim
+    )
+    expected = torch.cat([shard0, shard1], dim=seq_dim)
+    assert torch.equal(out, expected)

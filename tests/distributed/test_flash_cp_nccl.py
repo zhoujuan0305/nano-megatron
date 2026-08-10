@@ -84,11 +84,17 @@ def _small_cfg(*, attn_backend: str):
 
 
 def _gather_cp_seq(local: torch.Tensor, ctx) -> torch.Tensor:
-    from nano_megatron.parallel import gather_from_context_parallel_region
+    """All-gather CP sequence shards to full seq (global order for compare)."""
+    from nano_megatron.parallel import (
+        gather_from_context_parallel_region,
+        unpermute_ag_to_global,
+    )
 
     if ctx.context_parallel_size == 1:
         return local
-    return gather_from_context_parallel_region(
+    # Must match model scatter pack (default contiguous on ParallelConfig).
+    pack = getattr(ctx, "context_parallel_pack", "contiguous")
+    full = gather_from_context_parallel_region(
         local.detach(),
         ctx.context_parallel_group,
         ctx.backend,
@@ -96,7 +102,13 @@ def _gather_cp_seq(local: torch.Tensor, ctx) -> torch.Tensor:
         ctx.context_parallel_size,
         seq_dim=1,
         grad_op="split",
+        pack=pack,
     )
+    if pack == "zigzag":
+        full = unpermute_ag_to_global(
+            full, ctx.context_parallel_size, seq_dim=1
+        )
+    return full
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +156,7 @@ def test_worker_flash_cp2_vs_unfused_nccl():
         dist_backend="nccl",
     )
     assert ctx.context_parallel_size == 2
+    assert ctx.context_parallel_pack == "contiguous"
     assert ctx.world_size == 2
 
     torch.manual_seed(0)

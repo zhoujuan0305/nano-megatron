@@ -11,6 +11,13 @@ from nano_megatron.parallel.context_parallel import (
     gather_from_context_parallel_region,
     local_sequence_range,
     scatter_to_context_parallel_region,
+    unpermute_ag_to_global,
+    zigzag_ag_to_global_index,
+    zigzag_global_to_ag_index,
+    zigzag_half_ag_starts,
+    zigzag_half_ag_token_start,
+    zigzag_half_ids,
+    zigzag_local_token_indices,
 )
 from nano_megatron.parallel.context import (
     ParallelContext,
@@ -75,6 +82,13 @@ __all__ = [
     "scatter_to_context_parallel_region",
     "scatter_to_sequence_parallel_region",
     "unfused_causal_attention",
+    "unpermute_ag_to_global",
     "vocab_parallel_cross_entropy",
     "vocab_range_from_global",
+    "zigzag_ag_to_global_index",
+    "zigzag_global_to_ag_index",
+    "zigzag_half_ag_starts",
+    "zigzag_half_ag_token_start",
+    "zigzag_half_ids",
+    "zigzag_local_token_indices",
 ]

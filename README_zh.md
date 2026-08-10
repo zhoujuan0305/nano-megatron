@@ -12,7 +12,7 @@ English README: [README.md](README.md)
 | 张量并行 (TP) | 已支持 | 列/行并行 + vocab 并行 |
 | 序列并行 (SP) | 已支持 | 复用 TP process group |
 | 流水线并行 (PP) | 已支持 | 非交错 1F1B，同步 P2P |
-| 上下文并行 (CP) | 已支持 | 连续 AG-KV；FA 路径为 AG + 分块 flash（非 P2P ring）；不与 PP/SP 组合；`cp>1` 时包 DDP |
+| 上下文并行 (CP) | 已支持 | AG-KV + 分块 FA（默认 **prefix-concat** 多块，`NANO_CP_FA_CHUNK`）；pack 默认 `contiguous`，可选 `zigzag`；非 P2P ring；不与 PP/SP 组合；`cp>1` 时包 DDP |
 | FlashAttention | 已支持 | 可选 `flash-attn`；`attn_backend=auto\|flash\|unfused`；覆盖 TP + CP |
 | TP×DP / TP×PP / DP×PP / TP×DP×PP | 已支持 | 通过 `ParallelContext` 组合 |
 | TP×CP / CP×DP | 已支持 | 通过 `ParallelContext` 组合 |
@@ -32,7 +32,7 @@ English README: [README.md](README.md)
 | TP×PP | FP32 | **约 0.92x** | |
 | TP / TP+SP | **BF16 + FA** | **0.87x – 0.92x** | 三个规模均覆盖 |
 | DP2 | **BF16 + FA** | **0.95x – 1.01x** | 显存 **0.77x – 0.81x** |
-| CP2 | **BF16 + FA** | **0.81x – 0.83x** | unfused 约 0.52x–0.73x；显存常更低 |
+| CP2 | **BF16 + FA** | **0.81x – 0.83x**（contiguous pack） | 默认 pack **contiguous** + prefix-concat 多块 FA；zigzag 可选（`--cp-pack`）；显存常更低 |
 
 完整表格（按规模）：**[performance.md](performance.md)** §2.1（345M）· §3.1（760M）· §4.1（1.3B）。
 
@@ -64,7 +64,7 @@ config = ReferenceGPTConfig(attn_backend="auto")  # 默认
 | `"flash"` | 要求 CUDA + fp16/bf16 + `flash-attn`；不可用时抛出 `RuntimeError` |
 | `"unfused"` | 始终使用参考实现：scores→softmax→matmul |
 
-**上下文并行（CP）说明：** CP flash 路径使用连续 all-gather + 分块 FA（非 TE zigzag ring）。`attention_dropout > 0` 且 `cp > 1` 时，flash CP 路径**不支持**（分块反向传播无法传递 dropout RNG 状态）。
+**上下文并行（CP）说明：** CP flash 路径为 all-gather KV + 多块 FlashAttention（非 TE P2P ring）。多块 FA 默认 **prefix-concat**（`NANO_CP_FA_CHUNK=prefix`）：将非因果 KV 块拼接为一次 FA，再对本地块做一次因果 FA，最后 online-softmax 合并（每个 Q-shard ≤2 次 launch）；`legacy` 为每个 KV 块一次 launch。序列 pack 由 `ParallelConfig.context_parallel_pack` / bench `--cp-pack {contiguous,zigzag}` 控制（默认 **contiguous**）。`attention_dropout > 0` 且 `cp > 1` 时，flash CP 路径**不支持**（多块反向无法传递 dropout RNG 状态）。
 
 ### 运行参考模型
 

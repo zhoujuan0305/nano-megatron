@@ -55,15 +55,18 @@ def test_tp_cp_size1_stores_cp_fields(monkeypatch):
     ctx = _init_cp1(monkeypatch, "29610")
     assert ctx.context_parallel_size == 1
     assert ctx.context_parallel_rank == 0
+    assert ctx.context_parallel_pack == "contiguous"
     torch.manual_seed(0)
     ref = ReferenceGPT(_cfg())
     tp = build_tp_gpt_from_reference(ref, ctx)
     assert tp._cp_size == 1
     assert tp._cp_rank == 0
+    assert tp._cp_pack == "contiguous"
     assert tp._cp_group is not None
     for block in tp.blocks:
         assert block.attn._cp_size == 1
         assert block.attn._cp_rank == 0
+        assert block.attn._cp_pack == "contiguous"
         assert block.attn._cp_group is not None
 
 
@@ -111,10 +114,29 @@ def test_tp_cp_rejects_nondivisible_seq_len(monkeypatch):
     tp = build_tp_gpt_from_reference(ref, ctx)
     # Simulate multi-rank CP config on a single process for the divisibility check.
     tp._cp_size = 2
+    tp._cp_pack = "contiguous"
     for block in tp.blocks:
         block.attn._cp_size = 2
+        block.attn._cp_pack = "contiguous"
     ids = torch.randint(0, 16, (2, 5))  # 5 % 2 != 0
     with pytest.raises(ValueError, match="context_parallel_size"):
+        tp(ids)
+
+
+def test_tp_cp_zigzag_rejects_nondivisible_by_2cp(monkeypatch):
+    """Zigzag pack requires seq_len % (2 * cp_size) == 0."""
+    ctx = _init_cp1(monkeypatch, "29616")
+    torch.manual_seed(6)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    tp._cp_size = 2
+    tp._cp_pack = "zigzag"
+    for block in tp.blocks:
+        block.attn._cp_size = 2
+        block.attn._cp_pack = "zigzag"
+    # 6 % 2 == 0 but 6 % 4 != 0
+    ids = torch.randint(0, 16, (2, 6))
+    with pytest.raises(ValueError, match="2 \\* context_parallel_size"):
         tp(ids)
 
 
@@ -126,6 +148,7 @@ def test_tp_cp_local_ce_rejects_local_labels(monkeypatch):
     tp = build_tp_gpt_from_reference(ref, ctx)
     tp._cp_size = 2
     tp._cp_rank = 0
+    tp._cp_pack = "contiguous"
     # Local logits [B, S/2, V] with full-seq labels would be OK; local labels not.
     logits = torch.randn(2, 4, 16, requires_grad=True)
     local_labels = torch.randint(0, 16, (2, 4))
@@ -139,9 +162,10 @@ def test_tp_cp_local_ce_pairs_and_scale(monkeypatch):
     torch.manual_seed(5)
     ref = ReferenceGPT(_cfg())
     tp = build_tp_gpt_from_reference(ref, ctx)
-    # Simulate cp=2 rank0 on a fixed full sequence without running CP forward.
+    # Simulate contiguous cp=2 rank0 on a fixed full sequence.
     tp._cp_size = 2
     tp._cp_rank = 0
+    tp._cp_pack = "contiguous"
     b, s, v = 2, 8, 16
     full_logits = torch.randn(b, s, v, requires_grad=True)
     labels = torch.randint(0, v, (b, s))
@@ -173,4 +197,53 @@ def test_tp_cp_local_ce_pairs_and_scale(monkeypatch):
     ref_loss = shifted_cross_entropy(full_logits, labels)
     assert torch.allclose(
         (loss_local + loss1) * 0.5, ref_loss, atol=1e-5, rtol=1e-4
+    )
+
+
+def test_tp_cp_zigzag_ce_index_mapping_and_scale(monkeypatch):
+    """Zigzag CE maps local logits via zigzag indices; mean of ranks = full CE."""
+    from nano_megatron.parallel.context_parallel import zigzag_local_token_indices
+    from nano_megatron.parallel.vocab_parallel import (
+        vocab_parallel_cross_entropy_from_shifted,
+    )
+
+    ctx = _init_cp1(monkeypatch, "29617")
+    torch.manual_seed(7)
+    ref = ReferenceGPT(_cfg())
+    tp = build_tp_gpt_from_reference(ref, ctx)
+    tp._cp_size = 2
+    tp._cp_pack = "zigzag"
+    b, s, v = 2, 8, 16
+    full_logits = torch.randn(b, s, v, requires_grad=True)
+    labels = torch.randint(0, v, (b, s))
+
+    losses = []
+    for rank in (0, 1):
+        tp._cp_rank = rank
+        idx = zigzag_local_token_indices(rank, 2, s)
+        local = full_logits.index_select(1, idx).contiguous()
+        loss = tp.shifted_cross_entropy(local, labels)
+        losses.append(loss)
+
+        # Manual expected for this rank.
+        keep = idx < (s - 1)
+        local_t = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        global_g = idx.index_select(0, local_t)
+        shift_logits = local.index_select(1, local_t)
+        shift_labels = labels.index_select(1, global_g + 1)
+        local_sum = vocab_parallel_cross_entropy_from_shifted(
+            shift_logits,
+            shift_labels,
+            vocab_start_index=0,
+            vocab_end_index=v,
+            group=tp._tp_group,
+            backend=tp._tp_backend,
+            reduction="sum",
+        )
+        expected = local_sum * 2.0 / (labels[:, 1:] != -100).sum().to(local_sum.dtype)
+        assert torch.allclose(loss, expected, atol=1e-6, rtol=1e-5)
+
+    ref_loss = shifted_cross_entropy(full_logits, labels)
+    assert torch.allclose(
+        (losses[0] + losses[1]) * 0.5, ref_loss, atol=1e-5, rtol=1e-4
     )

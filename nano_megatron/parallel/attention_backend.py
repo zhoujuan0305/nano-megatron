@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 import torch
@@ -11,12 +12,43 @@ from nano_megatron.distributed.backend import CommBackend
 from nano_megatron.parallel.context_parallel import (
     causal_attn_scores_cp,
     gather_from_context_parallel_region,
+    zigzag_half_ag_token_start,
+    zigzag_half_ids,
 )
+
+CPPackName = Literal["contiguous", "zigzag"]
+_VALID_CP_PACK = frozenset({"contiguous", "zigzag"})
 
 AttentionBackendName = Literal["flash", "unfused"]
 RequestedAttentionBackend = Literal["auto", "flash", "unfused"]
 
+# CP chunked-FA multi-block strategy:
+# - "prefix": cat non-causal KV blocks → 1 FA + 1 causal FA + online combine
+# - "legacy": one FA launch per KV block (original loop)
+CPFaChunkMode = Literal["prefix", "legacy"]
+_VALID_CP_FA_CHUNK = frozenset({"prefix", "legacy"})
+_CP_FA_CHUNK_ENV = "NANO_CP_FA_CHUNK"
+_DEFAULT_CP_FA_CHUNK: CPFaChunkMode = "prefix"
+
 _FLASH_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def resolve_cp_fa_chunk_mode(mode: str | None = None) -> CPFaChunkMode:
+    """Resolve CP multi-block FA chunk mode.
+
+    Priority: explicit ``mode`` arg → env ``NANO_CP_FA_CHUNK`` → default
+    ``"prefix"``.  Valid values: ``"prefix"``, ``"legacy"``.
+    """
+    if mode is None:
+        raw = os.environ.get(_CP_FA_CHUNK_ENV, _DEFAULT_CP_FA_CHUNK)
+    else:
+        raw = mode
+    if raw not in _VALID_CP_FA_CHUNK:
+        raise ValueError(
+            f"CP FA chunk mode must be one of {sorted(_VALID_CP_FA_CHUNK)}; "
+            f"got {raw!r} (env {_CP_FA_CHUNK_ENV} or chunk_mode arg)"
+        )
+    return raw  # type: ignore[return-value]
 
 
 def flash_attn_available() -> bool:
@@ -352,15 +384,372 @@ def _flash_bwd_block(
     return dq, dk, dv
 
 
+def _check_cp_pack(pack: str) -> None:
+    if pack not in _VALID_CP_PACK:
+        raise ValueError(
+            f"pack must be 'contiguous' or 'zigzag', got {pack!r}"
+        )
+
+
+def _chunked_fa_combine_blocks(
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    v_bshd: Tensor,
+    *,
+    block_starts: range | list[int],
+    block_len: int,
+    causal_block: int,
+    scale: float,
+    dropout_p: float,
+    mode: str | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Run flash over KV blocks and online-softmax-combine.
+
+    Two multi-block strategies (``mode`` / env ``NANO_CP_FA_CHUNK``):
+
+    * ``legacy``: one FA launch per start, sequential online-softmax combine.
+    * ``prefix`` (default): concatenate all non-last (non-causal) KV blocks into
+      one FA call (``causal=False``), one FA on the last block
+      (``causal`` iff that start equals ``causal_block``), then a single
+      online-softmax combine.  Caps launches at 2 per Q-shard regardless of
+      how many prior blocks are visible (standard CP: causal only on last).
+
+    Args:
+        q_bshd: Query in BSHD layout ``[B, S_q, H, D]``.
+        k_bshd / v_bshd: Full KV in BSHD (AG or global layout).
+        block_starts: Iterable of block start indices (in tokens) to attend.
+        block_len: Tokens per KV block (all starts must use the same length).
+        causal_block: Block start index that uses ``causal=True`` (the query's
+            own block); all earlier blocks use ``causal=False``.
+        scale / dropout_p: Passed to flash-attn.
+        mode: ``"prefix"`` | ``"legacy"`` | ``None`` (resolve from env).
+
+    Returns:
+        ``(out_bhsd [B,H,S_q,D], lse_bhs [B,H,S_q])``.
+    """
+    chunk_mode = resolve_cp_fa_chunk_mode(mode)
+    starts = list(block_starts)
+    if not starts:
+        raise ValueError("block_starts must be non-empty")
+    if block_len < 1:
+        raise ValueError(f"block_len must be >= 1, got {block_len}")
+
+    if chunk_mode == "legacy":
+        return _chunked_fa_combine_blocks_legacy(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            block_starts=starts,
+            block_len=block_len,
+            causal_block=causal_block,
+            scale=scale,
+            dropout_p=dropout_p,
+        )
+
+    # --- prefix path ---
+    # Standard CP: only the last start may be the causal block.
+    if len(starts) >= 2:
+        for s in starts[:-1]:
+            if s == causal_block:
+                raise ValueError(
+                    "prefix chunk mode expects causal_block only on the last "
+                    f"start; got causal_block={causal_block}, starts={starts}"
+                )
+
+    if len(starts) == 1:
+        s0 = starts[0]
+        k_j = k_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        v_j = v_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        out_i_bshd, lse_i = _flash_fwd_out_lse(
+            q_bshd,
+            k_j,
+            v_j,
+            scale=scale,
+            causal=(s0 == causal_block),
+            dropout_p=dropout_p,
+        )
+        return _to_bhsd(out_i_bshd), lse_i
+
+    # n >= 2: one non-causal FA on cat(prefix), one FA on last, one combine.
+    # Single prefix block: skip cat (same as legacy first launch).
+    pref_starts = starts[:-1]
+    if len(pref_starts) == 1:
+        s0 = pref_starts[0]
+        k_pref = k_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        v_pref = v_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+    else:
+        k_pref = torch.cat(
+            [k_bshd[:, s : s + block_len, :, :] for s in pref_starts],
+            dim=1,
+        ).contiguous()
+        v_pref = torch.cat(
+            [v_bshd[:, s : s + block_len, :, :] for s in pref_starts],
+            dim=1,
+        ).contiguous()
+    out0_bshd, lse0 = _flash_fwd_out_lse(
+        q_bshd,
+        k_pref,
+        v_pref,
+        scale=scale,
+        causal=False,
+        dropout_p=dropout_p,
+    )
+    s_last = starts[-1]
+    k_last = k_bshd[:, s_last : s_last + block_len, :, :].contiguous()
+    v_last = v_bshd[:, s_last : s_last + block_len, :, :].contiguous()
+    out1_bshd, lse1 = _flash_fwd_out_lse(
+        q_bshd,
+        k_last,
+        v_last,
+        scale=scale,
+        causal=(s_last == causal_block),
+        dropout_p=dropout_p,
+    )
+    return _online_softmax_combine(
+        _to_bhsd(out0_bshd), lse0, _to_bhsd(out1_bshd), lse1
+    )
+
+
+def _chunked_fa_combine_blocks_legacy(
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    v_bshd: Tensor,
+    *,
+    block_starts: list[int],
+    block_len: int,
+    causal_block: int,
+    scale: float,
+    dropout_p: float,
+) -> tuple[Tensor, Tensor]:
+    """Per-block FA + sequential online-softmax combine (original path)."""
+    out_bhsd: Tensor | None = None
+    lse_bhs: Tensor | None = None
+    for start in block_starts:
+        k_j = k_bshd[:, start : start + block_len, :, :].contiguous()
+        v_j = v_bshd[:, start : start + block_len, :, :].contiguous()
+        causal = start == causal_block
+        out_i_bshd, lse_i = _flash_fwd_out_lse(
+            q_bshd,
+            k_j,
+            v_j,
+            scale=scale,
+            causal=causal,
+            dropout_p=dropout_p,
+        )
+        out_i = _to_bhsd(out_i_bshd)
+        if out_bhsd is None:
+            out_bhsd = out_i
+            lse_bhs = lse_i
+        else:
+            assert lse_bhs is not None
+            out_bhsd, lse_bhs = _online_softmax_combine(
+                out_bhsd, lse_bhs, out_i, lse_i
+            )
+    assert out_bhsd is not None and lse_bhs is not None
+    return out_bhsd, lse_bhs
+
+
+def _chunked_fa_bwd_blocks(
+    dout_bshd: Tensor,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    v_bshd: Tensor,
+    out_bshd: Tensor,
+    lse_bhs: Tensor,
+    *,
+    block_starts: range | list[int],
+    block_len: int,
+    causal_block: int,
+    scale: float,
+    dropout_p: float,
+    dq_bshd: Tensor,
+    dk_bshd: Tensor,
+    dv_bshd: Tensor,
+    mode: str | None = None,
+) -> None:
+    """Accumulate blockwise flash backward into ``dq`` / ``dk`` / ``dv`` (BSHD).
+
+    Mirrors :func:`_chunked_fa_combine_blocks`:
+
+    * ``legacy``: one bwd per start.
+    * ``prefix``: one bwd on cat(prefix KV), scatter ``dK``/``dV`` back to each
+      prefix slice with ``add_``; one bwd on the last block; ``dQ`` accumulates.
+    """
+    chunk_mode = resolve_cp_fa_chunk_mode(mode)
+    starts = list(block_starts)
+    if not starts:
+        raise ValueError("block_starts must be non-empty")
+    if block_len < 1:
+        raise ValueError(f"block_len must be >= 1, got {block_len}")
+
+    if chunk_mode == "legacy":
+        _chunked_fa_bwd_blocks_legacy(
+            dout_bshd,
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            out_bshd,
+            lse_bhs,
+            block_starts=starts,
+            block_len=block_len,
+            causal_block=causal_block,
+            scale=scale,
+            dropout_p=dropout_p,
+            dq_bshd=dq_bshd,
+            dk_bshd=dk_bshd,
+            dv_bshd=dv_bshd,
+        )
+        return
+
+    # --- prefix path ---
+    if len(starts) >= 2:
+        for s in starts[:-1]:
+            if s == causal_block:
+                raise ValueError(
+                    "prefix chunk mode expects causal_block only on the last "
+                    f"start; got causal_block={causal_block}, starts={starts}"
+                )
+
+    if len(starts) == 1:
+        s0 = starts[0]
+        k_j = k_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        v_j = v_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        dqi, dki, dvi = _flash_bwd_block(
+            dout_bshd,
+            q_bshd,
+            k_j,
+            v_j,
+            out_bshd,
+            lse_bhs,
+            scale=scale,
+            causal=(s0 == causal_block),
+            dropout_p=dropout_p,
+        )
+        dq_bshd.add_(dqi)
+        dk_bshd[:, s0 : s0 + block_len, :, :].add_(dki)
+        dv_bshd[:, s0 : s0 + block_len, :, :].add_(dvi)
+        return
+
+    pref_starts = starts[:-1]
+    if len(pref_starts) == 1:
+        s0 = pref_starts[0]
+        k_pref = k_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+        v_pref = v_bshd[:, s0 : s0 + block_len, :, :].contiguous()
+    else:
+        k_pref = torch.cat(
+            [k_bshd[:, s : s + block_len, :, :] for s in pref_starts],
+            dim=1,
+        ).contiguous()
+        v_pref = torch.cat(
+            [v_bshd[:, s : s + block_len, :, :] for s in pref_starts],
+            dim=1,
+        ).contiguous()
+    dqi0, dki_pref, dvi_pref = _flash_bwd_block(
+        dout_bshd,
+        q_bshd,
+        k_pref,
+        v_pref,
+        out_bshd,
+        lse_bhs,
+        scale=scale,
+        causal=False,
+        dropout_p=dropout_p,
+    )
+    dq_bshd.add_(dqi0)
+    if len(pref_starts) == 1:
+        s0 = pref_starts[0]
+        dk_bshd[:, s0 : s0 + block_len, :, :].add_(dki_pref)
+        dv_bshd[:, s0 : s0 + block_len, :, :].add_(dvi_pref)
+    else:
+        for i, s in enumerate(pref_starts):
+            sl = slice(i * block_len, (i + 1) * block_len)
+            dk_bshd[:, s : s + block_len, :, :].add_(dki_pref[:, sl, :, :])
+            dv_bshd[:, s : s + block_len, :, :].add_(dvi_pref[:, sl, :, :])
+
+    s_last = starts[-1]
+    k_last = k_bshd[:, s_last : s_last + block_len, :, :].contiguous()
+    v_last = v_bshd[:, s_last : s_last + block_len, :, :].contiguous()
+    dqi1, dki1, dvi1 = _flash_bwd_block(
+        dout_bshd,
+        q_bshd,
+        k_last,
+        v_last,
+        out_bshd,
+        lse_bhs,
+        scale=scale,
+        causal=(s_last == causal_block),
+        dropout_p=dropout_p,
+    )
+    dq_bshd.add_(dqi1)
+    dk_bshd[:, s_last : s_last + block_len, :, :].add_(dki1)
+    dv_bshd[:, s_last : s_last + block_len, :, :].add_(dvi1)
+
+
+def _chunked_fa_bwd_blocks_legacy(
+    dout_bshd: Tensor,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    v_bshd: Tensor,
+    out_bshd: Tensor,
+    lse_bhs: Tensor,
+    *,
+    block_starts: list[int],
+    block_len: int,
+    causal_block: int,
+    scale: float,
+    dropout_p: float,
+    dq_bshd: Tensor,
+    dk_bshd: Tensor,
+    dv_bshd: Tensor,
+) -> None:
+    """Per-block flash backward (original path)."""
+    for start in block_starts:
+        k_j = k_bshd[:, start : start + block_len, :, :].contiguous()
+        v_j = v_bshd[:, start : start + block_len, :, :].contiguous()
+        causal = start == causal_block
+        dqi, dki, dvi = _flash_bwd_block(
+            dout_bshd,
+            q_bshd,
+            k_j,
+            v_j,
+            out_bshd,
+            lse_bhs,
+            scale=scale,
+            causal=causal,
+            dropout_p=dropout_p,
+        )
+        dq_bshd.add_(dqi)
+        dk_bshd[:, start : start + block_len, :, :] = (
+            dk_bshd[:, start : start + block_len, :, :] + dki
+        )
+        dv_bshd[:, start : start + block_len, :, :] = (
+            dv_bshd[:, start : start + block_len, :, :] + dvi
+        )
+
+
 class _FlashChunkedCPCausalAttention(torch.autograd.Function):
-    """Contiguous-CP causal attention via chunked FlashAttention.
+    """CP causal attention via chunked FlashAttention (contiguous or zigzag).
 
-    Forward: for KV block ``j <= cp_rank``, run flash (``causal`` only when
-    ``j == cp_rank``) and online-softmax-combine.  KV blocks with
-    ``j > cp_rank`` are fully masked and skipped.
+    **Contiguous** (``pack="contiguous"``): for KV rank-block ``j <= cp_rank``,
+    run flash (``causal`` only when ``j == cp_rank``) and online-softmax-combine.
+    KV blocks with ``j > cp_rank`` are fully masked and skipped.  Block size
+    is ``S/cp``.  ``K_full``/``V_full`` are AG rank-concat (= global order).
 
-    Backward: flash blockwise backward with the *global* combined ``out`` and
-    ``lse`` (standard ring/block FA backward), accumulating ``dq`` and writing
+    **Zigzag** (``pack="zigzag"``): local ``Q`` is zigzag ``[half_a; half_b]``;
+    ``K_full``/``V_full`` are **AG rank-concat layout** (no unpermute).  For
+    each local half with global half-id ``g``, attend AG half-blocks
+    ``j = 0..g`` via :func:`zigzag_half_ag_token_start`, with
+    ``causal`` only on half ``g``.  Half size ``H = S/(2·cp)``.  ``dk``/``dv``
+    are written at AG offsets so gather backward can RS without inv-permute.
+
+    **Multi-block FA chunking** (``chunk_mode`` / env ``NANO_CP_FA_CHUNK``):
+
+    * ``prefix`` (default): cat non-causal KV blocks into one FA + one causal
+      FA + one online combine (≤2 launches per Q-shard).
+    * ``legacy``: one FA launch per visible KV block.
+
+    Backward: flash blockwise backward with the combined ``out`` and ``lse``
+    (standard ring/block FA backward), accumulating ``dq`` and writing
     per-block ``dk``/``dv``.
 
     Communication is *not* handled here — callers all-gather local K/V first
@@ -378,6 +767,8 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
         cp_rank: int,
         cp_size: int,
         dropout_p: float,
+        pack: str,
+        chunk_mode: str,
     ) -> Tensor:
         if dropout_p != 0.0:
             raise RuntimeError(
@@ -385,6 +776,10 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
                 f"dropout_p={dropout_p}.  The chunked backward cannot propagate "
                 f"the RNG state required for correct dropout gradients."
             )
+        _check_cp_pack(pack)
+        resolved_chunk = resolve_cp_fa_chunk_mode(
+            None if chunk_mode == "" else chunk_mode
+        )
         if q.dim() != 4 or k_full.dim() != 4 or v_full.dim() != 4:
             raise ValueError(
                 f"q, k, v must be 4D [B,H,S,D]; got q={tuple(q.shape)}, "
@@ -424,33 +819,63 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
         k_bshd = _to_bshd(k_full)
         v_bshd = _to_bshd(v_full)
 
-        out_bhsd: Tensor | None = None
-        lse_bhs: Tensor | None = None
-
-        # Contiguous CP: only KV ranks j <= cp_rank are visible.
-        for j in range(cp_rank + 1):
-            k_j = k_bshd[:, j * s_local : (j + 1) * s_local, :, :].contiguous()
-            v_j = v_bshd[:, j * s_local : (j + 1) * s_local, :, :].contiguous()
-            causal = j == cp_rank
-            out_i_bshd, lse_i = _flash_fwd_out_lse(
+        if pack == "contiguous":
+            # Contiguous CP: only KV ranks j <= cp_rank are visible.
+            # Block size = S/cp (rank blocks). Shared helper handles prefix/legacy.
+            block_starts = [j * s_local for j in range(cp_rank + 1)]
+            causal_block = cp_rank * s_local
+            out_bhsd, lse_bhs = _chunked_fa_combine_blocks(
                 q_bshd,
-                k_j,
-                v_j,
+                k_bshd,
+                v_bshd,
+                block_starts=block_starts,
+                block_len=s_local,
+                causal_block=causal_block,
                 scale=scale,
-                causal=causal,
                 dropout_p=dropout_p,
+                mode=resolved_chunk,
             )
-            out_i = _to_bhsd(out_i_bshd)
-            if out_bhsd is None:
-                out_bhsd = out_i
-                lse_bhs = lse_i
-            else:
-                assert lse_bhs is not None
-                out_bhsd, lse_bhs = _online_softmax_combine(
-                    out_bhsd, lse_bhs, out_i, lse_i
+            half_len = 0  # unused for contiguous
+        else:
+            # Zigzag: Q is [half_a; half_b]; K/V full are AG rank-concat layout.
+            # Half size H = S / (2 * cp). For each local half with global id g,
+            # attend AG half-blocks j=0..g (via half→AG start map) with causal
+            # only on half g.
+            if s_full % (2 * cp_size) != 0:
+                raise ValueError(
+                    f"full KV seq len ({s_full}) not divisible by "
+                    f"2 * cp_size ({2 * cp_size}) for zigzag pack"
                 )
-
-        assert out_bhsd is not None and lse_bhs is not None
+            half_len = s_full // (2 * cp_size)
+            if s_local != 2 * half_len:
+                raise ValueError(
+                    f"zigzag local seq must be 2*H={2 * half_len}; got {s_local}"
+                )
+            half_ids = zigzag_half_ids(cp_rank, cp_size)
+            half_outs: list[Tensor] = []
+            half_lses: list[Tensor] = []
+            for t, g in enumerate(half_ids):
+                q_half = q_bshd[:, t * half_len : (t + 1) * half_len, :, :].contiguous()
+                block_starts = [
+                    zigzag_half_ag_token_start(j, cp_size, half_len)
+                    for j in range(g + 1)
+                ]
+                causal_block = zigzag_half_ag_token_start(g, cp_size, half_len)
+                out_h, lse_h = _chunked_fa_combine_blocks(
+                    q_half,
+                    k_bshd,
+                    v_bshd,
+                    block_starts=block_starts,
+                    block_len=half_len,
+                    causal_block=causal_block,
+                    scale=scale,
+                    dropout_p=dropout_p,
+                    mode=resolved_chunk,
+                )
+                half_outs.append(out_h)
+                half_lses.append(lse_h)
+            out_bhsd = torch.cat(half_outs, dim=2)
+            lse_bhs = torch.cat(half_lses, dim=2)
 
         ctx.save_for_backward(q, k_full, v_full, out_bhsd, lse_bhs)
         ctx.scale = scale
@@ -458,17 +883,24 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
         ctx.cp_size = cp_size
         ctx.dropout_p = dropout_p
         ctx.s_local = s_local
+        ctx.pack = pack
+        ctx.half_len = half_len
+        ctx.chunk_mode = resolved_chunk
         return out_bhsd
 
     @staticmethod
     def backward(
         ctx: Any, dout: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, None, None, None, None]:
+    ) -> tuple[Tensor, Tensor, Tensor, None, None, None, None, None, None]:
         q, k_full, v_full, out, lse = ctx.saved_tensors
         scale: float = ctx.scale
         cp_rank: int = ctx.cp_rank
+        cp_size: int = ctx.cp_size
         s_local: int = ctx.s_local
         dropout_p: float = ctx.dropout_p
+        pack: str = ctx.pack
+        half_len: int = ctx.half_len
+        chunk_mode: str = ctx.chunk_mode
 
         q_bshd = _to_bshd(q)
         k_bshd = _to_bshd(k_full)
@@ -494,24 +926,61 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
         dk_bshd = torch.zeros_like(k_bshd)
         dv_bshd = torch.zeros_like(v_bshd)
 
-        for j in range(cp_rank + 1):
-            k_j = k_bshd[:, j * s_local : (j + 1) * s_local, :, :].contiguous()
-            v_j = v_bshd[:, j * s_local : (j + 1) * s_local, :, :].contiguous()
-            causal = j == cp_rank
-            dqi, dki, dvi = _flash_bwd_block(
+        if pack == "contiguous":
+            block_starts = [j * s_local for j in range(cp_rank + 1)]
+            causal_block = cp_rank * s_local
+            _chunked_fa_bwd_blocks(
                 dout_bshd,
                 q_bshd,
-                k_j,
-                v_j,
+                k_bshd,
+                v_bshd,
                 out_bshd,
                 lse,
+                block_starts=block_starts,
+                block_len=s_local,
+                causal_block=causal_block,
                 scale=scale,
-                causal=causal,
                 dropout_p=dropout_p,
+                dq_bshd=dq_bshd,
+                dk_bshd=dk_bshd,
+                dv_bshd=dv_bshd,
+                mode=chunk_mode,
             )
-            dq_bshd = dq_bshd + dqi
-            dk_bshd[:, j * s_local : (j + 1) * s_local, :, :] = dki
-            dv_bshd[:, j * s_local : (j + 1) * s_local, :, :] = dvi
+        else:
+            # Zigzag: each local half has its own out/lse slice; accumulate dk/dv
+            # at AG offsets (a KV half may be visible to both local Q halves).
+            half_ids = zigzag_half_ids(cp_rank, cp_size)
+            for t, g in enumerate(half_ids):
+                sl = slice(t * half_len, (t + 1) * half_len)
+                q_half = q_bshd[:, sl, :, :].contiguous()
+                out_half = out_bshd[:, sl, :, :].contiguous()
+                dout_half = dout_bshd[:, sl, :, :].contiguous()
+                # lse is [B, H, S] (BHSD-style heads), not BSHD.
+                lse_half = lse[:, :, sl].contiguous()
+                dq_half = torch.zeros_like(q_half)
+                block_starts = [
+                    zigzag_half_ag_token_start(j, cp_size, half_len)
+                    for j in range(g + 1)
+                ]
+                causal_block = zigzag_half_ag_token_start(g, cp_size, half_len)
+                _chunked_fa_bwd_blocks(
+                    dout_half,
+                    q_half,
+                    k_bshd,
+                    v_bshd,
+                    out_half,
+                    lse_half,
+                    block_starts=block_starts,
+                    block_len=half_len,
+                    causal_block=causal_block,
+                    scale=scale,
+                    dropout_p=dropout_p,
+                    dq_bshd=dq_half,
+                    dk_bshd=dk_bshd,
+                    dv_bshd=dv_bshd,
+                    mode=chunk_mode,
+                )
+                dq_bshd[:, sl, :, :] = dq_half
 
         # Unpad gradients to original head_dim.
         if head_dim % 8 != 0:
@@ -523,6 +992,8 @@ class _FlashChunkedCPCausalAttention(torch.autograd.Function):
             _to_bhsd(dq_bshd),
             _to_bhsd(dk_bshd),
             _to_bhsd(dv_bshd),
+            None,
+            None,
             None,
             None,
             None,
@@ -539,10 +1010,17 @@ def _flash_chunked_cp_causal_attention(
     cp_rank: int,
     cp_size: int,
     dropout_p: float = 0.0,
+    pack: str = "contiguous",
+    chunk_mode: str | None = None,
 ) -> Tensor:
-    """Chunked FA over full KV for contiguous CP (no collective).  Test helper."""
+    """Chunked FA over full KV for CP (no collective).  Test / internal helper.
+
+    ``chunk_mode``: ``"prefix"`` | ``"legacy"`` | ``None`` (env / default).
+    Empty string is treated as ``None`` for the autograd Function boundary.
+    """
+    mode_arg = "" if chunk_mode is None else chunk_mode
     return _FlashChunkedCPCausalAttention.apply(
-        q, k_full, v_full, scale, cp_rank, cp_size, dropout_p
+        q, k_full, v_full, scale, cp_rank, cp_size, dropout_p, pack, mode_arg
     )
 
 
@@ -557,18 +1035,29 @@ def flash_ring_causal_attention(
     cp_size: int,
     backend: CommBackend | None,
     dropout_p: float = 0.0,
+    pack: str = "contiguous",
+    chunk_mode: str | None = None,
 ) -> Tensor:
-    """Causal attention for contiguous context-parallel shards (FlashAttention).
+    """Causal attention for context-parallel shards (FlashAttention).
 
     Layout at the API boundary is ``[B, H, S_local, D]`` for ``q`` and local
-    ``k``/``v``.  Rank ``r`` owns sequence range
-    ``[r * S_local, (r + 1) * S_local)``.
+    ``k``/``v``.
 
-    Visibility (contiguous causal CP):
+    **Contiguous** (``pack="contiguous"``): rank ``r`` owns
+    ``[r * S_local, (r + 1) * S_local)``.  Visibility:
 
     * KV rank ``j < r``: full attention (``causal=False``)
     * KV rank ``j == r``: local causal (``causal=True``)
     * KV rank ``j > r``: skipped
+
+    **Zigzag** (``pack="zigzag"``): local Q/K/V are DualChunkSwap halves; AG
+    keeps rank-concat (AG) layout with **no** full-sequence unpermute.
+    Chunked FA indexes KV half-blocks via :func:`zigzag_half_ag_token_start`
+    (see ``_FlashChunkedCPCausalAttention``).
+
+    **Multi-block FA** (``chunk_mode`` / env ``NANO_CP_FA_CHUNK``, default
+    ``prefix``): prefix-concat non-causal KV into one FA + one causal FA +
+    online combine; ``legacy`` keeps one launch per block.
 
     Implementation note (MVP):
         Uses differentiable all-gather of K/V then **chunked** flash-attn over
@@ -586,6 +1075,7 @@ def flash_ring_causal_attention(
             dropout gradients.  Use ``flash_causal_attention`` (cp_size==1)
             when dropout is needed.
     """
+    _check_cp_pack(pack)
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
     if cp_rank < 0 or cp_rank >= cp_size:
@@ -611,7 +1101,7 @@ def flash_ring_causal_attention(
             "flash_ring_causal_attention requires cp_group when cp_size > 1"
         )
 
-    # seq_dim=2 for [B, H, S, D]
+    # seq_dim=2 for [B, H, S, D]; pack selects local shard layout (AG out).
     k_full = gather_from_context_parallel_region(
         k,
         cp_group,
@@ -620,6 +1110,7 @@ def flash_ring_causal_attention(
         cp_size,
         seq_dim=2,
         grad_op="reduce_scatter",
+        pack=pack,
     )
     v_full = gather_from_context_parallel_region(
         v,
@@ -629,7 +1120,9 @@ def flash_ring_causal_attention(
         cp_size,
         seq_dim=2,
         grad_op="reduce_scatter",
+        pack=pack,
     )
+    mode_arg = "" if chunk_mode is None else chunk_mode
     return _FlashChunkedCPCausalAttention.apply(
-        q, k_full, v_full, scale, cp_rank, cp_size, dropout_p
+        q, k_full, v_full, scale, cp_rank, cp_size, dropout_p, pack, mode_arg
     )

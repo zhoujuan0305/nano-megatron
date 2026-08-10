@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# CP sequence packing modes (Megatron DualChunkSwap = zigzag).
+_VALID_CONTEXT_PARALLEL_PACK = frozenset({"contiguous", "zigzag"})
+
 
 @dataclass(frozen=True)
 class ParallelConfig:
@@ -11,6 +14,12 @@ class ParallelConfig:
     data_parallel_size: int | None = None
     sequence_parallel: bool = False
     order: str = "tp-cp-dp-pp"
+    # CP sequence pack: "contiguous" (default) or "zigzag" (Megatron DualChunkSwap).
+    # Default is contiguous for pack-only history (run-20260810-007). With
+    # prefix-concat multi-block FA (NANO_CP_FA_CHUNK=prefix, run-20260810-001),
+    # zigzag launch tax is much lower; pack default stays contiguous pending
+    # a dedicated pack-default revisit.
+    context_parallel_pack: str = "contiguous"
 
     def product_without_dp(self) -> int:
         return (
@@ -38,6 +47,7 @@ class ParallelConfig:
 
     def validate(self, world_size: int) -> None:
         self._check_positive_sizes()
+        self._check_context_parallel_pack()
         if self.sequence_parallel and self.context_parallel_size > 1:
             raise ValueError(
                 "sequence_parallel is not supported with context_parallel_size > 1"
@@ -63,3 +73,10 @@ class ParallelConfig:
                 raise ValueError(f"{name} must be >= 1")
         if self.data_parallel_size is not None and self.data_parallel_size < 1:
             raise ValueError("data_parallel_size must be >= 1")
+
+    def _check_context_parallel_pack(self) -> None:
+        if self.context_parallel_pack not in _VALID_CONTEXT_PARALLEL_PACK:
+            raise ValueError(
+                "context_parallel_pack must be 'contiguous' or 'zigzag', "
+                f"got {self.context_parallel_pack!r}"
+            )

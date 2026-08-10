@@ -299,3 +299,272 @@ def test_chunked_cp_matches_unfused_single_process():
     g_u = torch.autograd.grad(out_u2, (q_u, k_u, v_u), dout.float())
     for a, b in zip(g_fa, g_u):
         torch.testing.assert_close(a.float(), b, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flash_attn_available(),
+    reason="requires CUDA and flash_attn",
+)
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_chunked_cp_zigzag_matches_unfused(cp_rank: int):
+    """Zigzag CP chunked FA (AG-layout KV) vs unfused per-half query_start."""
+    from nano_megatron.parallel.attention_backend import (
+        _flash_chunked_cp_causal_attention,
+    )
+    from nano_megatron.parallel.context_parallel import (
+        zigzag_global_to_ag_index,
+        zigzag_half_ids,
+    )
+
+    torch.manual_seed(2 + cp_rank)
+    b, h, s_full, d = 2, 4, 64, 32
+    cp_size = 2
+    half_len = s_full // (2 * cp_size)  # H = 16
+    s_local = 2 * half_len
+    device = "cuda"
+    dtype = torch.bfloat16
+    scale = d ** -0.5
+    g0, g1 = zigzag_half_ids(cp_rank, cp_size)
+
+    # Full global Q/K/V; local Q is zigzag concat of two global halves.
+    # FA zigzag consumes AG-layout K/V (rank-concat of zigzag locals).
+    q_full = torch.randn(b, h, s_full, d, device=device, dtype=dtype)
+    k_global = torch.randn(
+        b, h, s_full, d, device=device, dtype=dtype, requires_grad=True
+    )
+    v_global = torch.randn(
+        b, h, s_full, d, device=device, dtype=dtype, requires_grad=True
+    )
+    inv = zigzag_global_to_ag_index(cp_size, half_len, device=device)
+    # ag = global[:, :, inv]  (global_to_ag maps AG pos → global index)
+    k_ag = k_global.index_select(2, inv).detach().requires_grad_(True)
+    v_ag = v_global.index_select(2, inv).detach().requires_grad_(True)
+
+    q_h0 = q_full[:, :, g0 * half_len : (g0 + 1) * half_len, :].contiguous()
+    q_h1 = q_full[:, :, g1 * half_len : (g1 + 1) * half_len, :].contiguous()
+    q = torch.cat([q_h0, q_h1], dim=2).detach().requires_grad_(True)
+
+    out_fa = _flash_chunked_cp_causal_attention(
+        q,
+        k_ag,
+        v_ag,
+        scale=scale,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        pack="zigzag",
+    )
+
+    out_u0 = unfused_causal_attention(
+        q_h0.float(),
+        k_global.float(),
+        v_global.float(),
+        scale=scale,
+        query_start=g0 * half_len,
+    )
+    out_u1 = unfused_causal_attention(
+        q_h1.float(),
+        k_global.float(),
+        v_global.float(),
+        scale=scale,
+        query_start=g1 * half_len,
+    )
+    out_u = torch.cat([out_u0, out_u1], dim=2).to(dtype)
+    torch.testing.assert_close(out_fa, out_u, atol=2e-2, rtol=2e-2)
+
+    dout = torch.randn_like(out_fa)
+    g_fa = torch.autograd.grad(out_fa, (q, k_ag, v_ag), dout, retain_graph=True)
+
+    q0_u = q_h0.float().detach().requires_grad_(True)
+    q1_u = q_h1.float().detach().requires_grad_(True)
+    k_u = k_global.float().detach().requires_grad_(True)
+    v_u = v_global.float().detach().requires_grad_(True)
+    out_u0g = unfused_causal_attention(
+        q0_u, k_u, v_u, scale=scale, query_start=g0 * half_len
+    )
+    out_u1g = unfused_causal_attention(
+        q1_u, k_u, v_u, scale=scale, query_start=g1 * half_len
+    )
+    out_ug = torch.cat([out_u0g, out_u1g], dim=2)
+    g_u = torch.autograd.grad(
+        out_ug, (q0_u, q1_u, k_u, v_u), dout.float()
+    )
+    dq_u = torch.cat([g_u[0], g_u[1]], dim=2)
+    # Unfused dk/dv are global order; FA writes AG layout — map for compare.
+    inv_f = inv.to(device=g_u[2].device)
+    dk_u_ag = g_u[2].index_select(2, inv_f)
+    dv_u_ag = g_u[3].index_select(2, inv_f)
+    torch.testing.assert_close(g_fa[0].float(), dq_u, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(g_fa[1].float(), dk_u_ag, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(g_fa[2].float(), dv_u_ag, atol=5e-2, rtol=5e-2)
+    assert out_fa.shape == (b, h, s_local, d)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flash_attn_available(),
+    reason="requires CUDA and flash_attn",
+)
+def test_prefix_vs_legacy_contiguous_rank1():
+    """Contiguous CP rank1: prefix outs/grads match legacy within FA tol."""
+    from nano_megatron.parallel.attention_backend import (
+        _flash_chunked_cp_causal_attention,
+    )
+
+    torch.manual_seed(10)
+    b, h, s_full, d = 2, 4, 64, 32
+    cp_size, cp_rank = 2, 1
+    s_local = s_full // cp_size
+    device, dtype = "cuda", torch.bfloat16
+    scale = d ** -0.5
+
+    q = torch.randn(b, h, s_local, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(b, h, s_full, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(b, h, s_full, d, device=device, dtype=dtype, requires_grad=True)
+
+    out_leg = _flash_chunked_cp_causal_attention(
+        q, k, v, scale=scale, cp_rank=cp_rank, cp_size=cp_size, chunk_mode="legacy"
+    )
+    out_pre = _flash_chunked_cp_causal_attention(
+        q, k, v, scale=scale, cp_rank=cp_rank, cp_size=cp_size, chunk_mode="prefix"
+    )
+    torch.testing.assert_close(out_pre, out_leg, atol=2e-2, rtol=2e-2)
+
+    dout = torch.randn_like(out_leg)
+    g_leg = torch.autograd.grad(out_leg, (q, k, v), dout, retain_graph=True)
+    g_pre = torch.autograd.grad(out_pre, (q, k, v), dout)
+    for a, b_ in zip(g_pre, g_leg):
+        torch.testing.assert_close(a, b_, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flash_attn_available(),
+    reason="requires CUDA and flash_attn",
+)
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_prefix_vs_legacy_zigzag(cp_rank: int):
+    """Zigzag CP: prefix outs/grads match legacy within FA tol."""
+    from nano_megatron.parallel.attention_backend import (
+        _flash_chunked_cp_causal_attention,
+    )
+    from nano_megatron.parallel.context_parallel import (
+        zigzag_global_to_ag_index,
+        zigzag_half_ids,
+    )
+
+    torch.manual_seed(20 + cp_rank)
+    b, h, s_full, d = 2, 4, 64, 32
+    cp_size = 2
+    half_len = s_full // (2 * cp_size)
+    s_local = 2 * half_len
+    device, dtype = "cuda", torch.bfloat16
+    scale = d ** -0.5
+    g0, g1 = zigzag_half_ids(cp_rank, cp_size)
+
+    q_full = torch.randn(b, h, s_full, d, device=device, dtype=dtype)
+    k_global = torch.randn(b, h, s_full, d, device=device, dtype=dtype)
+    v_global = torch.randn(b, h, s_full, d, device=device, dtype=dtype)
+    inv = zigzag_global_to_ag_index(cp_size, half_len, device=device)
+    k_ag = k_global.index_select(2, inv).detach().requires_grad_(True)
+    v_ag = v_global.index_select(2, inv).detach().requires_grad_(True)
+    q_h0 = q_full[:, :, g0 * half_len : (g0 + 1) * half_len, :].contiguous()
+    q_h1 = q_full[:, :, g1 * half_len : (g1 + 1) * half_len, :].contiguous()
+    q = torch.cat([q_h0, q_h1], dim=2).detach().requires_grad_(True)
+
+    kw = dict(
+        scale=scale, cp_rank=cp_rank, cp_size=cp_size, pack="zigzag"
+    )
+    out_leg = _flash_chunked_cp_causal_attention(
+        q, k_ag, v_ag, chunk_mode="legacy", **kw
+    )
+    out_pre = _flash_chunked_cp_causal_attention(
+        q, k_ag, v_ag, chunk_mode="prefix", **kw
+    )
+    torch.testing.assert_close(out_pre, out_leg, atol=2e-2, rtol=2e-2)
+
+    dout = torch.randn_like(out_leg)
+    g_leg = torch.autograd.grad(out_leg, (q, k_ag, v_ag), dout, retain_graph=True)
+    g_pre = torch.autograd.grad(out_pre, (q, k_ag, v_ag), dout)
+    for a, b_ in zip(g_pre, g_leg):
+        torch.testing.assert_close(a, b_, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flash_attn_available(),
+    reason="requires CUDA and flash_attn",
+)
+def test_prefix_launch_count_four_blocks(monkeypatch):
+    """Zigzag half with g=3 (4 blocks): prefix → 2 FA fwd launches, not 4."""
+    import nano_megatron.parallel.attention_backend as ab
+
+    torch.manual_seed(30)
+    b, h, s_q, d = 1, 2, 16, 32
+    block_len = 16
+    n_blocks = 4
+    s_k = n_blocks * block_len
+    device, dtype = "cuda", torch.bfloat16
+    scale = d ** -0.5
+
+    q = torch.randn(b, s_q, h, d, device=device, dtype=dtype)
+    k = torch.randn(b, s_k, h, d, device=device, dtype=dtype)
+    v = torch.randn(b, s_k, h, d, device=device, dtype=dtype)
+    # Contiguous starts 0,16,32,48 — causal on last (standard CP).
+    starts = [i * block_len for i in range(n_blocks)]
+    causal_block = starts[-1]
+
+    real_fwd = ab._flash_fwd_out_lse
+    calls: list[tuple] = []
+
+    def counting_fwd(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_fwd(*args, **kwargs)
+
+    monkeypatch.setattr(ab, "_flash_fwd_out_lse", counting_fwd)
+
+    ab._chunked_fa_combine_blocks(
+        q,
+        k,
+        v,
+        block_starts=starts,
+        block_len=block_len,
+        causal_block=causal_block,
+        scale=scale,
+        dropout_p=0.0,
+        mode="legacy",
+    )
+    assert len(calls) == 4, f"legacy expected 4 launches, got {len(calls)}"
+    calls.clear()
+
+    ab._chunked_fa_combine_blocks(
+        q,
+        k,
+        v,
+        block_starts=starts,
+        block_len=block_len,
+        causal_block=causal_block,
+        scale=scale,
+        dropout_p=0.0,
+        mode="prefix",
+    )
+    assert len(calls) == 2, f"prefix expected 2 launches, got {len(calls)}"
+    # First launch: non-causal prefix cat (seq = 3 * block_len)
+    _args0, kwargs0 = calls[0]
+    assert kwargs0.get("causal") is False or (
+        len(_args0) >= 0 and kwargs0.get("causal", None) is False
+    )
+    k_pref = _args0[1]
+    assert k_pref.shape[1] == 3 * block_len
+    # Second launch: last block causal
+    _args1, kwargs1 = calls[1]
+    assert kwargs1.get("causal") is True
+    assert _args1[1].shape[1] == block_len
+
+
+def test_resolve_cp_fa_chunk_mode_env(monkeypatch):
+    from nano_megatron.parallel.attention_backend import resolve_cp_fa_chunk_mode
+
+    monkeypatch.delenv("NANO_CP_FA_CHUNK", raising=False)
+    assert resolve_cp_fa_chunk_mode(None) == "prefix"
+    assert resolve_cp_fa_chunk_mode("legacy") == "legacy"
+    monkeypatch.setenv("NANO_CP_FA_CHUNK", "legacy")
+    assert resolve_cp_fa_chunk_mode(None) == "legacy"
+    with pytest.raises(ValueError, match="CP FA chunk mode"):
+        resolve_cp_fa_chunk_mode("bogus")

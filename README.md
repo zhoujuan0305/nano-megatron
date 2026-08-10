@@ -12,7 +12,7 @@ Compact distributed training framework for studying Megatron-style parallelism.
 | Tensor Parallel (TP) | Supported | Column/row parallel + vocab parallel |
 | Sequence Parallel (SP) | Supported | Reuses the TP group |
 | Pipeline Parallel (PP) | Supported | Non-interleaved 1F1B, sync P2P |
-| Context Parallel (CP) | Supported | Contiguous AG-KV; FA path = AG + chunked flash (not P2P ring); no PP/SP combo; wrap DDP when `cp>1` |
+| Context Parallel (CP) | Supported | AG-KV + chunked FA (default **prefix-concat** multi-block, `NANO_CP_FA_CHUNK`); pack `contiguous` (default) or `zigzag`; not P2P ring; no PP/SP combo; wrap DDP when `cp>1` |
 | FlashAttention | Supported | Optional `flash-attn`; `attn_backend=auto\|flash\|unfused`; TP + CP |
 | TP × DP / TP × PP / DP × PP / TP × DP × PP | Supported | Composable via `ParallelContext` |
 | TP × CP / CP × DP | Supported | Composable via `ParallelContext` |
@@ -32,7 +32,7 @@ On 4× RTX A6000, matching GPT configs **345M / 760M / 1.3B** vs Megatron-LM (TE
 | TP×PP | FP32 | **~0.92x** | |
 | TP / TP+SP | **BF16 + FA** | **0.87x – 0.92x** | All three sizes |
 | DP2 | **BF16 + FA** | **0.95x – 1.01x** | Mem **0.77x – 0.81x** |
-| CP2 | **BF16 + FA** | **0.81x – 0.83x** | Was ~0.52x–0.73x unfused; mem often lower |
+| CP2 | **BF16 + FA** | **0.81x – 0.83x** (contiguous pack) | Default pack **contiguous** + prefix-concat multi-block FA; zigzag pack optional (`--cp-pack`); mem often lower |
 
 Full tables (per size): **[performance.md](performance.md)** §2.1 (345M) · §3.1 (760M) · §4.1 (1.3B).
 
@@ -64,7 +64,7 @@ config = ReferenceGPTConfig(attn_backend="auto")  # default
 | `"flash"` | Requires CUDA + fp16/bf16 + `flash-attn`; raises `RuntimeError` if unavailable |
 | `"unfused"` | Always uses the reference scores→softmax→matmul path |
 
-**Context Parallel (CP) notes:** The CP flash path uses contiguous all-gather + chunked FA (not TE zigzag ring). `attention_dropout > 0` with `cp > 1` is **unsupported** in the flash CP path (the chunked backward cannot propagate dropout RNG state).
+**Context Parallel (CP) notes:** The CP flash path is all-gather KV + multi-block FlashAttention (not a TE P2P ring). Multi-block FA defaults to **prefix-concat** (`NANO_CP_FA_CHUNK=prefix`): concatenate non-causal KV blocks into one FA call, plus one causal FA on the local block, then online-softmax combine (≤2 launches per Q-shard). Set `NANO_CP_FA_CHUNK=legacy` for one FA launch per KV block. Sequence pack is `ParallelConfig.context_parallel_pack` / bench `--cp-pack {contiguous,zigzag}` (default **contiguous**). `attention_dropout > 0` with `cp > 1` is **unsupported** in the flash CP path (the multi-block backward cannot propagate dropout RNG state).
 
 ### Run Reference Model
 
@@ -93,6 +93,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
 # 760M:  --hidden-size 1536 --ffn-hidden-size 6144 --batch-size 2
 # 1.3B:  --hidden-size 2048 --ffn-hidden-size 8192 --batch-size 1  (TP2/DP/CP; TP4 uses batch=2)
 # DP2 / CP2: scripts/benchmark_dp.py | benchmark_cp.py  + same --precision bf16 [--attn-backend flash]
+# CP pack A/B (nano): benchmark_cp.py --framework nano --cp-pack contiguous|zigzag
 
 # --- FP32 baseline (TP2 345M) ---
 python -m torch.distributed.run --standalone --nproc_per_node=2 \

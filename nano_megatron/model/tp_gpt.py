@@ -18,6 +18,9 @@ from nano_megatron.parallel.context_parallel import (
     gather_from_context_parallel_region,
     local_sequence_range,
     scatter_to_context_parallel_region,
+    unpermute_ag_to_global,
+    zigzag_half_ids,
+    zigzag_local_token_indices,
 )
 from nano_megatron.parallel.mappings import (
     ColumnParallelLinear,
@@ -83,6 +86,7 @@ class TPCausalSelfAttention(nn.Module):
         self._cp_size = ctx.context_parallel_size
         self._cp_group = ctx.context_parallel_group
         self._cp_backend = ctx.backend
+        self._cp_pack = ctx.context_parallel_pack
 
         # Support GQA (Group Query Attention)
         self.num_heads = ref_attn.num_heads
@@ -214,7 +218,7 @@ class TPCausalSelfAttention(nn.Module):
         k = self._repeat_kv(k, self.num_heads_per_group)
         v = self._repeat_kv(v, self.num_heads_per_group)
 
-        # Attention: flash (cp=1 or contiguous CP ring/chunked) or unfused AG-KV.
+        # Attention: flash (cp=1 or CP chunked) or unfused AG-KV.
         requested = getattr(self.config, "attn_backend", "auto")
         backend = resolve_attention_backend(
             requested=requested,
@@ -224,7 +228,7 @@ class TPCausalSelfAttention(nn.Module):
         )
         dropout_p = float(getattr(self.config, "attention_dropout", 0.0))
         if backend == "flash" and self._cp_size > 1:
-            # Contiguous CP: AG-KV + chunked flash (not P2P ring).
+            # CP: AG-KV + chunked flash (contiguous or zigzag pack; not P2P ring).
             context = flash_ring_causal_attention(
                 q,
                 k,
@@ -235,9 +239,12 @@ class TPCausalSelfAttention(nn.Module):
                 cp_size=self._cp_size,
                 backend=self._cp_backend,
                 dropout_p=dropout_p,
+                pack=self._cp_pack,
             )
         elif self._cp_size > 1:
-            # Unfused CP: all-gather KV; shifted causal mask on local Q shard.
+            # Unfused CP: all-gather KV (AG layout).  Zigzag keeps one
+            # unpermute here so existing global-order half logic stays simple;
+            # flash path never unpermutes.
             k_full = gather_from_context_parallel_region(
                 k,
                 self._cp_group,
@@ -245,6 +252,7 @@ class TPCausalSelfAttention(nn.Module):
                 self._cp_rank,
                 self._cp_size,
                 seq_dim=2,
+                pack=self._cp_pack,
             )
             v_full = gather_from_context_parallel_region(
                 v,
@@ -253,13 +261,41 @@ class TPCausalSelfAttention(nn.Module):
                 self._cp_rank,
                 self._cp_size,
                 seq_dim=2,
+                pack=self._cp_pack,
             )
-            query_start = self._cp_rank * q.size(2)
-            scores = causal_attn_scores_cp(
-                q, k_full, scale=self.scale, query_start=query_start
-            )
-            probs = softmax_last(scores)
-            context = torch.matmul(probs, v_full)
+            if self._cp_pack == "zigzag":
+                k_full = unpermute_ag_to_global(
+                    k_full, self._cp_size, seq_dim=2
+                )
+                v_full = unpermute_ag_to_global(
+                    v_full, self._cp_size, seq_dim=2
+                )
+                # Two DualChunkSwap halves; each half has its own global query_start.
+                s_local = q.size(2)
+                if s_local % 2 != 0:
+                    raise ValueError(
+                        f"zigzag local seq_len ({s_local}) must be even "
+                        f"(2 half-chunks)"
+                    )
+                half_len = s_local // 2
+                g0, g1 = zigzag_half_ids(self._cp_rank, self._cp_size)
+                q0, q1 = q.split(half_len, dim=2)
+                scores0 = causal_attn_scores_cp(
+                    q0, k_full, scale=self.scale, query_start=g0 * half_len
+                )
+                scores1 = causal_attn_scores_cp(
+                    q1, k_full, scale=self.scale, query_start=g1 * half_len
+                )
+                ctx0 = torch.matmul(softmax_last(scores0), v_full)
+                ctx1 = torch.matmul(softmax_last(scores1), v_full)
+                context = torch.cat([ctx0, ctx1], dim=2)
+            else:
+                query_start = self._cp_rank * q.size(2)
+                scores = causal_attn_scores_cp(
+                    q, k_full, scale=self.scale, query_start=query_start
+                )
+                probs = softmax_last(scores)
+                context = torch.matmul(probs, v_full)
         elif backend == "flash":
             context = flash_causal_attention(
                 q, k, v, scale=self.scale, dropout_p=dropout_p
@@ -396,6 +432,7 @@ class TPGPT(nn.Module):
         self._cp_size = ctx.context_parallel_size
         self._cp_group = ctx.context_parallel_group
         self._cp_backend = ctx.backend
+        self._cp_pack = ctx.context_parallel_pack
         self.vocab_start_index, self.vocab_end_index = vocab_range_from_global(
             ctx.tensor_parallel_rank,
             ctx.tensor_parallel_size,
@@ -488,17 +525,35 @@ class TPGPT(nn.Module):
                 f"({full_seq}) under CP; CP-local labels are not supported"
             )
 
-        start, end = local_sequence_range(
-            self._cp_rank, self._cp_size, full_seq
-        )
-        # Global i uses local logit[:, i - start] and labels[:, i + 1] for
-        # i in [start, end) with i < S - 1 (standard shifted CE).
-        pred_end = min(end, full_seq - 1)
-        if start >= pred_end:
-            return logits.sum() * 0.0
+        if self._cp_pack == "zigzag":
+            # Map local logit rows → global token indices; predict labels[g+1].
+            idx = zigzag_local_token_indices(
+                self._cp_rank,
+                self._cp_size,
+                full_seq,
+                device=labels.device,
+            )
+            # Skip the last global position (no next-token label).
+            keep = idx < (full_seq - 1)
+            if not bool(keep.any()):
+                return logits.sum() * 0.0
+            local_t = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+            global_g = idx.index_select(0, local_t)
+            shift_logits = logits.index_select(1, local_t).contiguous()
+            shift_labels = labels.index_select(1, global_g + 1).contiguous()
+        else:
+            start, end = local_sequence_range(
+                self._cp_rank, self._cp_size, full_seq
+            )
+            # Global i uses local logit[:, i - start] and labels[:, i + 1] for
+            # i in [start, end) with i < S - 1 (standard shifted CE).
+            pred_end = min(end, full_seq - 1)
+            if start >= pred_end:
+                return logits.sum() * 0.0
 
-        shift_logits = logits[:, : pred_end - start, :].contiguous()
-        shift_labels = labels[:, start + 1 : pred_end + 1].contiguous()
+            shift_logits = logits[:, : pred_end - start, :].contiguous()
+            shift_labels = labels[:, start + 1 : pred_end + 1].contiguous()
+
         local_sum = vocab_parallel_cross_entropy_from_shifted(
             shift_logits,
             shift_labels,
@@ -536,11 +591,20 @@ class TPGPT(nn.Module):
                 f"seq_len ({seq_len}) must be divisible by tensor_parallel_size "
                 f"({self._tp_size}) when sequence_parallel is enabled"
             )
-        if self._cp_size > 1 and seq_len % self._cp_size != 0:
-            raise ValueError(
-                f"seq_len ({seq_len}) must be divisible by context_parallel_size "
-                f"({self._cp_size})"
-            )
+        if self._cp_size > 1:
+            if self._cp_pack == "zigzag":
+                # DualChunkSwap needs two half-chunks per rank.
+                if seq_len % (2 * self._cp_size) != 0:
+                    raise ValueError(
+                        f"seq_len ({seq_len}) must be divisible by "
+                        f"2 * context_parallel_size ({2 * self._cp_size}) "
+                        f"when context_parallel_pack='zigzag'"
+                    )
+            elif seq_len % self._cp_size != 0:
+                raise ValueError(
+                    f"seq_len ({seq_len}) must be divisible by "
+                    f"context_parallel_size ({self._cp_size})"
+                )
 
         # Token embedding
         x = self.tok_emb(input_ids)
@@ -561,7 +625,7 @@ class TPGPT(nn.Module):
             )
         elif self._cp_size > 1:
             # CP: shard activations along sequence; keep global position indices
-            # for RoPE (local slice of the full arange / caller positions).
+            # for RoPE (zigzag index_select or contiguous slice).
             x = scatter_to_context_parallel_region(
                 x,
                 self._cp_group,
@@ -569,11 +633,21 @@ class TPGPT(nn.Module):
                 self._cp_rank,
                 self._cp_size,
                 seq_dim=1,
+                pack=self._cp_pack,
             )
-            start, end = local_sequence_range(
-                self._cp_rank, self._cp_size, seq_len
-            )
-            positions = positions[:, start:end]
+            if self._cp_pack == "zigzag":
+                zidx = zigzag_local_token_indices(
+                    self._cp_rank,
+                    self._cp_size,
+                    seq_len,
+                    device=positions.device,
+                )
+                positions = positions.index_select(1, zidx)
+            else:
+                start, end = local_sequence_range(
+                    self._cp_rank, self._cp_size, seq_len
+                )
+                positions = positions[:, start:end]
 
         for block in self.blocks:
             x = block(x, positions=positions)

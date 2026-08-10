@@ -10,9 +10,10 @@ Tokens accounting: CP splits sequence work, not data replicas.
 Fair peak memory: run nano and megatron as separate torchrun jobs
 (`--framework both` is rejected).
 
-Megatron CP uses zigzag load-balancing, so seq_len %% (2 * cp_size) == 0.
-nano CP uses contiguous shards; seq_len %% cp_size == 0 is enough (still
-enforce 2*cp for head-to-head comparison with Megatron).
+Megatron CP always uses zigzag load-balancing, so seq_len %% (2 * cp_size) == 0.
+nano CP supports ``--cp-pack {contiguous,zigzag}`` (default contiguous: chunked
+FA launch tax made pack-only zigzag slower on CP2 e2e). Contiguous only needs
+seq_len %% cp_size == 0; we still enforce 2*cp for head-to-head with Megatron.
 """
 
 from __future__ import annotations
@@ -84,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "flash", "unfused"],
         default="auto",
         help="nano attention backend (ignored by Megatron).",
+    )
+    p.add_argument(
+        "--cp-pack",
+        type=str,
+        choices=["contiguous", "zigzag"],
+        default="contiguous",
+        help=(
+            "nano CP sequence pack mode (ParallelConfig.context_parallel_pack). "
+            "Default contiguous (chunked FA: zigzag half-block launches cost more "
+            "than load-balance on CP2 e2e). Use zigzag for A/B / Megatron DualChunkSwap. "
+            "Megatron always zigzag; this flag is ignored for --framework megatron."
+        ),
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
@@ -201,6 +214,7 @@ def benchmark_nano(
             tensor_parallel_size=args.tp_size,
             context_parallel_size=cp_size,
             data_parallel_size=dp_size,
+            context_parallel_pack=args.cp_pack,
         ),
         dist_backend="nccl" if device.type == "cuda" else "gloo",
     )
@@ -242,7 +256,7 @@ def benchmark_nano(
         print(
             f"[nano] params/rank={n_params/1e6:.1f}M "
             f"tp={args.tp_size} cp={cp_size} dp={dp_size} precision={args.precision} "
-            f"attn_backend={cfg.attn_backend}",
+            f"attn_backend={cfg.attn_backend} cp_pack={args.cp_pack}",
             flush=True,
         )
 
