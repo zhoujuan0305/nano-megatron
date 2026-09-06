@@ -179,6 +179,7 @@ def _run_pp_vs_reference(
     seq_len: int,
     seed: int = 0,
     use_ddp: bool = False,
+    sequence_parallel: bool = False,
 ) -> None:
     from nano_megatron.distributed import DistributedDataParallel
     from nano_megatron.model import build_pipeline_stage_from_reference
@@ -205,6 +206,7 @@ def _run_pp_vs_reference(
                 tensor_parallel_size=tp,
                 data_parallel_size=dp,
                 pipeline_parallel_size=pp,
+                sequence_parallel=sequence_parallel,
             ),
             dist_backend="gloo",
         )
@@ -322,6 +324,13 @@ def test_launch_tp2_pp2_matches_reference():
 @pytest.mark.skipif(
     os.environ.get("NANO_MEGATRON_PP_WORKER") == "1", reason="launcher only"
 )
+def test_launch_tp2_sp_pp2_matches_reference():
+    _run_torchrun(4, "test_worker_tp2_sp_pp2_matches_reference", timeout=60)
+
+
+@pytest.mark.skipif(
+    os.environ.get("NANO_MEGATRON_PP_WORKER") == "1", reason="launcher only"
+)
 def test_launch_dp2_pp2_matches_reference():
     _run_torchrun(4, "test_worker_dp2_pp2_matches_reference")
 
@@ -376,6 +385,24 @@ def test_worker_tp2_pp2_matches_reference():
 @pytest.mark.skipif(
     os.environ.get("NANO_MEGATRON_PP_WORKER") != "1", reason="worker only"
 )
+def test_worker_tp2_sp_pp2_matches_reference():
+    _run_pp_vs_reference(
+        tp=2,
+        dp=1,
+        pp=2,
+        num_layers=4,
+        num_microbatches=2,
+        batch_per_dp=4,
+        seq_len=8,
+        seed=4,
+        use_ddp=False,
+        sequence_parallel=True,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("NANO_MEGATRON_PP_WORKER") != "1", reason="worker only"
+)
 def test_worker_dp2_pp2_matches_reference():
     _run_pp_vs_reference(
         tp=1,
@@ -407,4 +434,5 @@ def test_worker_tp2_dp2_pp2_matches_reference():
         seq_len=8,
         seed=3,
         use_ddp=True,
+        sequence_parallel=True,
     )

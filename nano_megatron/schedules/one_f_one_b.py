@@ -113,11 +113,22 @@ def forward_backward_1f1b(
             f"positions shape {tuple(positions.shape)} must match "
             f"input_ids shape {tuple(input_ids.shape)}"
         )
+    if positions is None:
+        positions = torch.arange(
+            input_ids.size(1), device=input_ids.device
+        ).unsqueeze(0).expand_as(input_ids)
 
     micro_batch_size = batch_size // num_microbatches
     seq_len = input_ids.size(1)
     hidden_size = stage.config.hidden_size
-    act_shape = _activation_shape(micro_batch_size, seq_len, hidden_size)
+    activation_seq_len = (
+        seq_len // ctx.tensor_parallel_size
+        if ctx.sequence_parallel
+        else seq_len
+    )
+    act_shape = _activation_shape(
+        micro_batch_size, activation_seq_len, hidden_size
+    )
     # Inter-stage dtype follows stage parameters (FP32 in v1).
     try:
         param_dtype = next(stage.parameters()).dtype
