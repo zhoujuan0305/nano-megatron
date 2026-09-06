@@ -149,6 +149,7 @@ def test_worker_tp2_forward_nccl():
         layernorm_eps=1e-5,
         use_bias=True,
         tie_word_embeddings=False,
+        tp_comm_overlap=True,
     )
     ctx = initialize_parallel(
         ParallelConfig(tensor_parallel_size=2), dist_backend="nccl"

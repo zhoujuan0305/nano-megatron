@@ -39,6 +39,7 @@ class ReferenceGPTConfig:
     hidden_dropout: float = 0.0
     attention_dropout: float = 0.0
     attn_backend: Literal["auto", "flash", "unfused"] = "auto"
+    tp_comm_overlap: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_heads != 0:

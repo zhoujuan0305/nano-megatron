@@ -100,6 +100,7 @@ def test_worker_sp_vs_tp_forward_backward_gloo():
         layernorm_eps=1e-5,
         use_bias=True,
         tie_word_embeddings=False,
+        tp_comm_overlap=True,
     )
     ctx = initialize_parallel(
         ParallelConfig(tensor_parallel_size=2, sequence_parallel=False),

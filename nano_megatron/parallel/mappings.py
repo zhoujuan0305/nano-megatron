@@ -377,6 +377,76 @@ def row_shard(
     return w_local, b_local
 
 
+class _LinearWithGradOverlap(torch.autograd.Function):
+    """Column-parallel linear with dgrad communication hidden by wgrad GEMM."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+        group: Any,
+        backend: CommBackend,
+        tp_size: int,
+        sequence_parallel: bool,
+    ) -> Tensor:
+        if sequence_parallel and tp_size > 1:
+            gathered = [torch.empty_like(x) for _ in range(tp_size)]
+            backend.all_gather(gathered, x.contiguous(), group=group)
+            linear_input = torch.cat(gathered, dim=SEQ_DIM)
+        else:
+            linear_input = x
+
+        ctx.save_for_backward(linear_input, weight)
+        ctx.group = group
+        ctx.backend = backend
+        ctx.tp_size = tp_size
+        ctx.sequence_parallel = sequence_parallel
+        ctx.has_bias = bias is not None
+        return F.linear(linear_input, weight, bias)
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor | None, None, None, None, None]:
+        linear_input, weight = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input_full = grad_output.matmul(weight)
+
+        work = None
+        if ctx.tp_size > 1 and ctx.sequence_parallel:
+            _check_seq_divisible(grad_input_full.size(SEQ_DIM), ctx.tp_size)
+            chunks = [
+                chunk.contiguous()
+                for chunk in grad_input_full.chunk(ctx.tp_size, dim=SEQ_DIM)
+            ]
+            grad_input = torch.empty_like(chunks[0])
+            work = ctx.backend.reduce_scatter(
+                grad_input,
+                chunks,
+                group=ctx.group,
+                op="sum",
+                async_op=True,
+            )
+        elif ctx.tp_size > 1:
+            grad_input = grad_input_full
+            work = ctx.backend.all_reduce(
+                grad_input, group=ctx.group, op="sum", async_op=True
+            )
+        else:
+            grad_input = grad_input_full
+
+        grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+        input_2d = linear_input.reshape(-1, linear_input.size(-1))
+        grad_weight = grad_output_2d.t().matmul(input_2d)
+        grad_bias = grad_output_2d.sum(dim=0) if ctx.has_bias else None
+
+        if hasattr(work, "wait"):
+            work.wait()
+        return grad_input, grad_weight, grad_bias, None, None, None, None
+
+
 class ColumnParallelLinear(nn.Module):
     def __init__(
         self,
@@ -389,6 +459,7 @@ class ColumnParallelLinear(nn.Module):
         *,
         weight_is_local: bool = False,
         sequence_parallel: bool = False,
+        overlap_dgrad: bool = False,
     ) -> None:
         super().__init__()
         if weight_is_local:
@@ -404,8 +475,19 @@ class ColumnParallelLinear(nn.Module):
         self.backend = backend
         self.buffer_manager = CommunicationBuffer()
         self.sequence_parallel = sequence_parallel
+        self.overlap_dgrad = overlap_dgrad
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.overlap_dgrad:
+            return _LinearWithGradOverlap.apply(
+                x,
+                self.weight,
+                self.bias,
+                self.group,
+                self.backend,
+                self.tp_size,
+                self.sequence_parallel,
+            )
         # SP path: input is sequence-sharded; gather full S then matmul.
         # No CopyToTPRegion — grad reduce-scatter is handled by the gather op.
         if self.sequence_parallel:

@@ -120,6 +120,7 @@ class TPCausalSelfAttention(nn.Module):
                 backend,
                 weight_is_local=True,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
         else:
             # Separate Q, K, V projections
@@ -131,6 +132,7 @@ class TPCausalSelfAttention(nn.Module):
                 group,
                 backend,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
             self.k_proj = ColumnParallelLinear(
                 ref_attn.k_proj.weight,
@@ -140,6 +142,7 @@ class TPCausalSelfAttention(nn.Module):
                 group,
                 backend,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
             self.v_proj = ColumnParallelLinear(
                 ref_attn.v_proj.weight,
@@ -149,6 +152,7 @@ class TPCausalSelfAttention(nn.Module):
                 group,
                 backend,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
 
         self.out_proj = RowParallelLinear(
@@ -332,6 +336,7 @@ class TPMLP(nn.Module):
                 backend,
                 weight_is_local=True,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
         else:
             self.fc1 = ColumnParallelLinear(
@@ -342,6 +347,7 @@ class TPMLP(nn.Module):
                 group,
                 backend,
                 sequence_parallel=sp,
+                overlap_dgrad=self.config.tp_comm_overlap,
             )
 
         self.fc2 = RowParallelLinear(
@@ -479,6 +485,7 @@ class TPGPT(nn.Module):
             ctx.tensor_parallel_group,
             ctx.backend,
             sequence_parallel=ctx.sequence_parallel,
+            overlap_dgrad=config.tp_comm_overlap,
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight

@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
+        "--overlap-tp-dgrad",
+        action="store_true",
+        help="Overlap TP dgrad AllReduce/ReduceScatter with the wgrad GEMM.",
+    )
+    p.add_argument(
         "--precision",
         type=str,
         choices=["fp32", "bf16"],
@@ -110,6 +115,7 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attn_backend=args.attn_backend,
+        tp_comm_overlap=args.overlap_tp_dgrad,
     )
 
     if args.sequence_parallel:
@@ -154,7 +160,8 @@ def benchmark_nano_megatron(args: argparse.Namespace) -> BenchmarkResult:
             f"glued={cfg.gated_linear_unit} bias={cfg.use_bias} "
             f"dropout=({cfg.hidden_dropout},{cfg.attention_dropout}) "
             f"sp={args.sequence_parallel} precision={args.precision} "
-            f"attn_backend={cfg.attn_backend}",
+            f"attn_backend={cfg.attn_backend} "
+            f"overlap_tp_dgrad={args.overlap_tp_dgrad}",
             flush=True,
         )
 
