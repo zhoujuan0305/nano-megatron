@@ -197,6 +197,7 @@ def _run_pp_vs_reference(
         destroy_parallel()
 
     cfg = _tiny_cfg(num_layers=num_layers)
+    cfg.tp_comm_overlap = tp > 1
     ctx = None
     try:
         ctx = initialize_parallel(
@@ -217,7 +218,12 @@ def _run_pp_vs_reference(
 
         ddp = None
         if use_ddp:
-            ddp = DistributedDataParallel(stage, ctx, bucket_cap_mb=25.0)
+            ddp = DistributedDataParallel(
+                stage,
+                ctx,
+                bucket_cap_mb=25.0,
+                overlap_grad_reduce=True,
+            )
             stage_mod = ddp.module
         else:
             stage_mod = stage

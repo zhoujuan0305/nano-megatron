@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark Pipeline Parallelism: nano-megatron 1F1B vs optional Megatron-LM.
 
-Same model knobs as scripts/benchmark_dp.py (RoPE, SwiGLU, LayerNorm, FP32).
+Same model knobs as scripts/benchmark_dp.py (RoPE, SwiGLU, LayerNorm).
 Measures per-GPU peak memory and tokens/sec (local batch is the full
 microbatch sum on each DP rank; global = local × dp_size).
 """
@@ -75,9 +75,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
+        "--overlap-grad-reduce",
+        action="store_true",
+        help="Overlap DP gradient bucket reductions with the final backward.",
+    )
+    p.add_argument(
+        "--overlap-tp-dgrad",
+        action="store_true",
+        help="Overlap TP dgrad communication with each wgrad GEMM.",
+    )
+    p.add_argument(
         "--overlap-p2p-comm",
         action="store_true",
         help="Prepost pipeline receives and defer waits across computation.",
+    )
+    p.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Shard eligible activations over the TP group.",
+    )
+    p.add_argument(
+        "--precision", choices=["fp32", "bf16"], default="fp32"
+    )
+    p.add_argument(
+        "--attn-backend",
+        choices=["auto", "flash", "unfused"],
+        default="auto",
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
@@ -120,6 +143,16 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"num-layers ({args.num_layers}) must be divisible by "
             f"pp-size ({args.pp_size})"
         )
+    if args.sequence_parallel and args.tp_size <= 1:
+        raise ValueError("sequence-parallel requires tp-size > 1")
+    if args.sequence_parallel and args.seq_len % args.tp_size != 0:
+        raise ValueError("seq-len must be divisible by tp-size with sequence parallel")
+    if args.overlap_p2p_comm and args.pp_size > 2:
+        raise ValueError("overlap-p2p-comm currently supports pp-size <= 2")
+
+
+def _dtype(args: argparse.Namespace) -> torch.dtype:
+    return torch.bfloat16 if args.precision == "bf16" else torch.float32
 
 
 def _ensure_dist(local_rank: int) -> None:
@@ -222,6 +255,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             tensor_parallel_size=args.tp_size,
             data_parallel_size=dp_size,
             pipeline_parallel_size=args.pp_size,
+            sequence_parallel=args.sequence_parallel,
         ),
         dist_backend="nccl" if device.type == "cuda" else "gloo",
     )
@@ -245,6 +279,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         use_fused_qkv=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        attn_backend=args.attn_backend,
+        tp_comm_overlap=args.overlap_tp_dgrad,
     )
 
     torch.manual_seed(42)
@@ -252,11 +288,19 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         torch.cuda.manual_seed_all(42)
 
     ref = ReferenceGPT(cfg)
-    stage = build_pipeline_stage_from_reference(ref, ctx).to(device)
+    dtype = _dtype(args)
+    stage = build_pipeline_stage_from_reference(ref, ctx).to(
+        device=device, dtype=dtype
+    )
 
     ddp = None
     if dp_size > 1:
-        ddp = DistributedDataParallel(stage, ctx, bucket_cap_mb=args.bucket_cap_mb)
+        ddp = DistributedDataParallel(
+            stage,
+            ctx,
+            bucket_cap_mb=args.bucket_cap_mb,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+        )
         stage_mod = ddp.module
         train_mod = ddp
     else:
@@ -271,7 +315,10 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
             f"microbatches={args.num_microbatches} "
             f"bucket_cap_mb={args.bucket_cap_mb} "
-            f"overlap_p2p_comm={args.overlap_p2p_comm}",
+            f"precision={args.precision} sp={args.sequence_parallel} "
+            f"overlap_dp={args.overlap_grad_reduce} "
+            f"overlap_tp={args.overlap_tp_dgrad} "
+            f"overlap_pp={args.overlap_p2p_comm}",
             flush=True,
         )
 
@@ -381,14 +428,14 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         tensor_model_parallel_size=args.tp_size,
         pipeline_model_parallel_size=args.pp_size,
         context_parallel_size=1,
-        pipeline_dtype=torch.float32,
+        pipeline_dtype=_dtype(args),
         layernorm_epsilon=1e-5,
         add_bias_linear=False,
         add_qkv_bias=False,
         activation_func=torch.nn.functional.silu,
         gated_linear_unit=True,
         normalization="LayerNorm",
-        sequence_parallel=False,
+        sequence_parallel=args.sequence_parallel,
         tp_comm_overlap=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -398,8 +445,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         masked_softmax_fusion=False,
         bias_dropout_fusion=False,
         fp16=False,
-        bf16=False,
-        params_dtype=torch.float32,
+        bf16=(args.precision == "bf16"),
+        params_dtype=_dtype(args),
         deallocate_pipeline_outputs=False,
         overlap_p2p_comm=args.overlap_p2p_comm,
         batch_p2p_comm=not args.overlap_p2p_comm,
@@ -419,6 +466,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         parallel_output=True,
         share_embeddings_and_output_weights=False,
     ).cuda(local_rank)
+    if args.precision == "bf16":
+        model = model.bfloat16()
     model.train()
 
     if is_rank0:
@@ -427,7 +476,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             f"[megatron] params/rank={n_params/1e6:.1f}M "
             f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
             f"microbatches={args.num_microbatches} "
-            f"micro_bs={micro_batch_size}",
+            f"micro_bs={micro_batch_size} precision={args.precision} "
+            f"sp={args.sequence_parallel} overlap_pp={args.overlap_p2p_comm}",
             flush=True,
         )
 
@@ -553,7 +603,7 @@ def write_markdown(results: list[BenchmarkResult], path: str) -> None:
 - **Date**: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - **PyTorch**: {torch.__version__}
 - **CUDA**: {torch.version.cuda}
-- **Precision**: FP32
+- **Precision**: see run command
 - **Tokens**: global = local_batch × seq × dp_size / wall_time
 - **Schedule**: non-interleaved 1F1B
 

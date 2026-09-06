@@ -75,6 +75,10 @@ class DistributedDataParallel(nn.Module):
         finally:
             self._require_backward_grad_sync = prev
 
+    @property
+    def overlap_grad_reduce(self) -> bool:
+        return self._overlap_grad_reduce
+
     def _param_device(self) -> torch.device:
         try:
             return next(self.module.parameters()).device

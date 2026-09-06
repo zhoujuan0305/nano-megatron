@@ -85,10 +85,11 @@ def forward_backward_1f1b(
 
     Splits the batch dimension of ``input_ids`` / ``labels`` into equal
     chunks. Returns the mean loss on the last stage; ``None`` elsewhere.
-    When ``ddp`` is set, every backward runs under ``ddp.no_sync()`` and
-    ``ddp.finish_grad_sync()`` is called before return. When
-    ``overlap_p2p_comm`` is enabled, receives are posted one microbatch ahead
-    and sends retain their tensors until their requests complete.
+    When overlapping DDP is enabled, all but the last microbatch use
+    ``ddp.no_sync()`` so the final backward can launch ready buckets. The
+    optimizer boundary still calls ``ddp.finish_grad_sync()``. When
+    ``overlap_p2p_comm`` is enabled, requests retain their tensors until they
+    complete.
     """
     if num_microbatches < 1:
         raise ValueError(f"num_microbatches must be >= 1, got {num_microbatches}")
@@ -136,6 +137,7 @@ def forward_backward_1f1b(
     input_tensors: list[Tensor] = []
     output_tensors: list[Tensor] = []
     losses: list[Tensor] = []
+    backward_count = 0
 
     def _forward_step(mb_idx: int, input_tensor: Tensor | None) -> Tensor:
         """One microbatch forward. ``input_tensor`` is tokens (first) or act."""
@@ -175,7 +177,14 @@ def forward_backward_1f1b(
         output_tensor_grad: Tensor | None,
     ) -> Tensor | None:
         """Backward one stored microbatch; return grad w.r.t. input (or None)."""
-        sync_ctx = ddp.no_sync() if ddp is not None else nullcontext()
+        nonlocal backward_count
+        is_last_backward = backward_count == num_microbatches - 1
+        backward_count += 1
+        defer_dp_sync = (
+            ddp is not None
+            and (not ddp.overlap_grad_reduce or not is_last_backward)
+        )
+        sync_ctx = ddp.no_sync() if defer_dp_sync else nullcontext()
         with sync_ctx:
             if is_last:
                 # output_tensor is the scaled microbatch loss.
