@@ -374,8 +374,18 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
     Requires Megatron-LM on ``PYTHONPATH``. Uses
     ``get_forward_backward_func`` / ``forward_backward_pipelining_without_interleaving``.
     """
+    if args.overlap_p2p_comm:
+        raise ValueError(
+            "Megatron-LM's non-interleaved pipeline schedule rejects "
+            "overlap_p2p_comm; run the Megatron reference without "
+            "--overlap-p2p-comm"
+        )
     try:
         from megatron.core import parallel_state
+        from megatron.core.distributed import (
+            DistributedDataParallel as MegatronDDP,
+        )
+        from megatron.core.distributed import DistributedDataParallelConfig
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
         )
@@ -448,8 +458,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         bf16=(args.precision == "bf16"),
         params_dtype=_dtype(args),
         deallocate_pipeline_outputs=False,
-        overlap_p2p_comm=args.overlap_p2p_comm,
-        batch_p2p_comm=not args.overlap_p2p_comm,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
     )
 
     is_first = parallel_state.is_pipeline_first_stage()
@@ -470,6 +480,25 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         model = model.bfloat16()
     model.train()
 
+    ddp = None
+    train_model = model
+    if dp_size > 1:
+        bucket_size = int(
+            args.bucket_cap_mb * 1024 * 1024 / _dtype(args).itemsize
+        )
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=False,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            use_distributed_optimizer=False,
+            average_in_collective=True,
+            bucket_size=bucket_size,
+        )
+        ddp = MegatronDDP(config=config, ddp_config=ddp_config, module=model)
+        ddp.broadcast_params()
+        train_model = ddp
+        if args.overlap_grad_reduce:
+            config.no_sync_func = ddp.no_sync
+
     if is_rank0:
         n_params = sum(p.numel() for p in model.parameters())
         print(
@@ -477,7 +506,9 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
             f"microbatches={args.num_microbatches} "
             f"micro_bs={micro_batch_size} precision={args.precision} "
-            f"sp={args.sequence_parallel} overlap_pp={args.overlap_p2p_comm}",
+            f"sp={args.sequence_parallel} "
+            f"overlap_dp={args.overlap_grad_reduce} "
+            "overlap_tp=native overlap_pp=False",
             flush=True,
         )
 
@@ -527,16 +558,20 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         return output_tensor, loss_func
 
     def step() -> None:
+        if ddp is not None:
+            ddp.zero_grad_buffer()
         model.zero_grad(set_to_none=True)
         forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=_make_iterator(),
-            model=model,
+            model=train_model,
             num_microbatches=args.num_microbatches,
             seq_length=args.seq_len,
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
+        if ddp is not None:
+            ddp.finish_grad_sync()
 
     elapsed, memory_mb = _time_loop(
         step,
@@ -646,44 +681,42 @@ def main() -> None:
     is_rank0 = int(os.environ.get("RANK", 0)) == 0
     results: list[BenchmarkResult] = []
 
-    if args.framework in ("nano", "both"):
-        _cuda_reset()
-        if is_rank0:
-            print("Benchmarking nano-megatron PP (1F1B)...", flush=True)
-        r = benchmark_nano(args, dp_size)
-        results.append(r)
-        if is_rank0:
-            _print_result(r)
-
-    if args.framework in ("megatron", "both"):
-        _cuda_reset()
-        if is_rank0:
-            print("Benchmarking Megatron-LM PP (best-effort)...", flush=True)
-        try:
-            r = benchmark_megatron(args, dp_size)
+    try:
+        if args.framework in ("nano", "both"):
+            _cuda_reset()
+            if is_rank0:
+                print("Benchmarking nano-megatron PP (1F1B)...", flush=True)
+            r = benchmark_nano(args, dp_size)
             results.append(r)
             if is_rank0:
                 _print_result(r)
-        except Exception as exc:  # noqa: BLE001 — best-effort path
+
+        if args.framework in ("megatron", "both"):
+            _cuda_reset()
             if is_rank0:
-                print(
-                    f"  Megatron PP path skipped: {type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            if args.framework == "megatron":
-                raise SystemExit(
-                    "Megatron PP benchmark failed and --framework=megatron "
-                    "was requested (no nano fallback)."
-                ) from exc
+                print("Benchmarking Megatron-LM PP (best-effort)...", flush=True)
+            try:
+                r = benchmark_megatron(args, dp_size)
+                results.append(r)
+                if is_rank0:
+                    _print_result(r)
+            except Exception as exc:  # noqa: BLE001 — best-effort path
+                if is_rank0:
+                    print(
+                        f"  Megatron PP path skipped: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                if args.framework == "megatron":
+                    raise
 
-    if is_rank0 and results and args.output:
-        write_markdown(results, args.output)
-        print(f"\nResults written to {args.output}", flush=True)
-
-    _cuda_reset()
-    if dist.is_initialized():
-        dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
-        dist.destroy_process_group()
+        if is_rank0 and results and args.output:
+            write_markdown(results, args.output)
+            print(f"\nResults written to {args.output}", flush=True)
+    finally:
+        _cuda_reset()
+        if dist.is_initialized():
+            dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

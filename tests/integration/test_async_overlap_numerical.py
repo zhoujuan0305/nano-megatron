@@ -1,8 +1,8 @@
-"""TP2 end-to-end numerical equivalence test for async all_reduce overlap.
+"""TP2 end-to-end numerical equivalence for dgrad/wgrad overlap.
 
-Verifies that enabling async_op=True with work.wait() fence in
-_ReduceFromTPRegion.forward and _CopyToTPRegion.backward produces identical
-logits and per-parameter gradients to a synchronous (monkeypatched) baseline.
+Verifies that the custom Column Parallel backward which launches dgrad
+AllReduce before wgrad GEMM produces the same logits and parameter gradients
+as the straightforward autograd path.
 
 Run with torchrun --nproc_per_node=2.
 """
@@ -60,16 +60,9 @@ def test_launch_async_overlap_numerical():
     os.environ.get("NANO_ASYNC_E2E_WORKER") != "1", reason="worker only"
 )
 def test_worker_async_overlap_numerical():
-    """TP2 2-layer nano-megatron model: sync vs async logits/grads at 1e-6.
+    """TP2 2-layer model: regular vs overlapped Column backward at 1e-6."""
+    from dataclasses import replace
 
-    Strategy: build one TP model, run forward+backward twice:
-    1. Sync baseline (monkeypatch TorchDistBackend.all_reduce to force async_op=False)
-    2. Async path (restore original all_reduce with async_op=True support)
-
-    Class-level monkeypatch affects all TorchDistBackend instances, so the same
-    model uses different all_reduce behavior in each pass.
-    """
-    from nano_megatron.distributed.torch_backend import TorchDistBackend
     from nano_megatron.model import build_tp_gpt_from_reference
     from nano_megatron.parallel import (
         ParallelConfig,
@@ -98,41 +91,35 @@ def test_worker_async_overlap_numerical():
         destroy_parallel()
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-    ref = ReferenceGPT(cfg)
+    ref_sync = ReferenceGPT(cfg)
+    overlap_cfg = replace(cfg, tp_comm_overlap=True)
+    ref_overlap = ReferenceGPT(overlap_cfg)
+    ref_overlap.load_state_dict(ref_sync.state_dict())
     ctx = initialize_parallel(
         ParallelConfig(tensor_parallel_size=ws), dist_backend="nccl"
     )
     ids = torch.randint(0, 128, (2, 16), device="cuda")
-    m = build_tp_gpt_from_reference(ref, ctx).cuda()
+    model_sync = build_tp_gpt_from_reference(ref_sync, ctx).cuda()
+    model_overlap = build_tp_gpt_from_reference(ref_overlap, ctx).cuda()
 
-    # --- Sync baseline: monkeypatch to force async_op=False ---
-    orig_all_reduce = TorchDistBackend.all_reduce
-
-    def force_sync(self, tensor, *, group=None, op="sum", async_op=False):
-        return orig_all_reduce(self, tensor, group=group, op=op, async_op=False)
-
-    TorchDistBackend.all_reduce = force_sync
-    logits_sync = m(ids)
-    loss_sync = m.shifted_cross_entropy(logits_sync, ids)
+    logits_sync = model_sync(ids)
+    loss_sync = model_sync.shifted_cross_entropy(logits_sync, ids)
     loss_sync.backward()
     logits_sync_v = logits_sync.detach().clone()
     grads_sync = {
         n: p.grad.detach().clone()
-        for n, p in m.named_parameters()
+        for n, p in model_sync.named_parameters()
         if p.grad is not None
     }
-    m.zero_grad()
 
-    # --- Async path (default async_op=True from Task 2) ---
-    TorchDistBackend.all_reduce = orig_all_reduce
-    logits_async = m(ids)
-    loss_async = m.shifted_cross_entropy(logits_async, ids)
+    logits_async = model_overlap(ids)
+    loss_async = model_overlap.shifted_cross_entropy(logits_async, ids)
     loss_async.backward()
     torch.cuda.synchronize()
     logits_async_v = logits_async.detach().clone()
     grads_async = {
         n: p.grad.detach().clone()
-        for n, p in m.named_parameters()
+        for n, p in model_overlap.named_parameters()
         if p.grad is not None
     }
 
