@@ -82,3 +82,35 @@ def test_sync_after_no_sync_still_works():
     ddp(x).sum().backward()
     ddp.finish_grad_sync()
     assert backend.all_reduce_calls > calls_after_no_sync
+
+
+def test_overlap_does_not_reduce_when_forward_has_no_backward():
+    backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(backend),
+        bucket_cap_mb=25.0,
+        overlap_grad_reduce=True,
+    )
+    baseline = backend.all_reduce_calls
+    ddp(torch.randn(2, 4))
+    ddp.finish_grad_sync()
+    assert backend.all_reduce_calls == baseline
+
+
+def test_overlap_no_sync_launches_at_finish_boundary():
+    backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(backend),
+        bucket_cap_mb=25.0,
+        overlap_grad_reduce=True,
+    )
+    baseline = backend.all_reduce_calls
+    with ddp.no_sync():
+        ddp(torch.randn(2, 4)).sum().backward()
+    assert backend.all_reduce_calls == baseline
+    ddp.finish_grad_sync()
+    assert backend.all_reduce_calls == baseline + 1

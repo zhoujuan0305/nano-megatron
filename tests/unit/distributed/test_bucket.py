@@ -17,6 +17,30 @@ class _FakeBackend:
         return tensor
 
 
+class _FakeWork:
+    def __init__(self) -> None:
+        self.waited = False
+
+    def wait(self) -> bool:
+        self.waited = True
+        return True
+
+    def is_completed(self) -> bool:
+        return self.waited
+
+
+class _AsyncFakeBackend:
+    def __init__(self) -> None:
+        self.work = _FakeWork()
+        self.tensor = None
+
+    def all_reduce(self, tensor, *, group=None, op="sum", async_op=False):
+        assert async_op is True
+        self.tensor = tensor
+        tensor.mul_(2)
+        return self.work
+
+
 def test_build_buckets_reverse_order_and_cap():
     m = nn.Sequential(
         nn.Linear(4, 4, bias=False),  # 16 elems
@@ -202,3 +226,44 @@ def test_reset_clears_flat_buffer():
     bucket.sync(_FakeBackend(), group=None, dp_size=2)
     bucket.reset()
     assert bucket._flat is None
+
+
+def test_async_sync_uses_persistent_grad_views_and_waits_late():
+    p0 = nn.Parameter(torch.zeros(2))
+    p1 = nn.Parameter(torch.zeros(3))
+    bucket = GradBucket([p0, p1])
+    bucket.prepare_grad_buffer(zero=True)
+    assert bucket.flat_buffer is not None
+    assert p0.grad.untyped_storage().data_ptr() == bucket.flat_buffer.untyped_storage().data_ptr()
+    assert p1.grad.untyped_storage().data_ptr() == bucket.flat_buffer.untyped_storage().data_ptr()
+
+    p0.grad.fill_(2)
+    p1.grad.fill_(4)
+    backend = _AsyncFakeBackend()
+    bucket.mark_ready(p0)
+    assert bucket.mark_ready(p1)
+    bucket.start_sync(backend, group=None, mean_divisor=2, group_size=2)
+
+    assert bucket.sync_started
+    assert not backend.work.waited
+    assert torch.equal(p0.grad, torch.full_like(p0, 2))
+    assert torch.equal(p1.grad, torch.full_like(p1, 4))
+
+    bucket.finish_sync()
+    assert backend.work.waited
+    assert bucket.coalesced
+
+
+def test_reset_can_reuse_persistent_grad_buffer():
+    p = nn.Parameter(torch.zeros(4))
+    bucket = GradBucket([p])
+    bucket.prepare_grad_buffer(zero=True)
+    original = bucket.flat_buffer
+    bucket.mark_ready(p)
+    bucket.start_sync(_AsyncFakeBackend(), None, 1, group_size=1)
+    bucket.finish_sync()
+    bucket.reset(keep_grad_buffer=True)
+    bucket.prepare_grad_buffer(zero=True)
+    assert bucket.flat_buffer is original
+    assert p.grad is not None
+    assert torch.count_nonzero(p.grad) == 0

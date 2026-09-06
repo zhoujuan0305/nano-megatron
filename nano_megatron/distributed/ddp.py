@@ -24,6 +24,7 @@ class DistributedDataParallel(nn.Module):
         *,
         bucket_cap_mb: float = 25.0,
         broadcast_buffers: bool = False,
+        overlap_grad_reduce: bool = False,
     ) -> None:
         super().__init__()
         # broadcast_buffers reserved for a later version.
@@ -40,6 +41,7 @@ class DistributedDataParallel(nn.Module):
             ctx.data_parallel_size * ctx.context_parallel_size
         )
         self._sync_group_size = self._mean_divisor
+        self._overlap_grad_reduce = overlap_grad_reduce
         self._buckets: list[GradBucket] = build_buckets(module, bucket_cap_mb)
         self._param_to_bucket: dict[nn.Parameter, GradBucket] = {
             p: bucket for bucket in self._buckets for p in bucket.params
@@ -55,8 +57,12 @@ class DistributedDataParallel(nn.Module):
         # When False, grad hooks skip mark_ready so buckets accumulate without
         # triggering all_reduce.  Managed by no_sync() context manager.
         self._require_backward_grad_sync: bool = True
+        self._grad_activity = False
 
         self._broadcast_params()
+        if self._overlap_grad_reduce:
+            for bucket in self._buckets:
+                bucket.prepare_grad_buffer(zero=True)
         self._register_grad_hooks()
 
     @contextmanager
@@ -99,12 +105,21 @@ class DistributedDataParallel(nn.Module):
         bucket = self._param_to_bucket.get(param)
         if bucket is None:
             return
+        self._grad_activity = True
         if not self._require_backward_grad_sync:
             self._sync_done = False
             return
         # New grads this iteration — allow finish_grad_sync to run again.
         self._sync_done = False
-        if bucket.mark_ready(param):
+        bucket_ready = bucket.mark_ready(param)
+        if self._overlap_grad_reduce and bucket_ready:
+            bucket.start_sync(
+                self._backend,
+                self._dp_group,
+                self._mean_divisor,
+                group_size=self._sync_group_size,
+            )
+        elif not self._overlap_grad_reduce and bucket_ready:
             bucket.sync(
                 self._backend,
                 self._dp_group,
@@ -161,6 +176,8 @@ class DistributedDataParallel(nn.Module):
         any_activity = any(
             bucket.coalesced or bucket.has_pending_ready for bucket in self._buckets
         )
+        if self._overlap_grad_reduce:
+            any_grad = self._grad_activity
         # No backward (or grads cleared): nothing to sync.
         if not any_grad and not any_activity:
             self._sync_done = True
@@ -178,12 +195,33 @@ class DistributedDataParallel(nn.Module):
                     f"finish_grad_sync rank={self._ctx.rank}: "
                     f"missing grads for {names}"
                 )
-            bucket.sync(
-                self._backend,
-                self._dp_group,
-                self._mean_divisor,
-                group_size=self._sync_group_size,
-            )
+            if self._overlap_grad_reduce:
+                if not bucket.sync_started:
+                    bucket.start_sync(
+                        self._backend,
+                        self._dp_group,
+                        self._mean_divisor,
+                        group_size=self._sync_group_size,
+                    )
+                bucket.finish_sync()
+            else:
+                bucket.sync(
+                    self._backend,
+                    self._dp_group,
+                    self._mean_divisor,
+                    group_size=self._sync_group_size,
+                )
         for bucket in self._buckets:
-            bucket.reset()
+            bucket.reset(keep_grad_buffer=self._overlap_grad_reduce)
+        self._grad_activity = False
+        self._sync_done = True
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        if not self._overlap_grad_reduce:
+            super().zero_grad(set_to_none=set_to_none)
+            return
+        for bucket in self._buckets:
+            bucket.reset(keep_grad_buffer=True)
+            bucket.prepare_grad_buffer(zero=True)
+        self._grad_activity = False
         self._sync_done = True

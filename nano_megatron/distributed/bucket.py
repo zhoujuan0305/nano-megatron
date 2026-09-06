@@ -18,6 +18,9 @@ class GradBucket:
         self._ready: set[int] = set()
         self._coalesced = False
         self._flat: Tensor | None = None
+        self._grad_views: dict[nn.Parameter, Tensor] = {}
+        self._work: Any | None = None
+        self._sync_started = False
 
     @property
     def params(self) -> list[nn.Parameter]:
@@ -31,6 +34,37 @@ class GradBucket:
     def has_pending_ready(self) -> bool:
         """True if at least one param has been marked ready this iteration."""
         return bool(self._ready)
+
+    @property
+    def all_ready(self) -> bool:
+        return len(self._ready) == len(self._params)
+
+    @property
+    def sync_started(self) -> bool:
+        return self._sync_started
+
+    @property
+    def flat_buffer(self) -> Tensor | None:
+        return self._flat
+
+    def prepare_grad_buffer(self, *, zero: bool) -> None:
+        """Map every parameter gradient onto this bucket's flat storage."""
+        total = sum(param.numel() for param in self._params)
+        first = self._params[0]
+        if self._flat is None:
+            self._flat = torch.empty(
+                total, dtype=first.dtype, device=first.device
+            )
+        if zero:
+            self._flat.zero_()
+
+        self._grad_views.clear()
+        offset = 0
+        for param in self._params:
+            view = self._flat[offset : offset + param.numel()].view_as(param)
+            self._grad_views[param] = view
+            param.grad = view
+            offset += param.numel()
 
     def mark_ready(self, param: nn.Parameter) -> bool:
         idx = self._index.get(param)
@@ -83,28 +117,93 @@ class GradBucket:
             return
 
         grads = [p.grad for p in self._params]
-        total = sum(g.numel() for g in grads)
-        flat = grads[0].new_empty(total)
-        offset = 0
-        for g in grads:
-            n = g.numel()
-            flat[offset : offset + n].copy_(g.reshape(-1))
-            offset += n
+        uses_grad_views = bool(self._grad_views) and all(
+            p.grad is self._grad_views[p] for p in self._params
+        )
+        if uses_grad_views:
+            assert self._flat is not None
+            flat = self._flat
+        else:
+            total = sum(g.numel() for g in grads)
+            flat = grads[0].new_empty(total)
+            offset = 0
+            for g in grads:
+                n = g.numel()
+                flat[offset : offset + n].copy_(g.reshape(-1))
+                offset += n
         backend.all_reduce(flat, group=group, op="sum")
         flat.div_(mean_divisor)
-        offset = 0
-        for p in self._params:
-            g = p.grad
-            n = g.numel()
-            g.copy_(flat[offset : offset + n].view_as(g))
-            offset += n
+        if not uses_grad_views:
+            offset = 0
+            for p in self._params:
+                g = p.grad
+                n = g.numel()
+                g.copy_(flat[offset : offset + n].view_as(g))
+                offset += n
         self._flat = flat
         self._coalesced = True
 
-    def reset(self) -> None:
+    def start_sync(
+        self,
+        backend: CommBackend,
+        group: Any,
+        mean_divisor: int,
+        *,
+        group_size: int,
+    ) -> None:
+        """Launch an in-place asynchronous reduction on the flat grad buffer."""
+        if self._sync_started or self._coalesced:
+            return
+        if mean_divisor < 1 or group_size < 1:
+            raise ValueError(
+                f"mean_divisor and group_size must be >= 1, "
+                f"got mean_divisor={mean_divisor}, group_size={group_size}"
+            )
+        missing = [p for p in self._params if p.grad is None]
+        if missing:
+            raise RuntimeError(
+                f"GradBucket.start_sync: {len(missing)} parameter(s) have grad=None"
+            )
+        if not self._grad_views or any(
+            p.grad is not self._grad_views[p] for p in self._params
+        ):
+            raise RuntimeError(
+                "GradBucket.start_sync requires prepare_grad_buffer() before backward"
+            )
+
+        self._sync_started = True
+        if group_size == 1:
+            self._coalesced = True
+            return
+
+        assert self._flat is not None
+        self._flat.div_(mean_divisor)
+        work = backend.all_reduce(
+            self._flat, group=group, op="sum", async_op=True
+        )
+        if hasattr(work, "wait"):
+            self._work = work
+        else:
+            self._coalesced = True
+
+    def finish_sync(self) -> None:
+        """Wait at the consumer boundary for a previously launched reduction."""
+        if not self._sync_started:
+            raise RuntimeError("GradBucket.finish_sync called before start_sync")
+        if self._work is not None:
+            self._work.wait()
+            self._work = None
+        self._coalesced = True
+
+    def reset(self, *, keep_grad_buffer: bool = False) -> None:
+        if self._work is not None:
+            raise RuntimeError("cannot reset GradBucket with communication in flight")
         self._ready.clear()
         self._coalesced = False
-        self._flat = None
+        self._sync_started = False
+        if not keep_grad_buffer:
+            self._flat = None
+            self._grad_views.clear()
 
 
 def build_buckets(
