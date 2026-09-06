@@ -65,6 +65,64 @@ def _make_request(
     )
 
 
+def warmup_pipeline_p2p(
+    ctx: ParallelContext,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> None:
+    """Initialize a two-stage P2P communicator with a matched exchange.
+
+    NCCL requires every rank in a newly created P2P communicator to enter its
+    first batched operation. The real overlap schedule has an asymmetric first
+    batch, so perform one tiny symmetric exchange once per parallel context.
+    """
+    if ctx.pipeline_parallel_size == 1:
+        return
+    if ctx.pipeline_parallel_size != 2:
+        raise ValueError(
+            "P2P warmup currently supports pipeline_parallel_size <= 2"
+        )
+    if getattr(ctx, "_pipeline_p2p_warmed", False):
+        return
+
+    peer = (
+        pipeline_next_rank(ctx)
+        if ctx.pipeline_parallel_rank == 0
+        else pipeline_prev_rank(ctx)
+    )
+    assert peer is not None
+    send_token = torch.zeros(1, dtype=dtype, device=device)
+    recv_token = torch.empty_like(send_token)
+    if ctx.pipeline_parallel_rank == 0:
+        tensors = (send_token, recv_token)
+        operations = (
+            P2POperation(
+                "send", send_token, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+            P2POperation(
+                "recv", recv_token, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+        )
+    else:
+        tensors = (recv_token, send_token)
+        operations = (
+            P2POperation(
+                "recv", recv_token, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+            P2POperation(
+                "send", send_token, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+        )
+    works = ctx.backend.batch_p2p(list(operations))
+    _make_request(
+        recv_token,
+        works,
+        retained_tensors=tensors,
+    ).wait()
+    setattr(ctx, "_pipeline_p2p_warmed", True)
+
+
 def recv_forward(
     ctx: ParallelContext,
     *,

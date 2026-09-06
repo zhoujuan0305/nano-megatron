@@ -81,6 +81,23 @@ class TestFirstStage:
             send_backward(ctx, t)
         ctx.backend.send.assert_not_called()
 
+    def test_p2p_warmup_is_matched_and_idempotent(self):
+        work = _FakeWork()
+        ctx = _make_ctx(pp_rank=0, pp_size=2)
+        ctx.backend.batch_p2p.return_value = [work]
+        prev_p, next_p = _patch_neighbors(None, 1)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import warmup_pipeline_p2p
+
+            warmup_pipeline_p2p(ctx, dtype=torch.float32, device="cpu")
+            warmup_pipeline_p2p(ctx, dtype=torch.float32, device="cpu")
+
+        operations = ctx.backend.batch_p2p.call_args.args[0]
+        assert [operation.kind for operation in operations] == ["send", "recv"]
+        assert all(operation.peer == 1 for operation in operations)
+        assert ctx.backend.batch_p2p.call_count == 1
+        assert work.waited
+
 
 # ---------------------------------------------------------------------------
 # Tests — last stage (pp_rank=pp_size-1)
@@ -106,6 +123,21 @@ class TestLastStage:
             t = torch.randn(2, 4)
             send_forward(ctx, t)
         ctx.backend.send.assert_not_called()
+
+    def test_p2p_warmup_uses_peer_order(self):
+        works = [_FakeWork(), _FakeWork()]
+        ctx = _make_ctx(pp_rank=1, pp_size=2)
+        ctx.backend.batch_p2p.return_value = works
+        prev_p, next_p = _patch_neighbors(0, None)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import warmup_pipeline_p2p
+
+            warmup_pipeline_p2p(ctx, dtype=torch.float32, device="cpu")
+
+        operations = ctx.backend.batch_p2p.call_args.args[0]
+        assert [operation.kind for operation in operations] == ["recv", "send"]
+        assert all(operation.peer == 0 for operation in operations)
+        assert all(work.waited for work in works)
 
 
 # ---------------------------------------------------------------------------

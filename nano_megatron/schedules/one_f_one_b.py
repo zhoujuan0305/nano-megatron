@@ -27,7 +27,6 @@ from nano_megatron.parallel.context import (
 from nano_megatron.schedules.p2p import (
     P2PRequest,
     recv_backward,
-    recv_backward_async,
     recv_forward,
     recv_forward_async,
     send_backward,
@@ -35,9 +34,9 @@ from nano_megatron.schedules.p2p import (
     send_backward_recv_forward,
     send_backward_recv_forward_async,
     send_forward,
-    send_forward_async,
     send_forward_recv_backward,
     send_forward_recv_backward_async,
+    warmup_pipeline_p2p,
 )
 
 if TYPE_CHECKING:
@@ -229,18 +228,9 @@ def forward_backward_1f1b(
                 output_tensor = _forward_step(mb_idx, input_tensor)
                 _backward_step(input_tensor, output_tensor, None)
         elif is_first:
-            # The first warmup send and the peer's first receive initialize the
-            # lazy NCCL communicator with matching one-operation batches.
-            input_tensor = _slice_microbatch(input_ids, 0, micro_batch_size)
-            assert input_tensor is not None
-            output_tensor = _forward_step(0, input_tensor)
-            warmup_send = send_forward_async(ctx, output_tensor)
-            assert warmup_send is not None
-            pending_sends.append(warmup_send)
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-
-            for mb_idx in range(1, num_microbatches):
+            warmup_pipeline_p2p(ctx, dtype=param_dtype, device=device)
+            pending_grads: list[P2PRequest] = []
+            for mb_idx in range(num_microbatches):
                 input_tensor = _slice_microbatch(
                     input_ids, mb_idx, micro_batch_size
                 )
@@ -248,34 +238,31 @@ def forward_backward_1f1b(
                 output_tensor = _forward_step(mb_idx, input_tensor)
                 exchange = send_forward_recv_backward_async(ctx, output_tensor)
                 assert exchange is not None
+                pending_grads.append(exchange)
                 input_tensors.append(input_tensor)
                 output_tensors.append(output_tensor)
 
+                if mb_idx < num_warmup:
+                    continue
                 oldest_input = input_tensors.pop(0)
                 oldest_output = output_tensors.pop(0)
                 _backward_step(
                     oldest_input,
                     oldest_output,
-                    exchange.wait(),
+                    pending_grads.pop(0).wait(),
                 )
 
-            # PP2 has one warmup microbatch, so one backward remains. Posting
-            # its receive before the wait keeps the endpoint asynchronous.
-            oldest_input = input_tensors.pop(0)
-            oldest_output = output_tensors.pop(0)
-            grad_request = recv_backward_async(
-                ctx,
-                shape=tuple(oldest_output.shape),
-                dtype=oldest_output.dtype,
-                device=oldest_output.device,
-            )
-            assert grad_request is not None
-            _backward_step(
-                oldest_input,
-                oldest_output,
-                grad_request.wait(),
-            )
+            while input_tensors:
+                oldest_input = input_tensors.pop(0)
+                oldest_output = output_tensors.pop(0)
+                _backward_step(
+                    oldest_input,
+                    oldest_output,
+                    pending_grads.pop(0).wait(),
+                )
+            assert not pending_grads
         else:
+            warmup_pipeline_p2p(ctx, dtype=param_dtype, device=device)
             pending_input = recv_forward_async(
                 ctx, shape=act_shape, dtype=param_dtype, device=device
             )
