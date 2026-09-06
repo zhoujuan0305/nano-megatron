@@ -197,6 +197,19 @@ def _time_loop(
     return elapsed, mem
 
 
+def _global_max_metrics(
+    elapsed: float, memory_mb: float, *, device: torch.device
+) -> tuple[float, float]:
+    """Use the slowest rank for throughput and the largest per-rank allocation."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return elapsed, memory_mb
+    metrics = torch.tensor(
+        [elapsed, memory_mb], dtype=torch.float64, device=device
+    )
+    dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+    return float(metrics[0].item()), float(metrics[1].item())
+
+
 def _make_result(
     *,
     framework: str,
@@ -346,6 +359,9 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
 
     elapsed, memory_mb = _time_loop(
         step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
+    )
+    elapsed, memory_mb = _global_max_metrics(
+        elapsed, memory_mb, device=device
     )
     destroy_parallel()
 
@@ -580,6 +596,9 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         warmup=args.warmup_steps,
         steps=args.benchmark_steps,
         device=device,
+    )
+    elapsed, memory_mb = _global_max_metrics(
+        elapsed, memory_mb, device=device
     )
     parallel_state.destroy_model_parallel()
 
