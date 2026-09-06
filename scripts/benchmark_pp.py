@@ -181,11 +181,13 @@ def _time_loop(
     if device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.nvtx.range_push("nano_megatron_benchmark_loop")
     t0 = time.perf_counter()
     for _ in range(steps):
         step_fn()
     if device.type == "cuda":
         torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
     elapsed = time.perf_counter() - t0
     mem = (
         torch.cuda.max_memory_allocated() / (1024 * 1024)
