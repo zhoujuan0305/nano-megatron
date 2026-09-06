@@ -37,11 +37,16 @@ class TorchDistBackend:
         *,
         group: Any | None = None,
         op: str = "sum",
-    ) -> Tensor:
-        dist.reduce_scatter(
-            output, input_list, op=reduce_op_from_string(op), group=group
+        async_op: bool = False,
+    ) -> Tensor | Any:
+        work = dist.reduce_scatter(
+            output,
+            input_list,
+            op=reduce_op_from_string(op),
+            group=group,
+            async_op=async_op,
         )
-        return output
+        return work if async_op else output
 
     def all_gather(
         self,
@@ -49,9 +54,12 @@ class TorchDistBackend:
         tensor: Tensor,
         *,
         group: Any | None = None,
-    ) -> list[Tensor]:
-        dist.all_gather(tensor_list, tensor, group=group)
-        return tensor_list
+        async_op: bool = False,
+    ) -> list[Tensor] | Any:
+        work = dist.all_gather(
+            tensor_list, tensor, group=group, async_op=async_op
+        )
+        return work if async_op else tensor_list
 
     def all_gather_into_tensor(
         self,
@@ -59,15 +67,39 @@ class TorchDistBackend:
         input: Tensor,
         *,
         group: Any | None = None,
-    ) -> Tensor:
-        dist.all_gather_into_tensor(output, input, group=group)
-        return output
+        async_op: bool = False,
+    ) -> Tensor | Any:
+        work = dist.all_gather_into_tensor(
+            output, input, group=group, async_op=async_op
+        )
+        return work if async_op else output
 
-    def send(self, tensor: Tensor, dst: int, *, group: Any | None = None) -> None:
-        dist.send(tensor, dst, group=group)
+    def send(
+        self,
+        tensor: Tensor,
+        dst: int,
+        *,
+        group: Any | None = None,
+        tag: int = 0,
+        async_op: bool = False,
+    ) -> None | Any:
+        if async_op:
+            return dist.isend(tensor, dst=dst, group=group, tag=tag)
+        dist.send(tensor, dst=dst, group=group, tag=tag)
+        return None
 
-    def recv(self, tensor: Tensor, src: int, *, group: Any | None = None) -> Tensor:
-        dist.recv(tensor, src, group=group)
+    def recv(
+        self,
+        tensor: Tensor,
+        src: int,
+        *,
+        group: Any | None = None,
+        tag: int = 0,
+        async_op: bool = False,
+    ) -> Tensor | Any:
+        if async_op:
+            return dist.irecv(tensor, src=src, group=group, tag=tag)
+        dist.recv(tensor, src=src, group=group, tag=tag)
         return tensor
 
     def broadcast(

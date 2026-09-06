@@ -80,6 +80,31 @@ def test_broadcast_method_exists():
     assert callable(backend.broadcast)
 
 
+@pytest.mark.parametrize(
+    "method_name", ["all_reduce", "reduce_scatter", "all_gather", "send", "recv"]
+)
+def test_async_operations_are_part_of_backend_contract(method_name):
+    backend: CommBackend = TorchDistBackend()
+    assert hasattr(backend, method_name)
+    assert "async_op" in __import__("inspect").signature(
+        getattr(backend, method_name)
+    ).parameters
+
+
+def test_async_send_and_recv_use_nonblocking_primitives(monkeypatch):
+    import torch.distributed as dist
+
+    sentinel_send = object()
+    sentinel_recv = object()
+    monkeypatch.setattr(dist, "isend", lambda *args, **kwargs: sentinel_send)
+    monkeypatch.setattr(dist, "irecv", lambda *args, **kwargs: sentinel_recv)
+    backend = TorchDistBackend()
+    tensor = torch.ones(2)
+
+    assert backend.send(tensor, 1, async_op=True) is sentinel_send
+    assert backend.recv(tensor, 1, async_op=True) is sentinel_recv
+
+
 def test_broadcast_calls_dist_broadcast(monkeypatch):
     import torch.distributed as dist
 
