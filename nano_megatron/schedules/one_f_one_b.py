@@ -300,6 +300,7 @@ def forward_backward_1f1b(
 
         if ddp is not None:
             ddp.finish_grad_sync()
+        stage.finish_sequence_parallel_grad_sync()
         if not is_last:
             return None
         assert losses, "last stage produced no microbatch losses"
@@ -439,6 +440,7 @@ def forward_backward_1f1b(
 
     if ddp is not None:
         ddp.finish_grad_sync()
+    stage.finish_sequence_parallel_grad_sync()
 
     if not is_last:
         return None

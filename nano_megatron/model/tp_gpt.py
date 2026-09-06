@@ -25,9 +25,10 @@ from nano_megatron.parallel.context_parallel import (
 from nano_megatron.parallel.mappings import (
     ColumnParallelLinear,
     RowParallelLinear,
+    SequenceParallelGradSynchronizer,
     blockwise_column_shard,
     fused_qkv_column_shard,
-    register_sequence_parallel_grad_allreduce,
+    mark_sequence_parallel_parameter,
     scatter_to_sequence_parallel_region,
 )
 from nano_megatron.parallel.vocab_parallel import (
@@ -398,9 +399,7 @@ class TPTransformerBlock(nn.Module):
                 self.ln2_weight,
                 self.ln2_bias,
             ):
-                register_sequence_parallel_grad_allreduce(
-                    p, ctx.tensor_parallel_group, ctx.backend
-                )
+                mark_sequence_parallel_parameter(p)
 
     def _apply_norm(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
         """Apply normalization based on config."""
@@ -469,12 +468,8 @@ class TPGPT(nn.Module):
         self.ln_f_bias = Parameter(ref.ln_f_bias.data.clone())
         self.layernorm_eps = config.layernorm_eps
         if ctx.sequence_parallel:
-            register_sequence_parallel_grad_allreduce(
-                self.ln_f_weight, ctx.tensor_parallel_group, ctx.backend
-            )
-            register_sequence_parallel_grad_allreduce(
-                self.ln_f_bias, ctx.tensor_parallel_group, ctx.backend
-            )
+            mark_sequence_parallel_parameter(self.ln_f_weight)
+            mark_sequence_parallel_parameter(self.ln_f_bias)
         # Column-parallel LM head: local logits [B, S, V/tp].
         # With SP, gathers sequence shards internally before the matmul.
         self.lm_head = ColumnParallelLinear(
@@ -490,6 +485,16 @@ class TPGPT(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
         self.to(dtype=torch.float32)
+        self._sequence_parallel_grad_sync = SequenceParallelGradSynchronizer(
+            self.parameters(),
+            group=self._tp_group,
+            backend=self._tp_backend,
+            tp_size=self._tp_size,
+        )
+
+    def finish_sequence_parallel_grad_sync(self) -> int:
+        """Coalesce and sum replicated SP parameter gradients over TP."""
+        return self._sequence_parallel_grad_sync.finish()
 
     def shifted_cross_entropy(
         self,

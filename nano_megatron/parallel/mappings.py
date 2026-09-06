@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -163,28 +165,94 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         return torch.cat(gathered, dim=SEQ_DIM), None, None, None, None
 
 
-def register_sequence_parallel_grad_allreduce(
-    param: nn.Parameter,
-    group: Any,
-    backend: CommBackend,
-) -> None:
-    """All-reduce grads for replicated params that only saw a sequence shard.
+_SEQUENCE_PARALLEL_GRAD_ATTR = "_nano_sequence_parallel_grad"
 
-    With SP, LayerNorm weights/biases and RowParallel bias accumulate grads
-    over local S/tp tokens only. Summing across the TP group restores the
-    full-sequence gradient (Megatron-style).
+
+def mark_sequence_parallel_parameter(param: nn.Parameter) -> None:
+    """Mark a replicated parameter whose gradient covers one sequence shard."""
+    if param.requires_grad:
+        setattr(param, _SEQUENCE_PARALLEL_GRAD_ATTR, True)
+
+
+class SequenceParallelGradSynchronizer:
+    """Coalesce replicated SP parameter gradients into one buffer per dtype.
+
+    Gradients accumulate locally across all microbatches. The execution
+    schedule calls :meth:`finish` after DP gradient communication completes,
+    which is safe because the DP and TP reductions commute but must not access
+    the same gradient storage concurrently.
     """
-    if not param.requires_grad:
-        return
 
-    def _hook(grad: Tensor) -> Tensor:
-        # torch.distributed all_reduce is in-place; return the same storage.
-        work = backend.all_reduce(grad, group=group, op="sum", async_op=True)
-        if hasattr(work, "wait"):
-            work.wait()
-        return grad
+    def __init__(
+        self,
+        params: Iterable[nn.Parameter],
+        *,
+        group: Any,
+        backend: CommBackend,
+        tp_size: int,
+    ) -> None:
+        if tp_size < 1:
+            raise ValueError(f"tp_size must be >= 1, got {tp_size}")
+        self._params = [
+            param
+            for param in params
+            if param.requires_grad
+            and bool(getattr(param, _SEQUENCE_PARALLEL_GRAD_ATTR, False))
+        ]
+        self._group = group
+        self._backend = backend
+        self._tp_size = tp_size
+        self._buffers: dict[
+            tuple[torch.device, torch.dtype, tuple[int, ...]], Tensor
+        ] = {}
 
-    param.register_hook(_hook)
+    @property
+    def num_parameters(self) -> int:
+        return len(self._params)
+
+    def finish(self) -> int:
+        """Sum marked gradients over TP and return the collective count."""
+        if self._tp_size == 1 or not self._params:
+            return 0
+
+        grouped: defaultdict[
+            tuple[torch.device, torch.dtype], list[nn.Parameter]
+        ] = defaultdict(list)
+        for param in self._params:
+            if param.grad is None:
+                raise RuntimeError(
+                    "sequence-parallel gradient is missing for parameter "
+                    f"with shape={tuple(param.shape)} device={param.device} "
+                    f"dtype={param.dtype}"
+                )
+            grouped[(param.grad.device, param.grad.dtype)].append(param)
+
+        collectives = 0
+        for (device, dtype), params in grouped.items():
+            sizes = tuple(param.numel() for param in params)
+            key = (device, dtype, sizes)
+            total = sum(sizes)
+            flat = self._buffers.get(key)
+            if flat is None:
+                flat = torch.empty(total, device=device, dtype=dtype)
+                self._buffers[key] = flat
+
+            offset = 0
+            for param, size in zip(params, sizes):
+                assert param.grad is not None
+                flat[offset : offset + size].copy_(param.grad.reshape(-1))
+                offset += size
+
+            self._backend.all_reduce(flat, group=self._group, op="sum")
+            collectives += 1
+
+            offset = 0
+            for param, size in zip(params, sizes):
+                assert param.grad is not None
+                param.grad.copy_(flat[offset : offset + size].view_as(param.grad))
+                offset += size
+
+        return collectives
 
 
 def scatter_to_sequence_parallel_region(
@@ -526,7 +594,7 @@ class RowParallelLinear(nn.Module):
         # Bias is added after reduce-scatter on the local sequence shard, so
         # its grad is partial and must be summed across the TP group.
         if sequence_parallel and self.bias is not None:
-            register_sequence_parallel_grad_allreduce(self.bias, group, backend)
+            mark_sequence_parallel_parameter(self.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.linear(x, self.weight, bias=None)

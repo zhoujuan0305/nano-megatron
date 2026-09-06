@@ -144,6 +144,7 @@ def test_worker_sp_vs_tp_forward_backward_nccl():
 
     loss_on.backward()
     loss_off.backward()
+    tp_on.finish_sequence_parallel_grad_sync()
     _assert_sp_grads_match_tp(tp_on, tp_off)
 
     destroy_parallel()
@@ -219,6 +220,7 @@ def test_worker_sp_vs_tp_fused_qkv_forward_backward_nccl():
 
     loss_on.backward()
     loss_off.backward()
+    tp_on.finish_sequence_parallel_grad_sync()
     _assert_sp_grads_match_tp(tp_on, tp_off)
 
     destroy_parallel()
