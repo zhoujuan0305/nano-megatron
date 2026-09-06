@@ -596,8 +596,6 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
-        if ddp is not None:
-            ddp.finish_grad_sync()
 
     elapsed, memory_mb = _time_loop(
         step,
