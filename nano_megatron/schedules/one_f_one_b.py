@@ -7,11 +7,9 @@ Control flow mirrors Megatron
 2. Steady 1F1B (forward next, backward oldest)
 3. Cooldown backward passes
 
-P2P uses blocking ``send``/``recv``. To avoid deadlock between adjacent
-stages that exchange activation and gradient in the same steady-state
-step, communication with the *next* stage is ordered as recv-grad then
-send-activation, and with the *prev* stage as send-grad then
-recv-activation (peer pairing under blocking collectives).
+The steady state submits the forward and backward directions together through
+``batch_p2p``. Grouping both directions lets NCCL make progress without a
+single send or receive blocking the peer's matching operation behind it.
 """
 from __future__ import annotations
 
@@ -34,8 +32,12 @@ from nano_megatron.schedules.p2p import (
     recv_forward_async,
     send_backward,
     send_backward_async,
+    send_backward_recv_forward,
+    send_backward_recv_forward_async,
     send_forward,
     send_forward_async,
+    send_forward_recv_backward,
+    send_forward_recv_backward_async,
 )
 
 if TYPE_CHECKING:
@@ -216,85 +218,88 @@ def forward_backward_1f1b(
             raise ValueError(
                 "overlap_p2p_comm currently supports pipeline_parallel_size <= 2"
             )
-        pending_input = (
-            recv_forward_async(
-                ctx, shape=act_shape, dtype=param_dtype, device=device
-            )
-            if not is_first
-            else None
-        )
-        pending_grads: list[P2PRequest] = []
         pending_sends: list[P2PRequest] = []
 
-        def next_input(mb_idx: int) -> Tensor:
-            nonlocal pending_input
-            if is_first:
-                local = _slice_microbatch(
+        if pp_size == 1:
+            for mb_idx in range(num_microbatches):
+                input_tensor = _slice_microbatch(
                     input_ids, mb_idx, micro_batch_size
                 )
-                assert local is not None
-                return local
-
-            assert pending_input is not None
-            received = pending_input.wait()
-            pending_input = None
-            return received
-
-        def launch_forward(output_tensor: Tensor) -> None:
-            if is_last:
-                return
-            send_request = send_forward_async(ctx, output_tensor)
-            grad_request = recv_backward_async(
-                ctx,
-                shape=tuple(output_tensor.shape),
-                dtype=output_tensor.dtype,
-                device=output_tensor.device,
-            )
-            assert send_request is not None and grad_request is not None
-            pending_grads.append(grad_request)
-            pending_sends.append(send_request)
-
-        def launch_backward(input_tensor_grad: Tensor | None) -> None:
-            if is_first:
-                return
-            assert input_tensor_grad is not None
-            request = send_backward_async(ctx, input_tensor_grad)
-            assert request is not None
-            pending_sends.append(request)
-
-        for mb_idx in range(num_microbatches):
-            input_tensor = next_input(mb_idx)
-            output_tensor = _forward_step(mb_idx, input_tensor)
-            launch_forward(output_tensor)
+                assert input_tensor is not None
+                output_tensor = _forward_step(mb_idx, input_tensor)
+                _backward_step(input_tensor, output_tensor, None)
+        elif is_first:
+            # The first warmup send and the peer's first receive initialize the
+            # lazy NCCL communicator with matching one-operation batches.
+            input_tensor = _slice_microbatch(input_ids, 0, micro_batch_size)
+            assert input_tensor is not None
+            output_tensor = _forward_step(0, input_tensor)
+            warmup_send = send_forward_async(ctx, output_tensor)
+            assert warmup_send is not None
+            pending_sends.append(warmup_send)
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
 
-            if mb_idx < num_warmup:
-                continue
-
-            oldest_input = input_tensors.pop(0)
-            oldest_output = output_tensors.pop(0)
-            output_grad = None if is_last else pending_grads.pop(0).wait()
-            input_grad = _backward_step(
-                oldest_input, oldest_output, output_grad
-            )
-            launch_backward(input_grad)
-            if not is_first and mb_idx + 1 < num_microbatches:
-                pending_input = recv_forward_async(
-                    ctx, shape=act_shape, dtype=param_dtype, device=device
+            for mb_idx in range(1, num_microbatches):
+                input_tensor = _slice_microbatch(
+                    input_ids, mb_idx, micro_batch_size
                 )
-                assert pending_input is not None
+                assert input_tensor is not None
+                output_tensor = _forward_step(mb_idx, input_tensor)
+                exchange = send_forward_recv_backward_async(ctx, output_tensor)
+                assert exchange is not None
+                input_tensors.append(input_tensor)
+                output_tensors.append(output_tensor)
 
-        while input_tensors:
+                oldest_input = input_tensors.pop(0)
+                oldest_output = output_tensors.pop(0)
+                _backward_step(
+                    oldest_input,
+                    oldest_output,
+                    exchange.wait(),
+                )
+
+            # PP2 has one warmup microbatch, so one backward remains. Posting
+            # its receive before the wait keeps the endpoint asynchronous.
             oldest_input = input_tensors.pop(0)
             oldest_output = output_tensors.pop(0)
-            output_grad = None if is_last else pending_grads.pop(0).wait()
-            input_grad = _backward_step(
-                oldest_input, oldest_output, output_grad
+            grad_request = recv_backward_async(
+                ctx,
+                shape=tuple(oldest_output.shape),
+                dtype=oldest_output.dtype,
+                device=oldest_output.device,
             )
-            launch_backward(input_grad)
+            assert grad_request is not None
+            _backward_step(
+                oldest_input,
+                oldest_output,
+                grad_request.wait(),
+            )
+        else:
+            pending_input = recv_forward_async(
+                ctx, shape=act_shape, dtype=param_dtype, device=device
+            )
+            assert pending_input is not None
+            for mb_idx in range(num_microbatches):
+                input_tensor = pending_input.wait()
+                output_tensor = _forward_step(mb_idx, input_tensor)
+                input_grad = _backward_step(input_tensor, output_tensor, None)
+                assert input_grad is not None
+                if mb_idx + 1 < num_microbatches:
+                    pending_input = send_backward_recv_forward_async(
+                        ctx,
+                        input_grad,
+                        shape=act_shape,
+                        dtype=param_dtype,
+                        device=device,
+                    )
+                    assert pending_input is not None
+                else:
+                    final_send = send_backward_async(ctx, input_grad)
+                    assert final_send is not None
+                    pending_sends.append(final_send)
 
-        assert not output_tensors and not pending_grads
+        assert not input_tensors and not output_tensors
         for request in pending_sends:
             request.wait()
 
@@ -308,39 +313,6 @@ def forward_backward_1f1b(
 
     if overlap_p2p_comm:
         return _run_overlap_schedule()
-
-    def _send_forward_recv_backward(output_tensor: Tensor) -> Tensor | None:
-        """Peer-safe exchange with next stage (blocking send/recv).
-
-        Order: recv grad from next, then send activation to next. Pairs with
-        the peer's send-grad-then-recv-activation ordering.
-        """
-        if is_last:
-            return None
-        # Shape of grad matches the activation we send.
-        grad = recv_backward(
-            ctx,
-            shape=tuple(output_tensor.shape),
-            dtype=output_tensor.dtype,
-            device=output_tensor.device,
-        )
-        send_forward(ctx, output_tensor)
-        return grad
-
-    def _send_backward_recv_forward(
-        input_tensor_grad: Tensor | None, *, recv_next_forward: bool
-    ) -> Tensor | None:
-        """Peer-safe exchange with previous stage."""
-        if not is_first:
-            assert input_tensor_grad is not None
-            send_backward(ctx, input_tensor_grad)
-        if not recv_next_forward or is_first:
-            # First stage loads tokens locally; caller handles that.
-            return None
-        recv = recv_forward(
-            ctx, shape=act_shape, dtype=param_dtype, device=device
-        )
-        return recv
 
     # ------------------------------------------------------------------
     # Warmup forwards
@@ -384,7 +356,7 @@ def forward_backward_1f1b(
         if is_last:
             output_tensor_grad = None
         else:
-            output_tensor_grad = _send_forward_recv_backward(output_tensor)
+            output_tensor_grad = send_forward_recv_backward(ctx, output_tensor)
 
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
@@ -411,8 +383,13 @@ def forward_backward_1f1b(
                     # first stage: no send_backward
                     pass
             else:
-                next_input = _send_backward_recv_forward(
-                    input_tensor_grad, recv_next_forward=True
+                assert input_tensor_grad is not None
+                next_input = send_backward_recv_forward(
+                    ctx,
+                    input_tensor_grad,
+                    shape=act_shape,
+                    dtype=param_dtype,
+                    device=device,
                 )
 
     # ------------------------------------------------------------------

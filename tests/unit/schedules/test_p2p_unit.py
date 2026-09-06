@@ -211,6 +211,58 @@ class TestMiddleStage:
         assert operation.kind == "send"
         assert operation.peer == 2
 
+    def test_forward_backward_exchange_uses_one_batch(self):
+        # NCCL may return one aggregate handle for a multi-operation batch.
+        works = [_FakeWork()]
+        ctx = _make_ctx(pp_rank=1, pp_size=3)
+        ctx.backend.batch_p2p.return_value = works
+        activation = torch.randn(2, 4)
+        prev_p, next_p = _patch_neighbors(0, 2)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import (
+                send_forward_recv_backward_async,
+            )
+
+            request = send_forward_recv_backward_async(ctx, activation)
+
+        assert request is not None
+        operations = ctx.backend.batch_p2p.call_args.args[0]
+        assert [operation.kind for operation in operations] == ["send", "recv"]
+        assert all(operation.peer == 2 for operation in operations)
+        assert request.retained_tensors == (activation,)
+        grad = request.wait()
+        assert grad.shape == activation.shape
+        assert all(work.waited for work in works)
+        assert request.retained_tensors == ()
+
+    def test_backward_forward_exchange_uses_one_batch(self):
+        works = [_FakeWork(), _FakeWork()]
+        ctx = _make_ctx(pp_rank=1, pp_size=3)
+        ctx.backend.batch_p2p.return_value = works
+        grad = torch.randn(2, 4)
+        prev_p, next_p = _patch_neighbors(0, 2)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import (
+                send_backward_recv_forward_async,
+            )
+
+            request = send_backward_recv_forward_async(
+                ctx,
+                grad,
+                shape=(2, 4),
+                dtype=torch.float32,
+                device="cpu",
+            )
+
+        assert request is not None
+        operations = ctx.backend.batch_p2p.call_args.args[0]
+        assert [operation.kind for operation in operations] == ["send", "recv"]
+        assert all(operation.peer == 0 for operation in operations)
+        assert request.retained_tensors == (grad,)
+        activation = request.wait()
+        assert activation.shape == grad.shape
+        assert all(work.waited for work in works)
+
 
 # ---------------------------------------------------------------------------
 # Tests — single-stage (pp_size=1)

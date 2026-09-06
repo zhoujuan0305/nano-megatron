@@ -31,17 +31,38 @@ from nano_megatron.parallel.context import (
 
 @dataclass
 class P2PRequest:
-    """Own a P2P buffer until its asynchronous operation has completed."""
+    """Own P2P buffers until all operations in one batch have completed."""
 
     tensor: Tensor
-    work: CommWork | None
+    works: tuple[CommWork, ...]
+    retained_tensors: tuple[Tensor, ...] = ()
     _complete: bool = False
 
     def wait(self) -> Tensor:
-        if not self._complete and self.work is not None:
-            self.work.wait()
+        if not self._complete:
+            for work in self.works:
+                work.wait()
         self._complete = True
+        self.retained_tensors = ()
         return self.tensor
+
+
+def _make_request(
+    tensor: Tensor,
+    works: list[CommWork],
+    *,
+    retained_tensors: tuple[Tensor, ...] = (),
+) -> P2PRequest:
+    # Backends may return one aggregate handle for the whole batch or one
+    # handle per operation. In either case, waiting every returned handle is
+    # sufficient to make all submitted operations complete.
+    if not works:
+        raise RuntimeError("batch_p2p returned no completion handles")
+    return P2PRequest(
+        tensor=tensor,
+        works=tuple(works),
+        retained_tensors=retained_tensors,
+    )
 
 
 def recv_forward(
@@ -128,7 +149,8 @@ def recv_forward_async(
             )
         ]
     )
-    return P2PRequest(tensor, works[0])
+    return _make_request(tensor, works)
+
 
 def send_forward_async(
     ctx: ParallelContext, tensor: Tensor
@@ -143,7 +165,11 @@ def send_forward_async(
             )
         ]
     )
-    return P2PRequest(tensor, works[0])
+    return _make_request(
+        tensor,
+        works,
+        retained_tensors=(tensor,),
+    )
 
 
 def recv_backward_async(
@@ -164,7 +190,7 @@ def recv_backward_async(
             )
         ]
     )
-    return P2PRequest(tensor, works[0])
+    return _make_request(tensor, works)
 
 
 def send_backward_async(
@@ -180,4 +206,90 @@ def send_backward_async(
             )
         ]
     )
-    return P2PRequest(tensor, works[0])
+    return _make_request(
+        tensor,
+        works,
+        retained_tensors=(tensor,),
+    )
+
+
+def send_forward_recv_backward_async(
+    ctx: ParallelContext,
+    tensor: Tensor,
+) -> P2PRequest | None:
+    """Send activation and receive its gradient in one NCCL P2P batch."""
+    peer = pipeline_next_rank(ctx)
+    if peer is None:
+        return None
+    grad = torch.empty_like(tensor)
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "send", tensor, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+            P2POperation(
+                "recv", grad, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+        ]
+    )
+    return _make_request(
+        grad,
+        works,
+        retained_tensors=(tensor,),
+    )
+
+
+def send_backward_recv_forward_async(
+    ctx: ParallelContext,
+    tensor: Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> P2PRequest | None:
+    """Send input gradient and receive the next activation in one P2P batch."""
+    peer = pipeline_prev_rank(ctx)
+    if peer is None:
+        return None
+    activation = torch.empty(shape, dtype=dtype, device=device)
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "send", tensor, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+            P2POperation(
+                "recv", activation, peer=peer, group=ctx.pipeline_parallel_group
+            ),
+        ]
+    )
+    return _make_request(
+        activation,
+        works,
+        retained_tensors=(tensor,),
+    )
+
+
+def send_forward_recv_backward(
+    ctx: ParallelContext,
+    tensor: Tensor,
+) -> Tensor | None:
+    request = send_forward_recv_backward_async(ctx, tensor)
+    return None if request is None else request.wait()
+
+
+def send_backward_recv_forward(
+    ctx: ParallelContext,
+    tensor: Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> Tensor | None:
+    request = send_backward_recv_forward_async(
+        ctx,
+        tensor,
+        shape=shape,
+        dtype=dtype,
+        device=device,
+    )
+    return None if request is None else request.wait()
