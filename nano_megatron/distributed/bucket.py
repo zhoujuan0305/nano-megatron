@@ -239,13 +239,16 @@ def build_buckets(
 
     for p in params:
         nbytes = p.numel() * p.element_size()
-        if current and (
-            p.dtype != current_dtype
-            or current_bytes + nbytes > cap_bytes
-        ):
+        if current and p.dtype != current_dtype:
             flush()
         current.append(p)
         current_bytes += nbytes
         current_dtype = p.dtype
+        # Treat the configured size as a target instead of a hard cap. A
+        # parameter is indivisible, so closing the bucket after crossing the
+        # threshold avoids systematically under-filled buckets when adjacent
+        # transformer weights are each a large fraction of the target.
+        if current_bytes >= cap_bytes:
+            flush()
     flush()
     return buckets

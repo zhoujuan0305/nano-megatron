@@ -41,19 +41,19 @@ class _AsyncFakeBackend:
         return self.work
 
 
-def test_build_buckets_reverse_order_and_cap():
+def test_build_buckets_reverse_order_and_flushes_after_target():
     m = nn.Sequential(
         nn.Linear(4, 4, bias=False),  # 16 elems
         nn.Linear(4, 4, bias=False),  # 16
         nn.Linear(4, 4, bias=False),  # 16
     )
-    # cap just under 2*16*4 = 128 bytes so each bucket holds at most 1 param of 64B...
-    # 16 float32 = 64 bytes. cap_mb such that cap_bytes = 100 → one param per bucket
+    # Each param is 64 bytes. With a 100-byte target, the first two reversed
+    # parameters cross the threshold together and the final one stands alone.
     buckets = build_buckets(m, bucket_cap_mb=100 / (1024 * 1024))
     flat_params = [p for b in buckets for p in b.params]
     expected = list(reversed(list(m.parameters())))
     assert flat_params == expected
-    assert all(len(b.params) == 1 for b in buckets)
+    assert [len(b.params) for b in buckets] == [2, 1]
 
 
 def test_build_buckets_packs_small_params_together():
