@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from nano_megatron.distributed.backend import CommBackend
+from nano_megatron.distributed.backend import AllReduceBackend, CommBackend
 from nano_megatron.distributed.bucket import GradBucket, build_buckets
 
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ class DistributedDataParallel(nn.Module):
         bucket_cap_mb: float = 25.0,
         broadcast_buffers: bool = False,
         overlap_grad_reduce: bool = False,
+        grad_sync_backend: AllReduceBackend | None = None,
     ) -> None:
         super().__init__()
         # broadcast_buffers reserved for a later version.
@@ -33,6 +34,9 @@ class DistributedDataParallel(nn.Module):
         self.add_module("module", module)
         self._ctx = ctx
         self._backend: CommBackend = ctx.backend
+        self._grad_sync_backend: AllReduceBackend = (
+            grad_sync_backend if grad_sync_backend is not None else ctx.backend
+        )
         # Sync over DP×CP.  Local-CE under CP scales loss by cp_size so that
         # mean (not sum) over the full DP×CP group recovers full-sequence grads.
         # group_size must be dp*cp so pure CP (dp=1, cp>1) still all-reduces.
@@ -118,14 +122,14 @@ class DistributedDataParallel(nn.Module):
         bucket_ready = bucket.mark_ready(param)
         if self._overlap_grad_reduce and bucket_ready:
             bucket.start_sync(
-                self._backend,
+                self._grad_sync_backend,
                 self._dp_group,
                 self._mean_divisor,
                 group_size=self._sync_group_size,
             )
         elif not self._overlap_grad_reduce and bucket_ready:
             bucket.sync(
-                self._backend,
+                self._grad_sync_backend,
                 self._dp_group,
                 self._mean_divisor,
                 group_size=self._sync_group_size,
@@ -202,7 +206,7 @@ class DistributedDataParallel(nn.Module):
             if self._overlap_grad_reduce:
                 if not bucket.sync_started:
                     bucket.start_sync(
-                        self._backend,
+                        self._grad_sync_backend,
                         self._dp_group,
                         self._mean_divisor,
                         group_size=self._sync_group_size,
@@ -210,7 +214,7 @@ class DistributedDataParallel(nn.Module):
                 bucket.finish_sync()
             else:
                 bucket.sync(
-                    self._backend,
+                    self._grad_sync_backend,
                     self._dp_group,
                     self._mean_divisor,
                     group_size=self._sync_group_size,

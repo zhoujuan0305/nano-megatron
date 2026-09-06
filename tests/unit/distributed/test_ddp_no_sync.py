@@ -114,3 +114,23 @@ def test_overlap_no_sync_launches_at_finish_boundary():
     assert backend.all_reduce_calls == baseline
     ddp.finish_grad_sync()
     assert backend.all_reduce_calls == baseline + 1
+
+
+def test_gradient_backend_is_independent_from_parameter_broadcast_backend():
+    collective_backend = _FakeBackend()
+    gradient_backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(collective_backend),
+        grad_sync_backend=gradient_backend,
+    )
+
+    # Constructor parameter synchronization stays on the context backend.
+    assert collective_backend.all_reduce_calls == 1
+    assert gradient_backend.all_reduce_calls == 0
+
+    ddp(torch.randn(2, 4)).sum().backward()
+    ddp.finish_grad_sync()
+    assert collective_backend.all_reduce_calls == 1
+    assert gradient_backend.all_reduce_calls == 1

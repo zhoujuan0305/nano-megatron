@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Measure NCCL time not overlapped by GPU compute in an Nsight trace.
+"""Measure communication time not overlapped by GPU compute in an Nsight trace.
 
 The benchmark emits one ``nano_megatron_benchmark_loop`` NVTX range per rank.
-For every CUDA context, this script clips kernels to that rank's range, forms
-the union of NCCL and non-NCCL kernel intervals, and reports the part of the
-NCCL union that does not intersect compute.  The maximum per-rank value is the
-critical-rank exposed communication time used by the experiment report.
+For every CUDA context, this script clips kernels to that rank's range and
+reports communication time that does not intersect compute. NCCL kernels and
+Nano NCCL's Ring Simple kernel are classified as communication. The maximum
+per-rank value is the critical-rank exposed communication time used by the
+experiment report.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from typing import Iterable
 
 Interval = tuple[int, int]
 NVTX_RANGE = "nano_megatron_benchmark_loop"
+COMMUNICATION_PATTERNS = ("nccl", "ring_simple_kernel")
 
 
 @dataclass(frozen=True)
@@ -136,7 +138,7 @@ def analyze(sqlite_path: Path, *, steps: int) -> list[ContextResult]:
             comm, compute, comm_count, compute_count = grouped.setdefault(
                 key, ([], [], 0, 0)
             )
-            if "nccl" in name.lower():
+            if any(pattern in name.lower() for pattern in COMMUNICATION_PATTERNS):
                 comm.append(clipped)
                 grouped[key] = (comm, compute, comm_count + 1, compute_count)
             else:
@@ -174,7 +176,7 @@ def analyze(sqlite_path: Path, *, steps: int) -> list[ContextResult]:
                 )
             )
         if not results:
-            raise RuntimeError("no NCCL kernels found inside benchmark NVTX ranges")
+            raise RuntimeError("no communication kernels found inside benchmark NVTX ranges")
         return results
     finally:
         connection.close()

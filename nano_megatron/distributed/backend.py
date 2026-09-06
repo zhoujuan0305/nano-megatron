@@ -14,6 +14,15 @@ class CommWork(Protocol):
     def is_completed(self) -> bool: ...
 
 
+class AllReduceBackend(Protocol):
+    """The narrow collective interface consumed by DP gradient buckets."""
+
+    def all_reduce(
+        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | CommWork: ...
+
+
 @dataclass(frozen=True)
 class P2POperation:
     kind: Literal["send", "recv"]

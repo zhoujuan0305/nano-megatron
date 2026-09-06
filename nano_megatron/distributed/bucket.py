@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from nano_megatron.distributed.backend import CommBackend
+from nano_megatron.distributed.backend import AllReduceBackend
 
 
 class GradBucket:
@@ -79,7 +79,7 @@ class GradBucket:
 
     def sync(
         self,
-        backend: CommBackend,
+        backend: AllReduceBackend,
         group: Any,
         dp_size: int,
         *,
@@ -145,7 +145,7 @@ class GradBucket:
 
     def start_sync(
         self,
-        backend: CommBackend,
+        backend: AllReduceBackend,
         group: Any,
         mean_divisor: int,
         *,

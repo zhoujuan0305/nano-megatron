@@ -75,6 +75,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
+        "--optimizer",
+        choices=["none", "sgd"],
+        default="none",
+        help="Optional parameter update included in each measured step.",
+    )
+    p.add_argument("--learning-rate", type=float, default=1.0e-4)
+    p.add_argument(
+        "--dp-backend",
+        choices=["torch", "nano-nccl"],
+        default="torch",
+        help="Backend used only for DP gradient bucket all-reduce.",
+    )
+    p.add_argument(
+        "--nano-nccl-library",
+        type=str,
+        default=None,
+        help="Path to libnano_nccl_mpi_c.so when --dp-backend=nano-nccl.",
+    )
+    p.add_argument(
+        "--nano-nccl-transport",
+        choices=["auto", "socket", "rdma"],
+        default="rdma",
+    )
+    p.add_argument(
         "--overlap-grad-reduce",
         action="store_true",
         help="Overlap DP gradient bucket reductions with the final backward.",
@@ -149,10 +173,38 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("seq-len must be divisible by tp-size with sequence parallel")
     if args.overlap_p2p_comm and args.pp_size > 2:
         raise ValueError("overlap-p2p-comm currently supports pp-size <= 2")
+    if args.learning_rate <= 0:
+        raise ValueError("learning-rate must be positive")
+    if args.dp_backend == "nano-nccl":
+        if not args.nano_nccl_library:
+            raise ValueError(
+                "--nano-nccl-library is required with --dp-backend=nano-nccl"
+            )
+        if args.framework == "megatron":
+            raise ValueError("--dp-backend=nano-nccl applies to the nano framework")
 
 
 def _dtype(args: argparse.Namespace) -> torch.dtype:
     return torch.bfloat16 if args.precision == "bf16" else torch.float32
+
+
+@torch.no_grad()
+def _optimizer_step(module: torch.nn.Module, optimizer: str, learning_rate: float) -> None:
+    if optimizer == "none":
+        return
+    if optimizer != "sgd":
+        raise ValueError(f"unsupported optimizer: {optimizer}")
+    params = []
+    grads = []
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is not None:
+            params.append(param)
+            grads.append(grad)
+    if params:
+        torch._foreach_add_(params, grads, alpha=-learning_rate)
 
 
 def _ensure_dist(local_rank: int) -> None:
@@ -308,64 +360,95 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         device=device, dtype=dtype
     )
 
-    ddp = None
-    if dp_size > 1:
-        ddp = DistributedDataParallel(
-            stage,
+    grad_sync_backend = None
+    if args.dp_backend == "nano-nccl":
+        if dp_size <= 1:
+            raise ValueError("Nano NCCL DP backend requires dp-size > 1")
+        from nano_megatron.distributed.nano_nccl_backend import NanoNcclBackend
+
+        grad_sync_backend = NanoNcclBackend.from_parallel_context(
             ctx,
-            bucket_cap_mb=args.bucket_cap_mb,
-            overlap_grad_reduce=args.overlap_grad_reduce,
-        )
-        stage_mod = ddp.module
-        train_mod = ddp
-    else:
-        stage_mod = stage
-        train_mod = stage
-    train_mod.train()
-
-    if is_rank0:
-        n_params = sum(p.numel() for p in stage_mod.parameters())
-        print(
-            f"[nano] params/rank={n_params/1e6:.1f}M "
-            f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
-            f"microbatches={args.num_microbatches} "
-            f"bucket_cap_mb={args.bucket_cap_mb} "
-            f"precision={args.precision} sp={args.sequence_parallel} "
-            f"overlap_dp={args.overlap_grad_reduce} "
-            f"overlap_tp={args.overlap_tp_dgrad} "
-            f"overlap_pp={args.overlap_p2p_comm}",
-            flush=True,
+            args.nano_nccl_library,
+            transport=args.nano_nccl_transport,
+            expected_channels=4,
         )
 
-    input_ids = torch.randint(
-        0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
-    )
-    labels = input_ids.clone()
-
-    def step() -> None:
-        if ddp is not None:
-            ddp.zero_grad(set_to_none=True)
+    try:
+        ddp = None
+        if dp_size > 1:
+            ddp = DistributedDataParallel(
+                stage,
+                ctx,
+                bucket_cap_mb=args.bucket_cap_mb,
+                overlap_grad_reduce=args.overlap_grad_reduce,
+                grad_sync_backend=grad_sync_backend,
+            )
+            stage_mod = ddp.module
+            train_mod = ddp
         else:
-            stage_mod.zero_grad(set_to_none=True)
-        forward_backward_1f1b(
-            stage=stage_mod,
-            ctx=ctx,
-            input_ids=input_ids,
-            labels=labels,
-            num_microbatches=args.num_microbatches,
-            ddp=ddp,
-            overlap_p2p_comm=args.overlap_p2p_comm,
+            stage_mod = stage
+            train_mod = stage
+        train_mod.train()
+
+        if is_rank0:
+            n_params = sum(p.numel() for p in stage_mod.parameters())
+            backend_detail = args.dp_backend
+            if grad_sync_backend is not None:
+                backend_detail += (
+                    f"/{grad_sync_backend.transport}/"
+                    f"{grad_sync_backend.channel_count}ch"
+                )
+            print(
+                f"[nano] params/rank={n_params/1e6:.1f}M "
+                f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
+                f"microbatches={args.num_microbatches} "
+                f"bucket_cap_mb={args.bucket_cap_mb} "
+                f"precision={args.precision} sp={args.sequence_parallel} "
+                f"dp_backend={backend_detail} "
+                f"optimizer={args.optimizer} "
+                f"overlap_dp={args.overlap_grad_reduce} "
+                f"overlap_tp={args.overlap_tp_dgrad} "
+                f"overlap_pp={args.overlap_p2p_comm}",
+                flush=True,
+            )
+
+        input_ids = torch.randint(
+            0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
         )
+        labels = input_ids.clone()
 
-    elapsed, memory_mb = _time_loop(
-        step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
-    )
-    elapsed, memory_mb = _global_max_metrics(
-        elapsed, memory_mb, device=device
-    )
-    destroy_parallel()
+        def step() -> None:
+            if ddp is not None:
+                ddp.zero_grad(set_to_none=True)
+            else:
+                stage_mod.zero_grad(set_to_none=True)
+            forward_backward_1f1b(
+                stage=stage_mod,
+                ctx=ctx,
+                input_ids=input_ids,
+                labels=labels,
+                num_microbatches=args.num_microbatches,
+                ddp=ddp,
+                overlap_p2p_comm=args.overlap_p2p_comm,
+            )
+            _optimizer_step(stage_mod, args.optimizer, args.learning_rate)
 
-    tag_parts = ["nano-megatron"]
+        elapsed, memory_mb = _time_loop(
+            step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
+        )
+        elapsed, memory_mb = _global_max_metrics(
+            elapsed, memory_mb, device=device
+        )
+    finally:
+        if grad_sync_backend is not None:
+            grad_sync_backend.close()
+        destroy_parallel()
+
+    tag_parts = [
+        "nano-megatron+nano-nccl"
+        if args.dp_backend == "nano-nccl"
+        else "nano-megatron"
+    ]
     dims = []
     if args.pp_size > 1:
         dims.append("PP")
@@ -533,6 +616,7 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             f"microbatches={args.num_microbatches} "
             f"micro_bs={micro_batch_size} precision={args.precision} "
             f"sp={args.sequence_parallel} "
+            f"optimizer={args.optimizer} "
             f"overlap_dp={args.overlap_grad_reduce} "
             "overlap_tp=native overlap_pp=False",
             flush=True,
@@ -596,6 +680,7 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
+        _optimizer_step(model, args.optimizer, args.learning_rate)
 
     elapsed, memory_mb = _time_loop(
         step,
