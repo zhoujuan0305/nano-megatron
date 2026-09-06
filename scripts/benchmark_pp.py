@@ -682,7 +682,8 @@ def main() -> None:
 
     _cuda_reset()
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
