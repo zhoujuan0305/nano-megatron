@@ -403,7 +403,10 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         from megatron.core.distributed import (
             DistributedDataParallel as MegatronDDP,
         )
-        from megatron.core.distributed import DistributedDataParallelConfig
+        from megatron.core.distributed import (
+            DistributedDataParallelConfig,
+            finalize_model_grads,
+        )
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
         )
@@ -478,6 +481,11 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         deallocate_pipeline_outputs=False,
         overlap_p2p_comm=False,
         batch_p2p_comm=True,
+        # The pipeline schedule owns final gradient synchronization in a
+        # normal Megatron training step.  This also coalesces replicated
+        # sequence-parallel parameter grads across the TP group; calling only
+        # DDP.finish_grad_sync() would omit that reduction.
+        finalize_model_grads_func=finalize_model_grads,
     )
 
     is_first = parallel_state.is_pipeline_first_stage()
