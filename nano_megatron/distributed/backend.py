@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
 
 from torch import Tensor
 
@@ -11,6 +12,15 @@ class CommWork(Protocol):
     def wait(self) -> bool: ...
 
     def is_completed(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class P2POperation:
+    kind: Literal["send", "recv"]
+    tensor: Tensor
+    peer: int
+    group: Any | None = None
+    tag: int = 0
 
 
 class CommBackend(Protocol):
@@ -66,6 +76,8 @@ class CommBackend(Protocol):
         tag: int = 0,
         async_op: bool = False,
     ) -> Tensor | CommWork: ...
+
+    def batch_p2p(self, operations: list[P2POperation]) -> list[CommWork]: ...
 
     def broadcast(
         self, tensor: Tensor, src: int, *, group: Any | None = None

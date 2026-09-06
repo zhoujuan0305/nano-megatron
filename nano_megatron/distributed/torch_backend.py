@@ -5,6 +5,8 @@ from typing import Any
 import torch.distributed as dist
 from torch import Tensor
 
+from nano_megatron.distributed.backend import P2POperation
+
 _OP_MAP = {
     "sum": dist.ReduceOp.SUM,
     "max": dist.ReduceOp.MAX,
@@ -101,6 +103,23 @@ class TorchDistBackend:
             return dist.irecv(tensor, src=src, group=group, tag=tag)
         dist.recv(tensor, src=src, group=group, tag=tag)
         return tensor
+
+    def batch_p2p(self, operations: list[P2POperation]) -> list[Any]:
+        if not operations:
+            return []
+        torch_operations: list[dist.P2POp] = []
+        for operation in operations:
+            function = dist.isend if operation.kind == "send" else dist.irecv
+            torch_operations.append(
+                dist.P2POp(
+                    function,
+                    operation.tensor,
+                    operation.peer,
+                    operation.group,
+                    operation.tag,
+                )
+            )
+        return dist.batch_isend_irecv(torch_operations)
 
     def broadcast(
         self, tensor: Tensor, src: int, *, group: Any | None = None
