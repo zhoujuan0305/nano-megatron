@@ -47,6 +47,15 @@ def _patch_neighbors(prev_rank, next_rank):
     return prev_patch, next_patch
 
 
+class _FakeWork:
+    def __init__(self) -> None:
+        self.waited = False
+
+    def wait(self) -> bool:
+        self.waited = True
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Tests — first stage (pp_rank=0)
 # ---------------------------------------------------------------------------
@@ -161,6 +170,46 @@ class TestMiddleStage:
         ctx.backend.send.assert_called_once_with(
             t, dst=prev_rank, group=ctx.pipeline_parallel_group,
         )
+
+    def test_async_recv_owns_buffer_until_wait(self):
+        work = _FakeWork()
+        ctx = _make_ctx(pp_rank=1, pp_size=3)
+        ctx.backend.batch_p2p.return_value = [work]
+        prev_p, next_p = _patch_neighbors(0, 2)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import recv_forward_async
+
+            request = recv_forward_async(
+                ctx, shape=(2, 4), dtype=torch.float32, device="cpu"
+            )
+        assert request is not None
+        assert not work.waited
+        tensor = request.wait()
+        assert work.waited
+        assert tensor is request.tensor
+        assert tensor.shape == (2, 4)
+        operation = ctx.backend.batch_p2p.call_args.args[0][0]
+        assert operation.kind == "recv"
+        assert operation.peer == 0
+
+    def test_async_send_retains_source_tensor(self):
+        work = _FakeWork()
+        ctx = _make_ctx(pp_rank=1, pp_size=3)
+        ctx.backend.batch_p2p.return_value = [work]
+        tensor = torch.randn(2, 4)
+        prev_p, next_p = _patch_neighbors(0, 2)
+        with prev_p, next_p:
+            from nano_megatron.schedules.p2p import send_forward_async
+
+            request = send_forward_async(ctx, tensor)
+        assert request is not None
+        assert request.tensor is tensor
+        assert not work.waited
+        request.wait()
+        assert work.waited
+        operation = ctx.backend.batch_p2p.call_args.args[0][0]
+        assert operation.kind == "send"
+        assert operation.peer == 2
 
 
 # ---------------------------------------------------------------------------

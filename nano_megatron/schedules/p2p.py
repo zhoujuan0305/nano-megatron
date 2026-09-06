@@ -14,9 +14,12 @@ First/last stage semantics:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor
 
+from nano_megatron.distributed.backend import CommWork, P2POperation
 from nano_megatron.parallel.context import (
     ParallelContext,
     is_pipeline_first_stage,
@@ -24,6 +27,21 @@ from nano_megatron.parallel.context import (
     pipeline_next_rank,
     pipeline_prev_rank,
 )
+
+
+@dataclass
+class P2PRequest:
+    """Own a P2P buffer until its asynchronous operation has completed."""
+
+    tensor: Tensor
+    work: CommWork | None
+    _complete: bool = False
+
+    def wait(self) -> Tensor:
+        if not self._complete and self.work is not None:
+            self.work.wait()
+        self._complete = True
+        return self.tensor
 
 
 def recv_forward(
@@ -90,3 +108,76 @@ def send_backward(ctx: ParallelContext, tensor: Tensor) -> None:
     if dst is None:
         return
     ctx.backend.send(tensor, dst=dst, group=ctx.pipeline_parallel_group)
+
+
+def recv_forward_async(
+    ctx: ParallelContext,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> P2PRequest | None:
+    src = pipeline_prev_rank(ctx)
+    if src is None:
+        return None
+    tensor = torch.empty(shape, dtype=dtype, device=device)
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "recv", tensor, peer=src, group=ctx.pipeline_parallel_group
+            )
+        ]
+    )
+    return P2PRequest(tensor, works[0])
+
+def send_forward_async(
+    ctx: ParallelContext, tensor: Tensor
+) -> P2PRequest | None:
+    dst = pipeline_next_rank(ctx)
+    if dst is None:
+        return None
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "send", tensor, peer=dst, group=ctx.pipeline_parallel_group
+            )
+        ]
+    )
+    return P2PRequest(tensor, works[0])
+
+
+def recv_backward_async(
+    ctx: ParallelContext,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> P2PRequest | None:
+    src = pipeline_next_rank(ctx)
+    if src is None:
+        return None
+    tensor = torch.empty(shape, dtype=dtype, device=device)
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "recv", tensor, peer=src, group=ctx.pipeline_parallel_group
+            )
+        ]
+    )
+    return P2PRequest(tensor, works[0])
+
+
+def send_backward_async(
+    ctx: ParallelContext, tensor: Tensor
+) -> P2PRequest | None:
+    dst = pipeline_prev_rank(ctx)
+    if dst is None:
+        return None
+    works = ctx.backend.batch_p2p(
+        [
+            P2POperation(
+                "send", tensor, peer=dst, group=ctx.pipeline_parallel_group
+            )
+        ]
+    )
+    return P2PRequest(tensor, works[0])

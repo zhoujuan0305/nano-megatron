@@ -251,6 +251,7 @@ def _run_pp_vs_reference(
             labels=labels_local,
             num_microbatches=num_microbatches,
             ddp=ddp,
+            overlap_p2p_comm=True,
         )
 
         is_last = is_pipeline_last_stage(ctx)

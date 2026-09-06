@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
+    p.add_argument(
+        "--overlap-p2p-comm",
+        action="store_true",
+        help="Prepost pipeline receives and defer waits across computation.",
+    )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
     return p.parse_args()
@@ -265,7 +270,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             f"[nano] params/rank={n_params/1e6:.1f}M "
             f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
             f"microbatches={args.num_microbatches} "
-            f"bucket_cap_mb={args.bucket_cap_mb}",
+            f"bucket_cap_mb={args.bucket_cap_mb} "
+            f"overlap_p2p_comm={args.overlap_p2p_comm}",
             flush=True,
         )
 
@@ -286,6 +292,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             labels=labels,
             num_microbatches=args.num_microbatches,
             ddp=ddp,
+            overlap_p2p_comm=args.overlap_p2p_comm,
         )
 
     elapsed, memory_mb = _time_loop(
@@ -394,6 +401,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         bf16=False,
         params_dtype=torch.float32,
         deallocate_pipeline_outputs=False,
+        overlap_p2p_comm=args.overlap_p2p_comm,
+        batch_p2p_comm=not args.overlap_p2p_comm,
     )
 
     is_first = parallel_state.is_pipeline_first_stage()

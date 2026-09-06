@@ -27,10 +27,15 @@ from nano_megatron.parallel.context import (
     is_pipeline_last_stage,
 )
 from nano_megatron.schedules.p2p import (
+    P2PRequest,
     recv_backward,
+    recv_backward_async,
     recv_forward,
+    recv_forward_async,
     send_backward,
+    send_backward_async,
     send_forward,
+    send_forward_async,
 )
 
 if TYPE_CHECKING:
@@ -74,13 +79,16 @@ def forward_backward_1f1b(
     positions: Tensor | None = None,
     num_microbatches: int,
     ddp: DistributedDataParallel | None = None,
+    overlap_p2p_comm: bool = False,
 ) -> Tensor | None:
     """Run non-interleaved 1F1B over ``num_microbatches`` microbatches.
 
     Splits the batch dimension of ``input_ids`` / ``labels`` into equal
     chunks. Returns the mean loss on the last stage; ``None`` elsewhere.
     When ``ddp`` is set, every backward runs under ``ddp.no_sync()`` and
-    ``ddp.finish_grad_sync()`` is called before return.
+    ``ddp.finish_grad_sync()`` is called before return. When
+    ``overlap_p2p_comm`` is enabled, receives are posted one microbatch ahead
+    and sends retain their tensors until their requests complete.
     """
     if num_microbatches < 1:
         raise ValueError(f"num_microbatches must be >= 1, got {num_microbatches}")
@@ -182,6 +190,103 @@ def forward_backward_1f1b(
             return None
         grad_input = input_tensor.grad
         return grad_input
+
+    def _run_overlap_schedule() -> Tensor | None:
+        if pp_size not in (1, 2):
+            raise ValueError(
+                "overlap_p2p_comm currently supports pipeline_parallel_size <= 2"
+            )
+        pending_input = (
+            recv_forward_async(
+                ctx, shape=act_shape, dtype=param_dtype, device=device
+            )
+            if not is_first
+            else None
+        )
+        pending_grads: list[P2PRequest] = []
+        pending_sends: list[P2PRequest] = []
+
+        def next_input(mb_idx: int) -> Tensor:
+            nonlocal pending_input
+            if is_first:
+                local = _slice_microbatch(
+                    input_ids, mb_idx, micro_batch_size
+                )
+                assert local is not None
+                return local
+
+            assert pending_input is not None
+            received = pending_input.wait()
+            pending_input = None
+            return received
+
+        def launch_forward(output_tensor: Tensor) -> None:
+            if is_last:
+                return
+            send_request = send_forward_async(ctx, output_tensor)
+            grad_request = recv_backward_async(
+                ctx,
+                shape=tuple(output_tensor.shape),
+                dtype=output_tensor.dtype,
+                device=output_tensor.device,
+            )
+            assert send_request is not None and grad_request is not None
+            pending_grads.append(grad_request)
+            pending_sends.append(send_request)
+
+        def launch_backward(input_tensor_grad: Tensor | None) -> None:
+            if is_first:
+                return
+            assert input_tensor_grad is not None
+            request = send_backward_async(ctx, input_tensor_grad)
+            assert request is not None
+            pending_sends.append(request)
+
+        for mb_idx in range(num_microbatches):
+            input_tensor = next_input(mb_idx)
+            output_tensor = _forward_step(mb_idx, input_tensor)
+            launch_forward(output_tensor)
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+
+            if mb_idx < num_warmup:
+                continue
+
+            oldest_input = input_tensors.pop(0)
+            oldest_output = output_tensors.pop(0)
+            output_grad = None if is_last else pending_grads.pop(0).wait()
+            input_grad = _backward_step(
+                oldest_input, oldest_output, output_grad
+            )
+            launch_backward(input_grad)
+            if not is_first and mb_idx + 1 < num_microbatches:
+                pending_input = recv_forward_async(
+                    ctx, shape=act_shape, dtype=param_dtype, device=device
+                )
+                assert pending_input is not None
+
+        while input_tensors:
+            oldest_input = input_tensors.pop(0)
+            oldest_output = output_tensors.pop(0)
+            output_grad = None if is_last else pending_grads.pop(0).wait()
+            input_grad = _backward_step(
+                oldest_input, oldest_output, output_grad
+            )
+            launch_backward(input_grad)
+
+        assert not output_tensors and not pending_grads
+        for request in pending_sends:
+            request.wait()
+
+        if ddp is not None:
+            ddp.finish_grad_sync()
+        if not is_last:
+            return None
+        assert losses, "last stage produced no microbatch losses"
+        return torch.stack(losses).sum()
+
+    if overlap_p2p_comm:
+        return _run_overlap_schedule()
 
     def _send_forward_recv_backward(output_tensor: Tensor) -> Tensor | None:
         """Peer-safe exchange with next stage (blocking send/recv).
