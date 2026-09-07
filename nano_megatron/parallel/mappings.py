@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -27,6 +29,46 @@ def _check_seq_tensor(x: Tensor) -> None:
         raise ValueError(
             f"sequence-parallel tensor must have dim >= 2 (layout [B, S, ...]), got dim={x.dim()}"
         )
+
+
+def _all_gather_along_sequence(
+    x: Tensor,
+    *,
+    group: Any,
+    backend: CommBackend,
+    group_size: int,
+) -> Tensor:
+    """Gather rank-major sequence shards without list staging."""
+    x_sequence_first = x.movedim(SEQ_DIM, 0).contiguous()
+    output_shape = list(x_sequence_first.shape)
+    output_shape[0] *= group_size
+    output = x_sequence_first.new_empty(output_shape)
+    backend.all_gather_into_tensor(output, x_sequence_first, group=group)
+    return output.movedim(0, SEQ_DIM)
+
+
+def _reduce_scatter_along_sequence(
+    x: Tensor,
+    *,
+    group: Any,
+    backend: CommBackend,
+    group_size: int,
+    async_op: bool = False,
+) -> tuple[Tensor, Any]:
+    """Pack sequence chunks once and reduce-scatter the contiguous tensor."""
+    _check_seq_divisible(x.size(SEQ_DIM), group_size)
+    input_sequence_first = x.movedim(SEQ_DIM, 0).contiguous()
+    output_shape = list(input_sequence_first.shape)
+    output_shape[0] //= group_size
+    output_sequence_first = input_sequence_first.new_empty(output_shape)
+    result = backend.reduce_scatter_tensor(
+        output_sequence_first,
+        input_sequence_first,
+        group=group,
+        op="sum",
+        async_op=async_op,
+    )
+    return output_sequence_first.movedim(0, SEQ_DIM), result
 
 
 class CommunicationBuffer:
@@ -78,11 +120,12 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        gathered = [torch.empty_like(grad_output) for _ in range(ctx.tp_size)]
-        ctx.backend.all_gather(
-            gathered, grad_output.contiguous(), group=ctx.group
+        grad_input = _all_gather_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
         )
-        grad_input = torch.cat(gathered, dim=SEQ_DIM)
         return grad_input, None, None, None, None
 
 
@@ -105,10 +148,9 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         if tp_size == 1:
             return x
         _check_seq_tensor(x)
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(tp_size)]
-        backend.all_gather(gathered, x, group=group)
-        return torch.cat(gathered, dim=SEQ_DIM)
+        return _all_gather_along_sequence(
+            x, group=group, backend=backend, group_size=tp_size
+        )
 
     @staticmethod
     def backward(
@@ -116,13 +158,12 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        _check_seq_divisible(grad_output.size(SEQ_DIM), ctx.tp_size)
-        chunks = [
-            c.contiguous()
-            for c in grad_output.chunk(ctx.tp_size, dim=SEQ_DIM)
-        ]
-        out = torch.empty_like(chunks[0])
-        ctx.backend.reduce_scatter(out, chunks, group=ctx.group, op="sum")
+        out, _ = _reduce_scatter_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
+        )
         return out, None, None, None, None
 
 
@@ -145,10 +186,9 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         if tp_size == 1:
             return x
         _check_seq_tensor(x)
-        _check_seq_divisible(x.size(SEQ_DIM), tp_size)
-        chunks = [c.contiguous() for c in x.chunk(tp_size, dim=SEQ_DIM)]
-        out = torch.empty_like(chunks[0])
-        backend.reduce_scatter(out, chunks, group=group, op="sum")
+        out, _ = _reduce_scatter_along_sequence(
+            x, group=group, backend=backend, group_size=tp_size
+        )
         return out
 
     @staticmethod
@@ -157,34 +197,103 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        grad_output = grad_output.contiguous()
-        gathered = [torch.empty_like(grad_output) for _ in range(ctx.tp_size)]
-        ctx.backend.all_gather(gathered, grad_output, group=ctx.group)
-        return torch.cat(gathered, dim=SEQ_DIM), None, None, None, None
+        grad_input = _all_gather_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
+        )
+        return grad_input, None, None, None, None
 
 
-def register_sequence_parallel_grad_allreduce(
-    param: nn.Parameter,
-    group: Any,
-    backend: CommBackend,
-) -> None:
-    """All-reduce grads for replicated params that only saw a sequence shard.
+_SEQUENCE_PARALLEL_GRAD_ATTR = "_nano_sequence_parallel_grad"
 
-    With SP, LayerNorm weights/biases and RowParallel bias accumulate grads
-    over local S/tp tokens only. Summing across the TP group restores the
-    full-sequence gradient (Megatron-style).
+
+def mark_sequence_parallel_parameter(param: nn.Parameter) -> None:
+    """Mark a replicated parameter whose gradient covers one sequence shard."""
+    if param.requires_grad:
+        setattr(param, _SEQUENCE_PARALLEL_GRAD_ATTR, True)
+
+
+class SequenceParallelGradSynchronizer:
+    """Coalesce replicated SP parameter gradients into one buffer per dtype.
+
+    Gradients accumulate locally across all microbatches. The execution
+    schedule calls :meth:`finish` after DP gradient communication completes,
+    which is safe because the DP and TP reductions commute but must not access
+    the same gradient storage concurrently.
     """
-    if not param.requires_grad:
-        return
 
-    def _hook(grad: Tensor) -> Tensor:
-        # torch.distributed all_reduce is in-place; return the same storage.
-        work = backend.all_reduce(grad, group=group, op="sum", async_op=True)
-        if hasattr(work, "wait"):
-            work.wait()
-        return grad
+    def __init__(
+        self,
+        params: Iterable[nn.Parameter],
+        *,
+        group: Any,
+        backend: CommBackend,
+        tp_size: int,
+    ) -> None:
+        if tp_size < 1:
+            raise ValueError(f"tp_size must be >= 1, got {tp_size}")
+        self._params = [
+            param
+            for param in params
+            if param.requires_grad
+            and bool(getattr(param, _SEQUENCE_PARALLEL_GRAD_ATTR, False))
+        ]
+        self._group = group
+        self._backend = backend
+        self._tp_size = tp_size
+        self._buffers: dict[
+            tuple[torch.device, torch.dtype, tuple[int, ...]], Tensor
+        ] = {}
 
-    param.register_hook(_hook)
+    @property
+    def num_parameters(self) -> int:
+        return len(self._params)
+
+    def finish(self) -> int:
+        """Sum marked gradients over TP and return the collective count."""
+        if self._tp_size == 1 or not self._params:
+            return 0
+
+        grouped: defaultdict[
+            tuple[torch.device, torch.dtype], list[nn.Parameter]
+        ] = defaultdict(list)
+        for param in self._params:
+            if param.grad is None:
+                raise RuntimeError(
+                    "sequence-parallel gradient is missing for parameter "
+                    f"with shape={tuple(param.shape)} device={param.device} "
+                    f"dtype={param.dtype}"
+                )
+            grouped[(param.grad.device, param.grad.dtype)].append(param)
+
+        collectives = 0
+        for (device, dtype), params in grouped.items():
+            sizes = tuple(param.numel() for param in params)
+            key = (device, dtype, sizes)
+            total = sum(sizes)
+            flat = self._buffers.get(key)
+            if flat is None:
+                flat = torch.empty(total, device=device, dtype=dtype)
+                self._buffers[key] = flat
+
+            offset = 0
+            for param, size in zip(params, sizes):
+                assert param.grad is not None
+                flat[offset : offset + size].copy_(param.grad.reshape(-1))
+                offset += size
+
+            self._backend.all_reduce(flat, group=self._group, op="sum")
+            collectives += 1
+
+            offset = 0
+            for param, size in zip(params, sizes):
+                assert param.grad is not None
+                param.grad.copy_(flat[offset : offset + size].view_as(param.grad))
+                offset += size
+
+        return collectives
 
 
 def scatter_to_sequence_parallel_region(
@@ -377,6 +486,70 @@ def row_shard(
     return w_local, b_local
 
 
+class _LinearWithGradOverlap(torch.autograd.Function):
+    """Column-parallel linear with dgrad communication hidden by wgrad GEMM."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+        group: Any,
+        backend: CommBackend,
+        tp_size: int,
+        sequence_parallel: bool,
+    ) -> Tensor:
+        if sequence_parallel and tp_size > 1:
+            linear_input = _all_gather_along_sequence(
+                x, group=group, backend=backend, group_size=tp_size
+            )
+        else:
+            linear_input = x
+
+        ctx.save_for_backward(linear_input, weight)
+        ctx.group = group
+        ctx.backend = backend
+        ctx.tp_size = tp_size
+        ctx.sequence_parallel = sequence_parallel
+        ctx.has_bias = bias is not None
+        return F.linear(linear_input, weight, bias)
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor | None, None, None, None, None]:
+        linear_input, weight = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input_full = grad_output.matmul(weight)
+
+        work = None
+        if ctx.tp_size > 1 and ctx.sequence_parallel:
+            grad_input, work = _reduce_scatter_along_sequence(
+                grad_input_full,
+                group=ctx.group,
+                backend=ctx.backend,
+                group_size=ctx.tp_size,
+                async_op=True,
+            )
+        elif ctx.tp_size > 1:
+            grad_input = grad_input_full
+            work = ctx.backend.all_reduce(
+                grad_input, group=ctx.group, op="sum", async_op=True
+            )
+        else:
+            grad_input = grad_input_full
+
+        grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+        input_2d = linear_input.reshape(-1, linear_input.size(-1))
+        grad_weight = grad_output_2d.t().matmul(input_2d)
+        grad_bias = grad_output_2d.sum(dim=0) if ctx.has_bias else None
+
+        if hasattr(work, "wait"):
+            work.wait()
+        return grad_input, grad_weight, grad_bias, None, None, None, None
+
+
 class ColumnParallelLinear(nn.Module):
     def __init__(
         self,
@@ -389,6 +562,7 @@ class ColumnParallelLinear(nn.Module):
         *,
         weight_is_local: bool = False,
         sequence_parallel: bool = False,
+        overlap_dgrad: bool = False,
     ) -> None:
         super().__init__()
         if weight_is_local:
@@ -404,8 +578,19 @@ class ColumnParallelLinear(nn.Module):
         self.backend = backend
         self.buffer_manager = CommunicationBuffer()
         self.sequence_parallel = sequence_parallel
+        self.overlap_dgrad = overlap_dgrad
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.overlap_dgrad:
+            return _LinearWithGradOverlap.apply(
+                x,
+                self.weight,
+                self.bias,
+                self.group,
+                self.backend,
+                self.tp_size,
+                self.sequence_parallel,
+            )
         # SP path: input is sequence-sharded; gather full S then matmul.
         # No CopyToTPRegion — grad reduce-scatter is handled by the gather op.
         if self.sequence_parallel:
@@ -444,7 +629,7 @@ class RowParallelLinear(nn.Module):
         # Bias is added after reduce-scatter on the local sequence shard, so
         # its grad is partial and must be summed across the TP group.
         if sequence_parallel and self.bias is not None:
-            register_sequence_parallel_grad_allreduce(self.bias, group, backend)
+            mark_sequence_parallel_parameter(self.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.linear(x, self.weight, bias=None)

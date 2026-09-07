@@ -11,7 +11,10 @@ from torch.nn import Parameter
 
 from nano_megatron.model.tp_gpt import TPGPT, build_tp_gpt_from_reference
 from nano_megatron.parallel.context import ParallelContext
-from nano_megatron.parallel.mappings import scatter_to_sequence_parallel_region
+from nano_megatron.parallel.mappings import (
+    SequenceParallelGradSynchronizer,
+    scatter_to_sequence_parallel_region,
+)
 from nano_megatron.parallel.vocab_parallel import (
     vocab_parallel_cross_entropy,
     vocab_range_from_global,
@@ -98,6 +101,12 @@ class PipelineStage(nn.Module):
             raise ValueError("last pipeline stage requires ln_f_* and lm_head")
 
         self.to(dtype=torch.float32)
+        self._sequence_parallel_grad_sync = SequenceParallelGradSynchronizer(
+            self.parameters(),
+            group=self._tp_group,
+            backend=self._tp_backend,
+            tp_size=self._tp_size,
+        )
 
     @property
     def is_first_stage(self) -> bool:
@@ -106,6 +115,10 @@ class PipelineStage(nn.Module):
     @property
     def is_last_stage(self) -> bool:
         return self._pp_rank == self._pp_size - 1
+
+    def finish_sequence_parallel_grad_sync(self) -> int:
+        """Coalesce and sum replicated SP parameter gradients over TP."""
+        return self._sequence_parallel_grad_sync.finish()
 
     def shifted_cross_entropy(
         self,

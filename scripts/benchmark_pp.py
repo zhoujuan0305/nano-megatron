@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark Pipeline Parallelism: nano-megatron 1F1B vs optional Megatron-LM.
 
-Same model knobs as scripts/benchmark_dp.py (RoPE, SwiGLU, LayerNorm, FP32).
+Same model knobs as scripts/benchmark_dp.py (RoPE, SwiGLU, LayerNorm).
 Measures per-GPU peak memory and tokens/sec (local batch is the full
 microbatch sum on each DP rank; global = local × dp_size).
 """
@@ -74,6 +74,63 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
+    p.add_argument(
+        "--optimizer",
+        choices=["none", "sgd"],
+        default="none",
+        help="Optional parameter update included in each measured step.",
+    )
+    p.add_argument("--learning-rate", type=float, default=1.0e-4)
+    p.add_argument(
+        "--collective-backend",
+        "--dp-backend",
+        dest="collective_backend",
+        choices=["torch", "nano-nccl"],
+        default="torch",
+        help=(
+            "Backend for active TP/SP and DP collectives. --dp-backend is a "
+            "deprecated alias. PP point-to-point remains on PyTorch distributed."
+        ),
+    )
+    p.add_argument(
+        "--nano-nccl-library",
+        type=str,
+        default=None,
+        help="Path to ABI-v2 libnano_nccl_mpi_c.so for Nano collectives.",
+    )
+    p.add_argument(
+        "--nano-nccl-transport",
+        choices=["auto", "shm", "p2p", "socket", "rdma"],
+        default="rdma",
+    )
+    p.add_argument(
+        "--overlap-grad-reduce",
+        action="store_true",
+        help="Overlap DP gradient bucket reductions with the final backward.",
+    )
+    p.add_argument(
+        "--overlap-tp-dgrad",
+        action="store_true",
+        help="Overlap TP dgrad communication with each wgrad GEMM.",
+    )
+    p.add_argument(
+        "--overlap-p2p-comm",
+        action="store_true",
+        help="Prepost pipeline receives and defer waits across computation.",
+    )
+    p.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Shard eligible activations over the TP group.",
+    )
+    p.add_argument(
+        "--precision", choices=["fp32", "bf16"], default="fp32"
+    )
+    p.add_argument(
+        "--attn-backend",
+        choices=["auto", "flash", "unfused"],
+        default="auto",
+    )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
     return p.parse_args()
@@ -115,6 +172,47 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"num-layers ({args.num_layers}) must be divisible by "
             f"pp-size ({args.pp_size})"
         )
+    if args.sequence_parallel and args.tp_size <= 1:
+        raise ValueError("sequence-parallel requires tp-size > 1")
+    if args.sequence_parallel and args.seq_len % args.tp_size != 0:
+        raise ValueError("seq-len must be divisible by tp-size with sequence parallel")
+    if args.overlap_p2p_comm and args.pp_size > 2:
+        raise ValueError("overlap-p2p-comm currently supports pp-size <= 2")
+    if args.learning_rate <= 0:
+        raise ValueError("learning-rate must be positive")
+    if args.collective_backend == "nano-nccl":
+        if not args.nano_nccl_library:
+            raise ValueError(
+                "--nano-nccl-library is required with "
+                "--collective-backend=nano-nccl"
+            )
+        if args.framework == "megatron":
+            raise ValueError(
+                "--collective-backend=nano-nccl applies to the nano framework"
+            )
+
+
+def _dtype(args: argparse.Namespace) -> torch.dtype:
+    return torch.bfloat16 if args.precision == "bf16" else torch.float32
+
+
+@torch.no_grad()
+def _optimizer_step(module: torch.nn.Module, optimizer: str, learning_rate: float) -> None:
+    if optimizer == "none":
+        return
+    if optimizer != "sgd":
+        raise ValueError(f"unsupported optimizer: {optimizer}")
+    params = []
+    grads = []
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is not None:
+            params.append(param)
+            grads.append(grad)
+    if params:
+        torch._foreach_add_(params, grads, alpha=-learning_rate)
 
 
 def _ensure_dist(local_rank: int) -> None:
@@ -143,11 +241,13 @@ def _time_loop(
     if device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.nvtx.range_push("nano_megatron_benchmark_loop")
     t0 = time.perf_counter()
     for _ in range(steps):
         step_fn()
     if device.type == "cuda":
         torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
     elapsed = time.perf_counter() - t0
     mem = (
         torch.cuda.max_memory_allocated() / (1024 * 1024)
@@ -155,6 +255,19 @@ def _time_loop(
         else 0.0
     )
     return elapsed, mem
+
+
+def _global_max_metrics(
+    elapsed: float, memory_mb: float, *, device: torch.device
+) -> tuple[float, float]:
+    """Use the slowest rank for throughput and the largest per-rank allocation."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return elapsed, memory_mb
+    metrics = torch.tensor(
+        [elapsed, memory_mb], dtype=torch.float64, device=device
+    )
+    dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+    return float(metrics[0].item()), float(metrics[1].item())
 
 
 def _make_result(
@@ -217,6 +330,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             tensor_parallel_size=args.tp_size,
             data_parallel_size=dp_size,
             pipeline_parallel_size=args.pp_size,
+            sequence_parallel=args.sequence_parallel,
         ),
         dist_backend="nccl" if device.type == "cuda" else "gloo",
     )
@@ -240,60 +354,115 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         use_fused_qkv=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        attn_backend=args.attn_backend,
+        tp_comm_overlap=args.overlap_tp_dgrad,
     )
 
-    torch.manual_seed(42)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(42)
+    collective_backend = None
+    if args.collective_backend == "nano-nccl":
+        from nano_megatron.distributed import create_nano_nccl_training_backend
 
-    ref = ReferenceGPT(cfg)
-    stage = build_pipeline_stage_from_reference(ref, ctx).to(device)
-
-    ddp = None
-    if dp_size > 1:
-        ddp = DistributedDataParallel(stage, ctx, bucket_cap_mb=args.bucket_cap_mb)
-        stage_mod = ddp.module
-        train_mod = ddp
-    else:
-        stage_mod = stage
-        train_mod = stage
-    train_mod.train()
-
-    if is_rank0:
-        n_params = sum(p.numel() for p in stage_mod.parameters())
-        print(
-            f"[nano] params/rank={n_params/1e6:.1f}M "
-            f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
-            f"microbatches={args.num_microbatches} "
-            f"bucket_cap_mb={args.bucket_cap_mb}",
-            flush=True,
+        collective_backend = create_nano_nccl_training_backend(
+            ctx,
+            args.nano_nccl_library,
+            transport=args.nano_nccl_transport,
+            expected_channels=4,
         )
+        ctx.backend = collective_backend
 
-    input_ids = torch.randint(
-        0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
-    )
-    labels = input_ids.clone()
+    try:
+        torch.manual_seed(42)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(42)
 
-    def step() -> None:
-        if ddp is not None:
-            ddp.zero_grad(set_to_none=True)
+        ref = ReferenceGPT(cfg)
+        dtype = _dtype(args)
+        stage = build_pipeline_stage_from_reference(ref, ctx).to(
+            device=device, dtype=dtype
+        )
+    except Exception:
+        if collective_backend is not None:
+            collective_backend.close()
+        destroy_parallel()
+        raise
+
+    try:
+        ddp = None
+        if dp_size > 1:
+            ddp = DistributedDataParallel(
+                stage,
+                ctx,
+                bucket_cap_mb=args.bucket_cap_mb,
+                overlap_grad_reduce=args.overlap_grad_reduce,
+            )
+            stage_mod = ddp.module
+            train_mod = ddp
         else:
-            stage_mod.zero_grad(set_to_none=True)
-        forward_backward_1f1b(
-            stage=stage_mod,
-            ctx=ctx,
-            input_ids=input_ids,
-            labels=labels,
-            num_microbatches=args.num_microbatches,
-            ddp=ddp,
+            stage_mod = stage
+            train_mod = stage
+        train_mod.train()
+
+        if is_rank0:
+            n_params = sum(p.numel() for p in stage_mod.parameters())
+            backend_detail = args.collective_backend
+            if collective_backend is not None:
+                routes = ";".join(
+                    f"{route.name}:{route.backend.transport}"
+                    f"[{','.join(route.backend.edge_transports)}]"
+                    for route in collective_backend.routes
+                )
+                backend_detail += f"/{args.nano_nccl_transport}/4ch/{routes}"
+            print(
+                f"[nano] params/rank={n_params/1e6:.1f}M "
+                f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
+                f"microbatches={args.num_microbatches} "
+                f"bucket_cap_mb={args.bucket_cap_mb} "
+                f"precision={args.precision} sp={args.sequence_parallel} "
+                f"collective_backend={backend_detail} "
+                f"optimizer={args.optimizer} "
+                f"overlap_dp={args.overlap_grad_reduce} "
+                f"overlap_tp={args.overlap_tp_dgrad} "
+                f"overlap_pp={args.overlap_p2p_comm}",
+                flush=True,
+            )
+
+        input_ids = torch.randint(
+            0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
         )
+        labels = input_ids.clone()
 
-    elapsed, memory_mb = _time_loop(
-        step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
-    )
-    destroy_parallel()
+        def step() -> None:
+            if ddp is not None:
+                ddp.zero_grad(set_to_none=True)
+            else:
+                stage_mod.zero_grad(set_to_none=True)
+            forward_backward_1f1b(
+                stage=stage_mod,
+                ctx=ctx,
+                input_ids=input_ids,
+                labels=labels,
+                num_microbatches=args.num_microbatches,
+                ddp=ddp,
+                overlap_p2p_comm=args.overlap_p2p_comm,
+            )
+            _optimizer_step(stage_mod, args.optimizer, args.learning_rate)
 
-    tag_parts = ["nano-megatron"]
+        elapsed, memory_mb = _time_loop(
+            step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
+        )
+        elapsed, memory_mb = _global_max_metrics(
+            elapsed, memory_mb, device=device
+        )
+    finally:
+        if collective_backend is not None:
+            collective_backend.close()
+        destroy_parallel()
+
+    tag_parts = [
+        "nano-megatron+nano-nccl"
+        if args.collective_backend == "nano-nccl"
+        else "nano-megatron"
+    ]
     dims = []
     if args.pp_size > 1:
         dims.append("PP")
@@ -320,8 +489,21 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
     Requires Megatron-LM on ``PYTHONPATH``. Uses
     ``get_forward_backward_func`` / ``forward_backward_pipelining_without_interleaving``.
     """
+    if args.overlap_p2p_comm:
+        raise ValueError(
+            "Megatron-LM's non-interleaved pipeline schedule rejects "
+            "overlap_p2p_comm; run the Megatron reference without "
+            "--overlap-p2p-comm"
+        )
     try:
         from megatron.core import parallel_state
+        from megatron.core.distributed import (
+            DistributedDataParallel as MegatronDDP,
+        )
+        from megatron.core.distributed import (
+            DistributedDataParallelConfig,
+            finalize_model_grads,
+        )
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
         )
@@ -374,14 +556,14 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         tensor_model_parallel_size=args.tp_size,
         pipeline_model_parallel_size=args.pp_size,
         context_parallel_size=1,
-        pipeline_dtype=torch.float32,
+        pipeline_dtype=_dtype(args),
         layernorm_epsilon=1e-5,
         add_bias_linear=False,
         add_qkv_bias=False,
         activation_func=torch.nn.functional.silu,
         gated_linear_unit=True,
         normalization="LayerNorm",
-        sequence_parallel=False,
+        sequence_parallel=args.sequence_parallel,
         tp_comm_overlap=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -391,9 +573,16 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         masked_softmax_fusion=False,
         bias_dropout_fusion=False,
         fp16=False,
-        bf16=False,
-        params_dtype=torch.float32,
+        bf16=(args.precision == "bf16"),
+        params_dtype=_dtype(args),
         deallocate_pipeline_outputs=False,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+        # The pipeline schedule owns final gradient synchronization in a
+        # normal Megatron training step.  This also coalesces replicated
+        # sequence-parallel parameter grads across the TP group; calling only
+        # DDP.finish_grad_sync() would omit that reduction.
+        finalize_model_grads_func=finalize_model_grads,
     )
 
     is_first = parallel_state.is_pipeline_first_stage()
@@ -410,7 +599,28 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         parallel_output=True,
         share_embeddings_and_output_weights=False,
     ).cuda(local_rank)
+    if args.precision == "bf16":
+        model = model.bfloat16()
     model.train()
+
+    ddp = None
+    train_model = model
+    if dp_size > 1:
+        bucket_size = int(
+            args.bucket_cap_mb * 1024 * 1024 / _dtype(args).itemsize
+        )
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=False,
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            use_distributed_optimizer=False,
+            average_in_collective=True,
+            bucket_size=bucket_size,
+        )
+        ddp = MegatronDDP(config=config, ddp_config=ddp_config, module=model)
+        ddp.broadcast_params()
+        train_model = ddp
+        if args.overlap_grad_reduce:
+            config.no_sync_func = ddp.no_sync
 
     if is_rank0:
         n_params = sum(p.numel() for p in model.parameters())
@@ -418,7 +628,11 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             f"[megatron] params/rank={n_params/1e6:.1f}M "
             f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
             f"microbatches={args.num_microbatches} "
-            f"micro_bs={micro_batch_size}",
+            f"micro_bs={micro_batch_size} precision={args.precision} "
+            f"sp={args.sequence_parallel} "
+            f"optimizer={args.optimizer} "
+            f"overlap_dp={args.overlap_grad_reduce} "
+            "overlap_tp=native overlap_pp=False",
             flush=True,
         )
 
@@ -468,22 +682,28 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         return output_tensor, loss_func
 
     def step() -> None:
+        if ddp is not None:
+            ddp.zero_grad_buffer()
         model.zero_grad(set_to_none=True)
         forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=_make_iterator(),
-            model=model,
+            model=train_model,
             num_microbatches=args.num_microbatches,
             seq_length=args.seq_len,
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
+        _optimizer_step(model, args.optimizer, args.learning_rate)
 
     elapsed, memory_mb = _time_loop(
         step,
         warmup=args.warmup_steps,
         steps=args.benchmark_steps,
         device=device,
+    )
+    elapsed, memory_mb = _global_max_metrics(
+        elapsed, memory_mb, device=device
     )
     parallel_state.destroy_model_parallel()
 
@@ -544,7 +764,7 @@ def write_markdown(results: list[BenchmarkResult], path: str) -> None:
 - **Date**: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - **PyTorch**: {torch.__version__}
 - **CUDA**: {torch.version.cuda}
-- **Precision**: FP32
+- **Precision**: see run command
 - **Tokens**: global = local_batch × seq × dp_size / wall_time
 - **Schedule**: non-interleaved 1F1B
 
@@ -587,43 +807,42 @@ def main() -> None:
     is_rank0 = int(os.environ.get("RANK", 0)) == 0
     results: list[BenchmarkResult] = []
 
-    if args.framework in ("nano", "both"):
-        _cuda_reset()
-        if is_rank0:
-            print("Benchmarking nano-megatron PP (1F1B)...", flush=True)
-        r = benchmark_nano(args, dp_size)
-        results.append(r)
-        if is_rank0:
-            _print_result(r)
-
-    if args.framework in ("megatron", "both"):
-        _cuda_reset()
-        if is_rank0:
-            print("Benchmarking Megatron-LM PP (best-effort)...", flush=True)
-        try:
-            r = benchmark_megatron(args, dp_size)
+    try:
+        if args.framework in ("nano", "both"):
+            _cuda_reset()
+            if is_rank0:
+                print("Benchmarking nano-megatron PP (1F1B)...", flush=True)
+            r = benchmark_nano(args, dp_size)
             results.append(r)
             if is_rank0:
                 _print_result(r)
-        except Exception as exc:  # noqa: BLE001 — best-effort path
+
+        if args.framework in ("megatron", "both"):
+            _cuda_reset()
             if is_rank0:
-                print(
-                    f"  Megatron PP path skipped: {type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            if args.framework == "megatron":
-                raise SystemExit(
-                    "Megatron PP benchmark failed and --framework=megatron "
-                    "was requested (no nano fallback)."
-                ) from exc
+                print("Benchmarking Megatron-LM PP (best-effort)...", flush=True)
+            try:
+                r = benchmark_megatron(args, dp_size)
+                results.append(r)
+                if is_rank0:
+                    _print_result(r)
+            except Exception as exc:  # noqa: BLE001 — best-effort path
+                if is_rank0:
+                    print(
+                        f"  Megatron PP path skipped: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                if args.framework == "megatron":
+                    raise
 
-    if is_rank0 and results and args.output:
-        write_markdown(results, args.output)
-        print(f"\nResults written to {args.output}", flush=True)
-
-    _cuda_reset()
-    if dist.is_initialized():
-        dist.barrier()
+        if is_rank0 and results and args.output:
+            write_markdown(results, args.output)
+            print(f"\nResults written to {args.output}", flush=True)
+    finally:
+        _cuda_reset()
+        if dist.is_initialized():
+            dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

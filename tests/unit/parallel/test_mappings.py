@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -15,7 +16,9 @@ from nano_megatron.parallel.mappings import (
     _ReduceFromTPRegion,
     ColumnParallelLinear,
     RowParallelLinear,
+    SequenceParallelGradSynchronizer,
     column_shard,
+    mark_sequence_parallel_parameter,
     row_shard,
 )
 
@@ -203,6 +206,59 @@ def test_communication_buffer_different_dtype_creates_new():
     buf1 = mgr.get_buffer((3, 4), torch.float32, torch.device("cpu"))
     buf2 = mgr.get_buffer((3, 4), torch.float16, torch.device("cpu"))
     assert buf1.data_ptr() != buf2.data_ptr()
+
+
+class _ScalingAllReduceBackend:
+    def __init__(self) -> None:
+        self.calls: list[torch.Tensor] = []
+
+    def all_reduce(self, tensor, *, group=None, op="sum", async_op=False):
+        assert op == "sum"
+        assert async_op is False
+        self.calls.append(tensor.detach().clone())
+        tensor.mul_(2)
+        return tensor
+
+
+def test_sequence_parallel_grad_sync_coalesces_marked_parameters():
+    first = torch.nn.Parameter(torch.zeros(2, 3))
+    second = torch.nn.Parameter(torch.zeros(4))
+    unmarked = torch.nn.Parameter(torch.zeros(1))
+    mark_sequence_parallel_parameter(first)
+    mark_sequence_parallel_parameter(second)
+    first.grad = torch.arange(6, dtype=torch.float32).view_as(first)
+    second.grad = torch.arange(4, dtype=torch.float32)
+    unmarked.grad = torch.ones_like(unmarked)
+    backend = _ScalingAllReduceBackend()
+    sync = SequenceParallelGradSynchronizer(
+        [first, second, unmarked],
+        group=object(),
+        backend=backend,
+        tp_size=2,
+    )
+
+    collectives = sync.finish()
+
+    assert collectives == 1
+    assert len(backend.calls) == 1
+    assert backend.calls[0].numel() == first.numel() + second.numel()
+    assert torch.equal(
+        first.grad,
+        2 * torch.arange(6, dtype=torch.float32).view_as(first),
+    )
+    assert torch.equal(second.grad, 2 * torch.arange(4, dtype=torch.float32))
+    assert torch.equal(unmarked.grad, torch.ones_like(unmarked))
+
+
+def test_sequence_parallel_grad_sync_rejects_missing_gradient():
+    param = torch.nn.Parameter(torch.zeros(2))
+    mark_sequence_parallel_parameter(param)
+    sync = SequenceParallelGradSynchronizer(
+        [param], group=object(), backend=_ScalingAllReduceBackend(), tp_size=2
+    )
+
+    with pytest.raises(RuntimeError, match="gradient is missing"):
+        sync.finish()
 
 
 def test_reduce_from_tp_region_backward_with_buffer(monkeypatch):

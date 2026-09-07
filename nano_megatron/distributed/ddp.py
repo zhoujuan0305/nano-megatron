@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from nano_megatron.distributed.backend import CommBackend
+from nano_megatron.distributed.backend import AllReduceBackend, CommBackend
 from nano_megatron.distributed.bucket import GradBucket, build_buckets
 
 if TYPE_CHECKING:
@@ -24,6 +24,8 @@ class DistributedDataParallel(nn.Module):
         *,
         bucket_cap_mb: float = 25.0,
         broadcast_buffers: bool = False,
+        overlap_grad_reduce: bool = False,
+        grad_sync_backend: AllReduceBackend | None = None,
     ) -> None:
         super().__init__()
         # broadcast_buffers reserved for a later version.
@@ -32,6 +34,9 @@ class DistributedDataParallel(nn.Module):
         self.add_module("module", module)
         self._ctx = ctx
         self._backend: CommBackend = ctx.backend
+        self._grad_sync_backend: AllReduceBackend = (
+            grad_sync_backend if grad_sync_backend is not None else ctx.backend
+        )
         # Sync over DP×CP.  Local-CE under CP scales loss by cp_size so that
         # mean (not sum) over the full DP×CP group recovers full-sequence grads.
         # group_size must be dp*cp so pure CP (dp=1, cp>1) still all-reduces.
@@ -40,6 +45,7 @@ class DistributedDataParallel(nn.Module):
             ctx.data_parallel_size * ctx.context_parallel_size
         )
         self._sync_group_size = self._mean_divisor
+        self._overlap_grad_reduce = overlap_grad_reduce
         self._buckets: list[GradBucket] = build_buckets(module, bucket_cap_mb)
         self._param_to_bucket: dict[nn.Parameter, GradBucket] = {
             p: bucket for bucket in self._buckets for p in bucket.params
@@ -55,8 +61,12 @@ class DistributedDataParallel(nn.Module):
         # When False, grad hooks skip mark_ready so buckets accumulate without
         # triggering all_reduce.  Managed by no_sync() context manager.
         self._require_backward_grad_sync: bool = True
+        self._grad_activity = False
 
         self._broadcast_params()
+        if self._overlap_grad_reduce:
+            for bucket in self._buckets:
+                bucket.prepare_grad_buffer(zero=True)
         self._register_grad_hooks()
 
     @contextmanager
@@ -69,27 +79,12 @@ class DistributedDataParallel(nn.Module):
         finally:
             self._require_backward_grad_sync = prev
 
-    def _param_device(self) -> torch.device:
-        try:
-            return next(self.module.parameters()).device
-        except StopIteration:
-            return torch.device("cpu")
+    @property
+    def overlap_grad_reduce(self) -> bool:
+        return self._overlap_grad_reduce
 
     def _broadcast_params(self) -> None:
-        device = self._param_device()
-        # Leader is the rank with dp_rank==0 and cp_rank==0 in this DP×CP group.
-        is_leader = (
-            self._ctx.data_parallel_rank == 0
-            and self._ctx.context_parallel_rank == 0
-        )
-        leader = torch.tensor(
-            [self._ctx.rank if is_leader else -1],
-            dtype=torch.long,
-            device=device,
-        )
-        self._backend.all_reduce(leader, group=self._dp_group, op="max")
-        dp_src = int(leader.item())
-
+        dp_src = self._ctx.data_context_parallel_src_rank
         for param in self._param_to_bucket:
             self._backend.broadcast(
                 param.data, src=dp_src, group=self._dp_group
@@ -99,14 +94,23 @@ class DistributedDataParallel(nn.Module):
         bucket = self._param_to_bucket.get(param)
         if bucket is None:
             return
+        self._grad_activity = True
         if not self._require_backward_grad_sync:
             self._sync_done = False
             return
         # New grads this iteration — allow finish_grad_sync to run again.
         self._sync_done = False
-        if bucket.mark_ready(param):
+        bucket_ready = bucket.mark_ready(param)
+        if self._overlap_grad_reduce and bucket_ready:
+            bucket.start_sync(
+                self._grad_sync_backend,
+                self._dp_group,
+                self._mean_divisor,
+                group_size=self._sync_group_size,
+            )
+        elif not self._overlap_grad_reduce and bucket_ready:
             bucket.sync(
-                self._backend,
+                self._grad_sync_backend,
                 self._dp_group,
                 self._mean_divisor,
                 group_size=self._sync_group_size,
@@ -161,6 +165,8 @@ class DistributedDataParallel(nn.Module):
         any_activity = any(
             bucket.coalesced or bucket.has_pending_ready for bucket in self._buckets
         )
+        if self._overlap_grad_reduce:
+            any_grad = self._grad_activity
         # No backward (or grads cleared): nothing to sync.
         if not any_grad and not any_activity:
             self._sync_done = True
@@ -178,12 +184,33 @@ class DistributedDataParallel(nn.Module):
                     f"finish_grad_sync rank={self._ctx.rank}: "
                     f"missing grads for {names}"
                 )
-            bucket.sync(
-                self._backend,
-                self._dp_group,
-                self._mean_divisor,
-                group_size=self._sync_group_size,
-            )
+            if self._overlap_grad_reduce:
+                if not bucket.sync_started:
+                    bucket.start_sync(
+                        self._grad_sync_backend,
+                        self._dp_group,
+                        self._mean_divisor,
+                        group_size=self._sync_group_size,
+                    )
+                bucket.finish_sync()
+            else:
+                bucket.sync(
+                    self._grad_sync_backend,
+                    self._dp_group,
+                    self._mean_divisor,
+                    group_size=self._sync_group_size,
+                )
         for bucket in self._buckets:
-            bucket.reset()
+            bucket.reset(keep_grad_buffer=self._overlap_grad_reduce)
+        self._grad_activity = False
+        self._sync_done = True
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        if not self._overlap_grad_reduce:
+            super().zero_grad(set_to_none=set_to_none)
+            return
+        for bucket in self._buckets:
+            bucket.reset(keep_grad_buffer=True)
+            bucket.prepare_grad_buffer(zero=True)
+        self._grad_activity = False
         self._sync_done = True

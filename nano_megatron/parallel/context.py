@@ -36,6 +36,7 @@ class ParallelContext:
     context_parallel_group: Any
     sequence_parallel: bool
     data_context_parallel_group: Any
+    data_context_parallel_src_rank: int
 
 
 _PARALLEL_CONTEXT: ParallelContext | None = None
@@ -143,7 +144,9 @@ def initialize_parallel(
     dp_group = _create_group_for_rank(global_rank, rg.get_ranks("dp"))
     pp_group = _create_group_for_rank(global_rank, rg.get_ranks("pp"))
     cp_group = _create_group_for_rank(global_rank, rg.get_ranks("cp"))
-    dp_cp_group = _create_group_for_rank(global_rank, rg.get_ranks("dp-cp"))
+    dp_cp_rank_lists = rg.get_ranks("dp-cp")
+    dp_cp_group = _create_group_for_rank(global_rank, dp_cp_rank_lists)
+    dp_cp_ranks = next(ranks for ranks in dp_cp_rank_lists if global_rank in ranks)
 
     comm_backend: CommBackend = backend if backend is not None else TorchDistBackend()
 
@@ -168,6 +171,7 @@ def initialize_parallel(
         context_parallel_group=cp_group,
         sequence_parallel=cfg.sequence_parallel,
         data_context_parallel_group=dp_cp_group,
+        data_context_parallel_src_rank=dp_cp_ranks[0],
     )
     _PARALLEL_CONTEXT = ctx
     return ctx

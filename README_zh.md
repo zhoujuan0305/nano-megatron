@@ -16,6 +16,7 @@ English README: [README.md](README.md)
 | FlashAttention | 已支持 | 可选 `flash-attn`；`attn_backend=auto\|flash\|unfused`；覆盖 TP + CP |
 | TP×DP / TP×PP / DP×PP / TP×DP×PP | 已支持 | 通过 `ParallelContext` 组合 |
 | TP×CP / CP×DP | 已支持 | 通过 `ParallelContext` 组合 |
+| Nano NCCL 集合通信 | 可选 | ABI v2 后端替换 TP/SP 与 DP 的 AllReduce、AllGather、ReduceScatter；PP 点对点通信仍走 PyTorch distributed |
 | ZeRO | 规划中 | — |
 
 可直接使用 PyTorch tensor、autograd、CUDA 与分布式通信原语。通信经小型 `CommBackend` 抽象（默认包装 PyTorch distributed）。
@@ -105,7 +106,19 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
   scripts/benchmark_pp.py --framework nano --pp-size 2 --tp-size 1 \
   --batch-size 8 --num-microbatches 4 --seq-len 1024 \
   --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+
+# TP2×SP×DP2 使用 Nano NCCL 集合通信（所有 rank 需处于同一个 MPI world）
+mpirun -n 4 <rank-env-wrapper> python scripts/benchmark_pp.py \
+  --framework nano --tp-size 2 --pp-size 1 --dp-size 2 --sequence-parallel \
+  --collective-backend nano-nccl \
+  --nano-nccl-library /path/to/libnano_nccl_mpi_c.so \
+  --nano-nccl-transport auto --overlap-grad-reduce --overlap-tp-dgrad
 ```
+
+Nano NCCL factory 为活跃的 TP 与 DP×CP group 分别创建 communicator，并按
+process-group 对象路由三类 tensor 集合通信。广播、barrier 与流水线 send/recv
+仍使用 PyTorch fallback。所有 rank 必须按相同顺序创建 communicator；原生库的
+编译期 rank 数必须等于每个被路由 group 的大小。
 
 全部规模与并行组合见 [performance.md](performance.md)。
 

@@ -80,6 +80,68 @@ def test_broadcast_method_exists():
     assert callable(backend.broadcast)
 
 
+@pytest.mark.parametrize(
+    "method_name", ["all_reduce", "reduce_scatter", "all_gather", "send", "recv"]
+)
+def test_async_operations_are_part_of_backend_contract(method_name):
+    backend: CommBackend = TorchDistBackend()
+    assert hasattr(backend, method_name)
+    assert "async_op" in __import__("inspect").signature(
+        getattr(backend, method_name)
+    ).parameters
+
+
+def test_async_send_and_recv_use_nonblocking_primitives(monkeypatch):
+    import torch.distributed as dist
+
+    sentinel_send = object()
+    sentinel_recv = object()
+    monkeypatch.setattr(dist, "isend", lambda *args, **kwargs: sentinel_send)
+    monkeypatch.setattr(dist, "irecv", lambda *args, **kwargs: sentinel_recv)
+    backend = TorchDistBackend()
+    tensor = torch.ones(2)
+
+    assert backend.send(tensor, 1, async_op=True) is sentinel_send
+    assert backend.recv(tensor, 1, async_op=True) is sentinel_recv
+
+
+def test_batch_p2p_maps_backend_neutral_operations(monkeypatch):
+    import torch.distributed as dist
+
+    from nano_megatron.distributed import P2POperation
+
+    captured = []
+    sentinel = [object(), object()]
+
+    class FakeP2POp:
+        def __init__(self, op, tensor, peer, group, tag):
+            self.op = op
+            self.tensor = tensor
+            self.peer = peer
+            self.group = group
+            self.tag = tag
+
+    def fake_batch(operations):
+        captured.extend(operations)
+        return sentinel
+
+    monkeypatch.setattr(dist, "batch_isend_irecv", fake_batch)
+    monkeypatch.setattr(dist, "P2POp", FakeP2POp)
+    backend = TorchDistBackend()
+    send = torch.ones(2)
+    recv = torch.empty(2)
+    result = backend.batch_p2p(
+        [
+            P2POperation("recv", recv, peer=1),
+            P2POperation("send", send, peer=1),
+        ]
+    )
+
+    assert result is sentinel
+    assert [op.op for op in captured] == [dist.irecv, dist.isend]
+    assert [op.tensor for op in captured] == [recv, send]
+
+
 def test_broadcast_calls_dist_broadcast(monkeypatch):
     import torch.distributed as dist
 

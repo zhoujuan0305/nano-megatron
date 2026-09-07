@@ -150,7 +150,9 @@ def test_worker_dp2_grad_matches_reference_nccl():
         nn.ReLU(),
         nn.Linear(8, 4),
     ).to(device)
-    ddp = DistributedDataParallel(module, ctx, bucket_cap_mb=25.0)
+    ddp = DistributedDataParallel(
+        module, ctx, bucket_cap_mb=25.0, overlap_grad_reduce=True
+    )
 
     # Same global batch on every rank; each rank takes a local shard.
     torch.manual_seed(123)

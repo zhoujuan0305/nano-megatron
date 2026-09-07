@@ -179,6 +179,7 @@ def _run_pp_vs_reference(
     seq_len: int,
     seed: int = 0,
     use_ddp: bool = False,
+    sequence_parallel: bool = False,
 ) -> None:
     from nano_megatron.distributed import DistributedDataParallel
     from nano_megatron.model import build_pipeline_stage_from_reference
@@ -197,6 +198,7 @@ def _run_pp_vs_reference(
         destroy_parallel()
 
     cfg = _tiny_cfg(num_layers=num_layers)
+    cfg.tp_comm_overlap = tp > 1
     ctx = None
     try:
         ctx = initialize_parallel(
@@ -204,6 +206,7 @@ def _run_pp_vs_reference(
                 tensor_parallel_size=tp,
                 data_parallel_size=dp,
                 pipeline_parallel_size=pp,
+                sequence_parallel=sequence_parallel,
             ),
             dist_backend="gloo",
         )
@@ -217,7 +220,12 @@ def _run_pp_vs_reference(
 
         ddp = None
         if use_ddp:
-            ddp = DistributedDataParallel(stage, ctx, bucket_cap_mb=25.0)
+            ddp = DistributedDataParallel(
+                stage,
+                ctx,
+                bucket_cap_mb=25.0,
+                overlap_grad_reduce=True,
+            )
             stage_mod = ddp.module
         else:
             stage_mod = stage
@@ -251,6 +259,7 @@ def _run_pp_vs_reference(
             labels=labels_local,
             num_microbatches=num_microbatches,
             ddp=ddp,
+            overlap_p2p_comm=True,
         )
 
         is_last = is_pipeline_last_stage(ctx)
@@ -315,6 +324,13 @@ def test_launch_tp2_pp2_matches_reference():
 @pytest.mark.skipif(
     os.environ.get("NANO_MEGATRON_PP_WORKER") == "1", reason="launcher only"
 )
+def test_launch_tp2_sp_pp2_matches_reference():
+    _run_torchrun(4, "test_worker_tp2_sp_pp2_matches_reference", timeout=60)
+
+
+@pytest.mark.skipif(
+    os.environ.get("NANO_MEGATRON_PP_WORKER") == "1", reason="launcher only"
+)
 def test_launch_dp2_pp2_matches_reference():
     _run_torchrun(4, "test_worker_dp2_pp2_matches_reference")
 
@@ -369,6 +385,24 @@ def test_worker_tp2_pp2_matches_reference():
 @pytest.mark.skipif(
     os.environ.get("NANO_MEGATRON_PP_WORKER") != "1", reason="worker only"
 )
+def test_worker_tp2_sp_pp2_matches_reference():
+    _run_pp_vs_reference(
+        tp=2,
+        dp=1,
+        pp=2,
+        num_layers=4,
+        num_microbatches=2,
+        batch_per_dp=4,
+        seq_len=8,
+        seed=4,
+        use_ddp=False,
+        sequence_parallel=True,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("NANO_MEGATRON_PP_WORKER") != "1", reason="worker only"
+)
 def test_worker_dp2_pp2_matches_reference():
     _run_pp_vs_reference(
         tp=1,
@@ -400,4 +434,5 @@ def test_worker_tp2_dp2_pp2_matches_reference():
         seq_len=8,
         seed=3,
         use_ddp=True,
+        sequence_parallel=True,
     )

@@ -28,6 +28,7 @@ def _make_ctx(backend, dp_size=2):
         context_parallel_rank=0,
         context_parallel_size=1,
         data_context_parallel_group="dp_cp",
+        data_context_parallel_src_rank=0,
         backend=backend,
     )
 
@@ -36,7 +37,6 @@ def test_no_sync_defers_all_reduce_until_finish():
     backend = _FakeBackend()
     model = nn.Linear(4, 4, bias=False)
     ddp = DistributedDataParallel(model, _make_ctx(backend), bucket_cap_mb=25.0)
-    # _broadcast_params uses all_reduce during __init__; capture baseline.
     baseline = backend.all_reduce_calls
     x = torch.randn(2, 4)
     with ddp.no_sync():
@@ -82,3 +82,55 @@ def test_sync_after_no_sync_still_works():
     ddp(x).sum().backward()
     ddp.finish_grad_sync()
     assert backend.all_reduce_calls > calls_after_no_sync
+
+
+def test_overlap_does_not_reduce_when_forward_has_no_backward():
+    backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(backend),
+        bucket_cap_mb=25.0,
+        overlap_grad_reduce=True,
+    )
+    baseline = backend.all_reduce_calls
+    ddp(torch.randn(2, 4))
+    ddp.finish_grad_sync()
+    assert backend.all_reduce_calls == baseline
+
+
+def test_overlap_no_sync_launches_at_finish_boundary():
+    backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(backend),
+        bucket_cap_mb=25.0,
+        overlap_grad_reduce=True,
+    )
+    baseline = backend.all_reduce_calls
+    with ddp.no_sync():
+        ddp(torch.randn(2, 4)).sum().backward()
+    assert backend.all_reduce_calls == baseline
+    ddp.finish_grad_sync()
+    assert backend.all_reduce_calls == baseline + 1
+
+
+def test_gradient_backend_is_independent_from_parameter_broadcast_backend():
+    collective_backend = _FakeBackend()
+    gradient_backend = _FakeBackend()
+    model = nn.Linear(4, 4, bias=False)
+    ddp = DistributedDataParallel(
+        model,
+        _make_ctx(collective_backend),
+        grad_sync_backend=gradient_backend,
+    )
+
+    # Constructor parameter synchronization uses broadcast, not a metadata reduction.
+    assert collective_backend.all_reduce_calls == 0
+    assert gradient_backend.all_reduce_calls == 0
+
+    ddp(torch.randn(2, 4)).sum().backward()
+    ddp.finish_grad_sync()
+    assert collective_backend.all_reduce_calls == 0
+    assert gradient_backend.all_reduce_calls == 1

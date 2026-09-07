@@ -152,6 +152,7 @@ def test_worker_pp2_matches_reference_nccl():
             labels=labels,
             num_microbatches=2,
             ddp=None,
+            overlap_p2p_comm=True,
         )
 
         if is_pipeline_last_stage(ctx):

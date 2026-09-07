@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
+    p.add_argument(
+        "--overlap-grad-reduce",
+        action="store_true",
+        help="Launch each DP bucket reduction as soon as its gradients are ready.",
+    )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
         "--precision",
@@ -194,7 +199,12 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         model = build_tp_gpt_from_reference(ref, ctx).to(device=device, dtype=dtype)
     else:
         model = ref.to(device=device, dtype=dtype)
-    ddp = DistributedDataParallel(model, ctx, bucket_cap_mb=args.bucket_cap_mb)
+    ddp = DistributedDataParallel(
+        model,
+        ctx,
+        bucket_cap_mb=args.bucket_cap_mb,
+        overlap_grad_reduce=args.overlap_grad_reduce,
+    )
     ddp.train()
 
     if is_rank0:
@@ -202,7 +212,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         print(
             f"[nano] params/rank={n_params/1e6:.1f}M tp={args.tp_size} dp={dp_size} "
             f"bucket_cap_mb={args.bucket_cap_mb} precision={args.precision} "
-            f"attn_backend={cfg.attn_backend}",
+            f"attn_backend={cfg.attn_backend} "
+            f"overlap_grad_reduce={args.overlap_grad_reduce}",
             flush=True,
         )
 
