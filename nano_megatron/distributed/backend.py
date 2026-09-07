@@ -23,20 +23,8 @@ class AllReduceBackend(Protocol):
     ) -> Tensor | CommWork: ...
 
 
-@dataclass(frozen=True)
-class P2POperation:
-    kind: Literal["send", "recv"]
-    tensor: Tensor
-    peer: int
-    group: Any | None = None
-    tag: int = 0
-
-
-class CommBackend(Protocol):
-    def all_reduce(
-        self, tensor: Tensor, *, group: Any | None = None, op: str = "sum",
-        async_op: bool = False,
-    ) -> Tensor | CommWork: ...
+class CollectiveBackend(AllReduceBackend, Protocol):
+    """Collective operations used by data and model parallelism."""
 
     def reduce_scatter(
         self,
@@ -66,6 +54,17 @@ class CommBackend(Protocol):
         async_op: bool = False,
     ) -> Tensor | CommWork: ...
 
+
+@dataclass(frozen=True)
+class P2POperation:
+    kind: Literal["send", "recv"]
+    tensor: Tensor
+    peer: int
+    group: Any | None = None
+    tag: int = 0
+
+
+class CommBackend(CollectiveBackend, Protocol):
     def send(
         self,
         tensor: Tensor,

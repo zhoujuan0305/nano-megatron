@@ -16,6 +16,7 @@ Compact distributed training framework for studying Megatron-style parallelism.
 | FlashAttention | Supported | Optional `flash-attn`; `attn_backend=auto\|flash\|unfused`; TP + CP |
 | TP × DP / TP × PP / DP × PP / TP × DP × PP | Supported | Composable via `ParallelContext` |
 | TP × CP / CP × DP | Supported | Composable via `ParallelContext` |
+| Nano NCCL collectives | Optional | ABI v2 backend for TP/SP and DP AllReduce, AllGather, and ReduceScatter; PP P2P stays on PyTorch distributed |
 | ZeRO | Planned | — |
 
 PyTorch tensors, autograd, CUDA, and distributed collectives are used directly. Communication goes through a small `CommBackend` abstraction (default: PyTorch distributed).
@@ -106,7 +107,20 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
   scripts/benchmark_pp.py --framework nano --pp-size 2 --tp-size 1 \
   --batch-size 8 --num-microbatches 4 --seq-len 1024 \
   --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
+
+# TP2×SP×DP2 with Nano NCCL collectives (launch all ranks under one MPI world)
+mpirun -n 4 <rank-env-wrapper> python scripts/benchmark_pp.py \
+  --framework nano --tp-size 2 --pp-size 1 --dp-size 2 --sequence-parallel \
+  --collective-backend nano-nccl \
+  --nano-nccl-library /path/to/libnano_nccl_mpi_c.so \
+  --nano-nccl-transport auto --overlap-grad-reduce --overlap-tp-dgrad
 ```
+
+The Nano NCCL factory creates one communicator for each active TP and DP×CP
+group and routes their three tensor collectives by process-group identity.
+Broadcasts, barriers, and pipeline send/recv use the PyTorch fallback. All
+ranks must enter communicator creation in the same order, and the native
+library's compile-time rank count must equal each routed group size.
 
 All sizes and modes: [performance.md](performance.md).
 

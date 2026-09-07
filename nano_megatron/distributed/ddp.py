@@ -83,27 +83,8 @@ class DistributedDataParallel(nn.Module):
     def overlap_grad_reduce(self) -> bool:
         return self._overlap_grad_reduce
 
-    def _param_device(self) -> torch.device:
-        try:
-            return next(self.module.parameters()).device
-        except StopIteration:
-            return torch.device("cpu")
-
     def _broadcast_params(self) -> None:
-        device = self._param_device()
-        # Leader is the rank with dp_rank==0 and cp_rank==0 in this DP×CP group.
-        is_leader = (
-            self._ctx.data_parallel_rank == 0
-            and self._ctx.context_parallel_rank == 0
-        )
-        leader = torch.tensor(
-            [self._ctx.rank if is_leader else -1],
-            dtype=torch.long,
-            device=device,
-        )
-        self._backend.all_reduce(leader, group=self._dp_group, op="max")
-        dp_src = int(leader.item())
-
+        dp_src = self._ctx.data_context_parallel_src_rank
         for param in self._param_to_bucket:
             self._backend.broadcast(
                 param.data, src=dp_src, group=self._dp_group

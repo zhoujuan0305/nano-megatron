@@ -28,6 +28,7 @@ def _make_ctx(backend, dp_size=2):
         context_parallel_rank=0,
         context_parallel_size=1,
         data_context_parallel_group="dp_cp",
+        data_context_parallel_src_rank=0,
         backend=backend,
     )
 
@@ -36,7 +37,6 @@ def test_no_sync_defers_all_reduce_until_finish():
     backend = _FakeBackend()
     model = nn.Linear(4, 4, bias=False)
     ddp = DistributedDataParallel(model, _make_ctx(backend), bucket_cap_mb=25.0)
-    # _broadcast_params uses all_reduce during __init__; capture baseline.
     baseline = backend.all_reduce_calls
     x = torch.randn(2, 4)
     with ddp.no_sync():
@@ -126,11 +126,11 @@ def test_gradient_backend_is_independent_from_parameter_broadcast_backend():
         grad_sync_backend=gradient_backend,
     )
 
-    # Constructor parameter synchronization stays on the context backend.
-    assert collective_backend.all_reduce_calls == 1
+    # Constructor parameter synchronization uses broadcast, not a metadata reduction.
+    assert collective_backend.all_reduce_calls == 0
     assert gradient_backend.all_reduce_calls == 0
 
     ddp(torch.randn(2, 4)).sum().backward()
     ddp.finish_grad_sync()
-    assert collective_backend.all_reduce_calls == 1
+    assert collective_backend.all_reduce_calls == 0
     assert gradient_backend.all_reduce_calls == 1

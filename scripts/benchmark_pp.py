@@ -82,20 +82,25 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--learning-rate", type=float, default=1.0e-4)
     p.add_argument(
+        "--collective-backend",
         "--dp-backend",
+        dest="collective_backend",
         choices=["torch", "nano-nccl"],
         default="torch",
-        help="Backend used only for DP gradient bucket all-reduce.",
+        help=(
+            "Backend for active TP/SP and DP collectives. --dp-backend is a "
+            "deprecated alias. PP point-to-point remains on PyTorch distributed."
+        ),
     )
     p.add_argument(
         "--nano-nccl-library",
         type=str,
         default=None,
-        help="Path to libnano_nccl_mpi_c.so when --dp-backend=nano-nccl.",
+        help="Path to ABI-v2 libnano_nccl_mpi_c.so for Nano collectives.",
     )
     p.add_argument(
         "--nano-nccl-transport",
-        choices=["auto", "socket", "rdma"],
+        choices=["auto", "shm", "p2p", "socket", "rdma"],
         default="rdma",
     )
     p.add_argument(
@@ -175,13 +180,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("overlap-p2p-comm currently supports pp-size <= 2")
     if args.learning_rate <= 0:
         raise ValueError("learning-rate must be positive")
-    if args.dp_backend == "nano-nccl":
+    if args.collective_backend == "nano-nccl":
         if not args.nano_nccl_library:
             raise ValueError(
-                "--nano-nccl-library is required with --dp-backend=nano-nccl"
+                "--nano-nccl-library is required with "
+                "--collective-backend=nano-nccl"
             )
         if args.framework == "megatron":
-            raise ValueError("--dp-backend=nano-nccl applies to the nano framework")
+            raise ValueError(
+                "--collective-backend=nano-nccl applies to the nano framework"
+            )
 
 
 def _dtype(args: argparse.Namespace) -> torch.dtype:
@@ -350,28 +358,33 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         tp_comm_overlap=args.overlap_tp_dgrad,
     )
 
-    torch.manual_seed(42)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(42)
+    collective_backend = None
+    if args.collective_backend == "nano-nccl":
+        from nano_megatron.distributed import create_nano_nccl_training_backend
 
-    ref = ReferenceGPT(cfg)
-    dtype = _dtype(args)
-    stage = build_pipeline_stage_from_reference(ref, ctx).to(
-        device=device, dtype=dtype
-    )
-
-    grad_sync_backend = None
-    if args.dp_backend == "nano-nccl":
-        if dp_size <= 1:
-            raise ValueError("Nano NCCL DP backend requires dp-size > 1")
-        from nano_megatron.distributed.nano_nccl_backend import NanoNcclBackend
-
-        grad_sync_backend = NanoNcclBackend.from_parallel_context(
+        collective_backend = create_nano_nccl_training_backend(
             ctx,
             args.nano_nccl_library,
             transport=args.nano_nccl_transport,
             expected_channels=4,
         )
+        ctx.backend = collective_backend
+
+    try:
+        torch.manual_seed(42)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(42)
+
+        ref = ReferenceGPT(cfg)
+        dtype = _dtype(args)
+        stage = build_pipeline_stage_from_reference(ref, ctx).to(
+            device=device, dtype=dtype
+        )
+    except Exception:
+        if collective_backend is not None:
+            collective_backend.close()
+        destroy_parallel()
+        raise
 
     try:
         ddp = None
@@ -381,7 +394,6 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 ctx,
                 bucket_cap_mb=args.bucket_cap_mb,
                 overlap_grad_reduce=args.overlap_grad_reduce,
-                grad_sync_backend=grad_sync_backend,
             )
             stage_mod = ddp.module
             train_mod = ddp
@@ -392,11 +404,11 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
 
         if is_rank0:
             n_params = sum(p.numel() for p in stage_mod.parameters())
-            backend_detail = args.dp_backend
-            if grad_sync_backend is not None:
+            backend_detail = args.collective_backend
+            if collective_backend is not None:
                 backend_detail += (
-                    f"/{grad_sync_backend.transport}/"
-                    f"{grad_sync_backend.channel_count}ch"
+                    f"/{args.nano_nccl_transport}/4ch/"
+                    f"{','.join(collective_backend.route_names)}"
                 )
             print(
                 f"[nano] params/rank={n_params/1e6:.1f}M "
@@ -404,7 +416,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 f"microbatches={args.num_microbatches} "
                 f"bucket_cap_mb={args.bucket_cap_mb} "
                 f"precision={args.precision} sp={args.sequence_parallel} "
-                f"dp_backend={backend_detail} "
+                f"collective_backend={backend_detail} "
                 f"optimizer={args.optimizer} "
                 f"overlap_dp={args.overlap_grad_reduce} "
                 f"overlap_tp={args.overlap_tp_dgrad} "
@@ -440,13 +452,13 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             elapsed, memory_mb, device=device
         )
     finally:
-        if grad_sync_backend is not None:
-            grad_sync_backend.close()
+        if collective_backend is not None:
+            collective_backend.close()
         destroy_parallel()
 
     tag_parts = [
         "nano-megatron+nano-nccl"
-        if args.dp_backend == "nano-nccl"
+        if args.collective_backend == "nano-nccl"
         else "nano-megatron"
     ]
     dims = []
