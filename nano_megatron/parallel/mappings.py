@@ -31,6 +31,46 @@ def _check_seq_tensor(x: Tensor) -> None:
         )
 
 
+def _all_gather_along_sequence(
+    x: Tensor,
+    *,
+    group: Any,
+    backend: CommBackend,
+    group_size: int,
+) -> Tensor:
+    """Gather rank-major sequence shards without list staging."""
+    x_sequence_first = x.movedim(SEQ_DIM, 0).contiguous()
+    output_shape = list(x_sequence_first.shape)
+    output_shape[0] *= group_size
+    output = x_sequence_first.new_empty(output_shape)
+    backend.all_gather_into_tensor(output, x_sequence_first, group=group)
+    return output.movedim(0, SEQ_DIM)
+
+
+def _reduce_scatter_along_sequence(
+    x: Tensor,
+    *,
+    group: Any,
+    backend: CommBackend,
+    group_size: int,
+    async_op: bool = False,
+) -> tuple[Tensor, Any]:
+    """Pack sequence chunks once and reduce-scatter the contiguous tensor."""
+    _check_seq_divisible(x.size(SEQ_DIM), group_size)
+    input_sequence_first = x.movedim(SEQ_DIM, 0).contiguous()
+    output_shape = list(input_sequence_first.shape)
+    output_shape[0] //= group_size
+    output_sequence_first = input_sequence_first.new_empty(output_shape)
+    result = backend.reduce_scatter_tensor(
+        output_sequence_first,
+        input_sequence_first,
+        group=group,
+        op="sum",
+        async_op=async_op,
+    )
+    return output_sequence_first.movedim(0, SEQ_DIM), result
+
+
 class CommunicationBuffer:
     """Pre-allocated communication buffer manager.
 
@@ -80,11 +120,12 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        gathered = [torch.empty_like(grad_output) for _ in range(ctx.tp_size)]
-        ctx.backend.all_gather(
-            gathered, grad_output.contiguous(), group=ctx.group
+        grad_input = _all_gather_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
         )
-        grad_input = torch.cat(gathered, dim=SEQ_DIM)
         return grad_input, None, None, None, None
 
 
@@ -107,10 +148,9 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         if tp_size == 1:
             return x
         _check_seq_tensor(x)
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(tp_size)]
-        backend.all_gather(gathered, x, group=group)
-        return torch.cat(gathered, dim=SEQ_DIM)
+        return _all_gather_along_sequence(
+            x, group=group, backend=backend, group_size=tp_size
+        )
 
     @staticmethod
     def backward(
@@ -118,13 +158,12 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        _check_seq_divisible(grad_output.size(SEQ_DIM), ctx.tp_size)
-        chunks = [
-            c.contiguous()
-            for c in grad_output.chunk(ctx.tp_size, dim=SEQ_DIM)
-        ]
-        out = torch.empty_like(chunks[0])
-        ctx.backend.reduce_scatter(out, chunks, group=ctx.group, op="sum")
+        out, _ = _reduce_scatter_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
+        )
         return out, None, None, None, None
 
 
@@ -147,10 +186,9 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         if tp_size == 1:
             return x
         _check_seq_tensor(x)
-        _check_seq_divisible(x.size(SEQ_DIM), tp_size)
-        chunks = [c.contiguous() for c in x.chunk(tp_size, dim=SEQ_DIM)]
-        out = torch.empty_like(chunks[0])
-        backend.reduce_scatter(out, chunks, group=group, op="sum")
+        out, _ = _reduce_scatter_along_sequence(
+            x, group=group, backend=backend, group_size=tp_size
+        )
         return out
 
     @staticmethod
@@ -159,10 +197,13 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None]:
         if ctx.tp_size == 1:
             return grad_output, None, None, None, None
-        grad_output = grad_output.contiguous()
-        gathered = [torch.empty_like(grad_output) for _ in range(ctx.tp_size)]
-        ctx.backend.all_gather(gathered, grad_output, group=ctx.group)
-        return torch.cat(gathered, dim=SEQ_DIM), None, None, None, None
+        grad_input = _all_gather_along_sequence(
+            grad_output,
+            group=ctx.group,
+            backend=ctx.backend,
+            group_size=ctx.tp_size,
+        )
+        return grad_input, None, None, None, None
 
 
 _SEQUENCE_PARALLEL_GRAD_ATTR = "_nano_sequence_parallel_grad"
@@ -460,9 +501,9 @@ class _LinearWithGradOverlap(torch.autograd.Function):
         sequence_parallel: bool,
     ) -> Tensor:
         if sequence_parallel and tp_size > 1:
-            gathered = [torch.empty_like(x) for _ in range(tp_size)]
-            backend.all_gather(gathered, x.contiguous(), group=group)
-            linear_input = torch.cat(gathered, dim=SEQ_DIM)
+            linear_input = _all_gather_along_sequence(
+                x, group=group, backend=backend, group_size=tp_size
+            )
         else:
             linear_input = x
 
@@ -484,17 +525,11 @@ class _LinearWithGradOverlap(torch.autograd.Function):
 
         work = None
         if ctx.tp_size > 1 and ctx.sequence_parallel:
-            _check_seq_divisible(grad_input_full.size(SEQ_DIM), ctx.tp_size)
-            chunks = [
-                chunk.contiguous()
-                for chunk in grad_input_full.chunk(ctx.tp_size, dim=SEQ_DIM)
-            ]
-            grad_input = torch.empty_like(chunks[0])
-            work = ctx.backend.reduce_scatter(
-                grad_input,
-                chunks,
+            grad_input, work = _reduce_scatter_along_sequence(
+                grad_input_full,
                 group=ctx.group,
-                op="sum",
+                backend=ctx.backend,
+                group_size=ctx.tp_size,
                 async_op=True,
             )
         elif ctx.tp_size > 1:

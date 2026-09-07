@@ -94,6 +94,23 @@ class RoutedCommBackend:
             async_op=async_op,
         )
 
+    def reduce_scatter_tensor(
+        self,
+        output: Tensor,
+        input: Tensor,
+        *,
+        group: Any | None = None,
+        op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | CommWork:
+        return self._collectives(group).reduce_scatter_tensor(
+            output,
+            input,
+            group=group,
+            op=op,
+            async_op=async_op,
+        )
+
     def all_gather(
         self,
         tensor_list: list[Tensor],

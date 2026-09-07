@@ -28,6 +28,12 @@ class _RecordingBackend:
         self._record("reduce_scatter", group)
         return output
 
+    def reduce_scatter_tensor(
+        self, output, input, *, group=None, op="sum", async_op=False
+    ):
+        self._record("reduce_scatter_tensor", group)
+        return output
+
     def all_gather(self, tensor_list, tensor, *, group=None, async_op=False):
         self._record("all_gather", group)
         return tensor_list
@@ -83,6 +89,7 @@ def test_routes_collectives_by_group_identity() -> None:
     backend.all_reduce(tensor, group=tp_group)
     backend.all_gather([tensor.clone(), tensor.clone()], tensor, group=tp_group)
     backend.reduce_scatter(tensor, [tensor, tensor], group=tp_group)
+    backend.reduce_scatter_tensor(tensor, tensor, group=tp_group)
     backend.all_reduce(tensor, group=dp_group)
     backend.all_reduce(tensor, group=unregistered_group)
 
@@ -90,6 +97,7 @@ def test_routes_collectives_by_group_identity() -> None:
         "all_reduce",
         "all_gather",
         "reduce_scatter",
+        "reduce_scatter_tensor",
     ]
     assert [operation for operation, _ in dp.calls] == ["all_reduce"]
     assert [operation for operation, _ in fallback.calls] == ["all_reduce"]

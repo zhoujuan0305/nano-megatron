@@ -133,6 +133,26 @@ def _check_gather_scatter(
     scatter_work.wait()
     _assert_equal(actual_scatter, expected_scatter, f"{name} reduce-scatter")
 
+    packed_inputs = torch.cat(inputs)
+    expected_scatter_tensor = torch.empty_like(source)
+    actual_scatter_tensor = torch.empty_like(source)
+    torch_backend.reduce_scatter_tensor(
+        expected_scatter_tensor, packed_inputs, group=group, op="sum"
+    )
+    scatter_tensor_work = nano.reduce_scatter_tensor(
+        actual_scatter_tensor,
+        packed_inputs,
+        group=group,
+        op="sum",
+        async_op=True,
+    )
+    scatter_tensor_work.wait()
+    _assert_equal(
+        actual_scatter_tensor,
+        expected_scatter_tensor,
+        f"{name} reduce-scatter-tensor",
+    )
+
 
 def main() -> None:
     args = parse_args()

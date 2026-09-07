@@ -50,6 +50,24 @@ class TorchDistBackend:
         )
         return work if async_op else output
 
+    def reduce_scatter_tensor(
+        self,
+        output: Tensor,
+        input: Tensor,
+        *,
+        group: Any | None = None,
+        op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | Any:
+        work = dist.reduce_scatter_tensor(
+            output,
+            input,
+            op=reduce_op_from_string(op),
+            group=group,
+            async_op=async_op,
+        )
+        return work if async_op else output
+
     def all_gather(
         self,
         tensor_list: list[Tensor],

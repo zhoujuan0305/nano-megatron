@@ -622,6 +622,45 @@ class NanoNcclBackend:
         work = self._work((flat_input,))
         return self._complete(work, output, async_op=async_op)
 
+    def reduce_scatter_tensor(
+        self,
+        output: Tensor,
+        input: Tensor,
+        *,
+        group: Any | None = None,
+        op: str = "sum",
+        async_op: bool = False,
+    ) -> Tensor | _NanoNcclWork:
+        self._require_open()
+        self._validate_group(group)
+        dtype = self._validate_tensor(output, name="reduce-scatter output")
+        input_dtype = self._validate_tensor(input, name="reduce-scatter input")
+        redop = self._redop(op)
+        if input_dtype != dtype or input.numel() != output.numel() * self.group_size:
+            raise ValueError(
+                "reduce-scatter input must have the output dtype and "
+                f"{self.group_size}x its elements; input={input.numel()}/{input.dtype}, "
+                f"output={output.numel()}/{output.dtype}"
+            )
+        if output.numel() == 0:
+            return output
+
+        self._begin_launch((input, output))
+        args = _ReduceScatterArgs(
+            input.data_ptr(),
+            output.data_ptr(),
+            self._stream.cuda_stream,
+            output.numel(),
+            dtype,
+            redop,
+        )
+        status = self._lib.nano_nccl_reduce_scatter(
+            self._handle, ctypes.byref(args)
+        )
+        self._raise_native_error(status, "reduce-scatter launch")
+        work = self._work()
+        return self._complete(work, output, async_op=async_op)
+
     def close(self) -> None:
         if self._closed:
             return
