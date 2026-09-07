@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--pp-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -129,16 +130,18 @@ def _check_tp_gather_scatter(ctx, nano, torch_backend: TorchDistBackend) -> None
 def main() -> None:
     args = parse_args()
     world_size = int(os.environ["WORLD_SIZE"])
-    expected_world = args.tp_size * args.dp_size
+    expected_world = args.tp_size * args.pp_size * args.dp_size
     if world_size != expected_world:
         raise ValueError(
-            f"WORLD_SIZE={world_size}, expected tp_size*dp_size={expected_world}"
+            f"WORLD_SIZE={world_size}, expected "
+            f"tp_size*pp_size*dp_size={expected_world}"
         )
 
     _phase("initialize_parallel: begin", enabled=args.verbose)
     ctx = initialize_parallel(
         ParallelConfig(
             tensor_parallel_size=args.tp_size,
+            pipeline_parallel_size=args.pp_size,
             data_parallel_size=args.dp_size,
         ),
         dist_backend="nccl",
