@@ -78,14 +78,21 @@ def _check_all_reduce(
         _assert_equal(actual, expected, f"{name} all-reduce {op}")
 
 
-def _check_tp_gather_scatter(ctx, nano, torch_backend: TorchDistBackend) -> None:
-    group = ctx.tensor_parallel_group
-    rank = ctx.tensor_parallel_rank
+def _check_gather_scatter(
+    nano,
+    torch_backend: TorchDistBackend,
+    *,
+    group,
+    group_rank: int,
+    group_size: int,
+    name: str,
+) -> None:
+    rank = group_rank
     source = torch.arange(65539, device="cuda", dtype=torch.bfloat16)
     source.add_(rank * 3)
 
-    expected_gather = [torch.empty_like(source) for _ in range(ctx.tensor_parallel_size)]
-    actual_gather = [torch.empty_like(source) for _ in range(ctx.tensor_parallel_size)]
+    expected_gather = [torch.empty_like(source) for _ in range(group_size)]
+    actual_gather = [torch.empty_like(source) for _ in range(group_size)]
     torch_backend.all_gather(expected_gather, source, group=group)
     gather_work = nano.all_gather(
         actual_gather, source, group=group, async_op=True
@@ -94,10 +101,10 @@ def _check_tp_gather_scatter(ctx, nano, torch_backend: TorchDistBackend) -> None
     for source_rank, (actual, expected) in enumerate(
         zip(actual_gather, expected_gather)
     ):
-        _assert_equal(actual, expected, f"TP all-gather rank {source_rank}")
+        _assert_equal(actual, expected, f"{name} all-gather rank {source_rank}")
 
     expected_into = torch.empty(
-        source.numel() * ctx.tensor_parallel_size,
+        source.numel() * group_size,
         device=source.device,
         dtype=source.dtype,
     )
@@ -107,11 +114,11 @@ def _check_tp_gather_scatter(ctx, nano, torch_backend: TorchDistBackend) -> None
         actual_into, source, group=group, async_op=True
     )
     into_work.wait()
-    _assert_equal(actual_into, expected_into, "TP all-gather-into-tensor")
+    _assert_equal(actual_into, expected_into, f"{name} all-gather-into-tensor")
 
     inputs = [
         torch.full_like(source, float(rank * 10 + destination + 1))
-        for destination in range(ctx.tensor_parallel_size)
+        for destination in range(group_size)
     ]
     expected_scatter = torch.empty_like(source)
     actual_scatter = torch.empty_like(source)
@@ -124,7 +131,7 @@ def _check_tp_gather_scatter(ctx, nano, torch_backend: TorchDistBackend) -> None
         async_op=True,
     )
     scatter_work.wait()
-    _assert_equal(actual_scatter, expected_scatter, "TP reduce-scatter")
+    _assert_equal(actual_scatter, expected_scatter, f"{name} reduce-scatter")
 
 
 def main() -> None:
@@ -166,7 +173,14 @@ def main() -> None:
             name="TP",
         )
         _phase("TP gather/scatter: begin", enabled=args.verbose)
-        _check_tp_gather_scatter(ctx, nano, torch_backend)
+        _check_gather_scatter(
+            nano,
+            torch_backend,
+            group=ctx.tensor_parallel_group,
+            group_rank=ctx.tensor_parallel_rank,
+            group_size=ctx.tensor_parallel_size,
+            name="TP",
+        )
         _phase("DP all-reduce: begin", enabled=args.verbose)
         _check_all_reduce(
             nano,
@@ -175,13 +189,22 @@ def main() -> None:
             group_rank=ctx.data_parallel_rank,
             name="DP",
         )
+        _phase("DP gather/scatter: begin", enabled=args.verbose)
+        _check_gather_scatter(
+            nano,
+            torch_backend,
+            group=ctx.data_context_parallel_group,
+            group_rank=ctx.data_parallel_rank,
+            group_size=ctx.data_parallel_size * ctx.context_parallel_size,
+            name="DP",
+        )
         _phase("collectives: complete", enabled=args.verbose)
         torch.cuda.synchronize()
         dist.barrier()
         if ctx.rank == 0:
             print(
-                "Nano NCCL TP AllReduce/AllGather/ReduceScatter and "
-                "DP AllReduce match PyTorch NCCL",
+                "Nano NCCL TP and DP AllReduce/AllGather/ReduceScatter "
+                "match PyTorch NCCL",
                 flush=True,
             )
     finally:
