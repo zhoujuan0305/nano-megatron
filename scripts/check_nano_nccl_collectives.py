@@ -162,6 +162,12 @@ def main() -> None:
         transport=args.transport,
     )
     _phase("Nano communicators: complete", enabled=args.verbose)
+    for route in nano.routes:
+        _phase(
+            f"{route.name}: transport={route.backend.transport} "
+            f"edges={','.join(route.backend.edge_transports)}",
+            enabled=args.verbose,
+        )
     try:
         ctx.backend = nano
         _phase("TP all-reduce: begin", enabled=args.verbose)

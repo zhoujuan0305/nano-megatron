@@ -53,6 +53,10 @@ class RoutedCommBackend:
     def route_names(self) -> tuple[str, ...]:
         return tuple(route.name for route in self._routes)
 
+    @property
+    def routes(self) -> tuple[CollectiveRoute, ...]:
+        return self._routes
+
     def _collectives(self, group: Any | None) -> CollectiveBackend:
         if self._closed:
             raise RuntimeError("RoutedCommBackend is closed")

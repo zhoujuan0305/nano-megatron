@@ -77,6 +77,9 @@ def test_routes_collectives_by_group_identity() -> None:
     )
     tensor = torch.ones(2)
 
+    assert backend.route_names == ("tp", "dp-cp")
+    assert tuple(route.backend for route in backend.routes) == (tp, dp)
+
     backend.all_reduce(tensor, group=tp_group)
     backend.all_gather([tensor.clone(), tensor.clone()], tensor, group=tp_group)
     backend.reduce_scatter(tensor, [tensor, tensor], group=tp_group)

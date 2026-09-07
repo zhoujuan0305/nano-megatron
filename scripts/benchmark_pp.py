@@ -406,10 +406,12 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             n_params = sum(p.numel() for p in stage_mod.parameters())
             backend_detail = args.collective_backend
             if collective_backend is not None:
-                backend_detail += (
-                    f"/{args.nano_nccl_transport}/4ch/"
-                    f"{','.join(collective_backend.route_names)}"
+                routes = ";".join(
+                    f"{route.name}:{route.backend.transport}"
+                    f"[{','.join(route.backend.edge_transports)}]"
+                    for route in collective_backend.routes
                 )
+                backend_detail += f"/{args.nano_nccl_transport}/4ch/{routes}"
             print(
                 f"[nano] params/rank={n_params/1e6:.1f}M "
                 f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
