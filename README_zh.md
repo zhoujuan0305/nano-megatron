@@ -1,6 +1,6 @@
 # nano-megatron
 
-面向研究与复现的紧凑分布式训练框架，覆盖 Megatron 风格大模型并行技术。
+基于 PyTorch/CUDA 独立实现并验证 Megatron 风格大模型核心并行机制的紧凑训练框架。
 
 English README: [README.md](README.md)
 
@@ -8,22 +8,63 @@ English README: [README.md](README.md)
 
 | 并行 / 能力 | 状态 | 说明 |
 |-------------|------|------|
-| 数据并行 (DP) | 已支持 | 自定义 DDP + 梯度 bucket |
-| 张量并行 (TP) | 已支持 | 列/行并行 + vocab 并行 |
-| 序列并行 (SP) | 已支持 | 复用 TP process group |
-| 流水线并行 (PP) | 已支持 | 非交错 1F1B，同步 P2P |
+| 数据并行 (DP) | 已支持 | 自定义 DDP；持久化连续梯度 bucket；参数就绪异步 AllReduce |
+| 张量并行 (TP) | 已支持 | Column/Row Parallel；QKV/SwiGLU 与词表切分；dgrad 集合通信重叠 |
+| 序列并行 (SP) | 已支持 | 在 TP group 上执行 tensor AllGather/ReduceScatter；合并复制参数梯度 |
+| 流水线并行 (PP) | 已支持 | 非交错 1F1B；双向 batched P2P |
 | 上下文并行 (CP) | 已支持 | AG-KV + 分块 FA（默认 **prefix-concat** 多块，`NANO_CP_FA_CHUNK`）；pack 默认 `contiguous`，可选 `zigzag`；非 P2P ring；不与 PP/SP 组合；`cp>1` 时包 DDP |
 | FlashAttention | 已支持 | 可选 `flash-attn`；`attn_backend=auto\|flash\|unfused`；覆盖 TP + CP |
-| TP×DP / TP×PP / DP×PP / TP×DP×PP | 已支持 | 通过 `ParallelContext` 组合 |
+| TP×DP / TP×PP / DP×PP / TP×SP×PP×DP | 已支持 | 通过 `ParallelContext` 组合；组合路径已对齐未切分参考实现 |
 | TP×CP / CP×DP | 已支持 | 通过 `ParallelContext` 组合 |
-| Nano NCCL 集合通信 | 可选 | ABI v2 后端替换 TP/SP 与 DP 的 AllReduce、AllGather、ReduceScatter；PP 点对点通信仍走 PyTorch distributed |
+| [Nano NCCL](https://github.com/zhoujuan0305/nano-nccl) 集合通信 | 可选 | 为各通信组创建 ABI v2 communicator，替换训练主路径 TP/SP 与 DP 的全部 AllReduce、AllGather、ReduceScatter；PP P2P 仍走 PyTorch distributed |
 | ZeRO | 规划中 | — |
 
 可直接使用 PyTorch tensor、autograd、CUDA 与分布式通信原语。通信经小型 `CommBackend` 抽象（默认包装 PyTorch distributed）。
 
+## 设计
+
+```mermaid
+flowchart LR
+    Step["1F1B 训练 step"] --> TP["TP / SP 映射"]
+    Step --> PP["PP 调度"]
+    Step --> DP["DP 梯度 bucket"]
+    TP --> Router["按通信组路由的集合通信后端"]
+    DP --> Router
+    Router --> Torch["PyTorch distributed"]
+    Router --> NanoTP["Nano NCCL TP communicator"]
+    Router --> NanoDP["Nano NCCL DP×CP communicator"]
+    PP --> Torch
+```
+
+`ParallelContext` 根据 rank 坐标统一构造正交通信组；模型和并行层只依赖通信
+接口，路由后端按 process-group 对象选择 communicator。参考模型与切分模型可
+从同一份权重初始化，测试直接对比 logits、loss 与各 rank 的局部参数梯度。
+
 ## 性能
 
-在 4× RTX A6000、相同 GPT 配置 **345M / 760M / 1.3B** 对比 Megatron-LM（TE）：
+### 双节点 TP2 × SP × PP2 × DP2
+
+当前集成测试采用 1.424B 参数 GPT、BF16、序列长度 2048 和双节点
+8× RTX A6000。TP 与 PP 留在单机，每个 DP 对跨节点。计时范围包含前向、
+反向、TP/SP 通信、PP P2P 和最终 DP 梯度同步，不包含优化器更新。
+
+| 路径 | 全局 tok/s | Step ms | 相对结果 |
+|------|-----------:|--------:|----------|
+| nano-megatron + Nano NCCL，同步通信 | 17,221.76 | 475.68 | — |
+| nano-megatron + Nano NCCL，DP+TP overlap | **19,263.63** | **425.26** | 相对同步路径 **+11.86%** |
+| nano-megatron + PyTorch NCCL GDR=0，DP+TP overlap | 19,974.20 | 410.13 | Nano NCCL 保持 **0.964x** |
+| Megatron-LM/TE + NCCL GDR=0 | 18,958.51 | 432.10 | Nano 路径中位吞吐为 **1.016x** |
+
+数据为五轮旋转交错实验的中位数，每轮 warmup 5 step、测量 20 step。
+Nano NCCL 与 PyTorch NCCL 的后端 A/B 使用相同连接设置，Megatron 使用其
+推荐设置。两条框架路径的五轮区间存在重叠，因此 1.016x 表示该工作负载下
+性能持平，不代表普遍快于 Megatron-LM。原始汇总、拓扑控制实验和适用范围见
+[实验记录](https://github.com/zhoujuan0305/experiments/tree/main/nano-megatron/nano-nccl-collectives/runs/run-20260907-002)。
+
+### 早期单机基线
+
+在 4× RTX A6000、相同 GPT 配置 **345M / 760M / 1.3B** 下对比
+Megatron-LM（TE）：
 
 | 模式 | 精度 | nano / Megatron 吞吐比 | 说明 |
 |------|------|------------------------|------|
@@ -107,7 +148,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
   --batch-size 8 --num-microbatches 4 --seq-len 1024 \
   --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
 
-# TP2×SP×DP2 使用 Nano NCCL 集合通信（所有 rank 需处于同一个 MPI world）
+# TP2×SP×DP2 使用 Nano NCCL 集合通信（每个 GPU 一个 MPI 进程）
 mpirun -n 4 <rank-env-wrapper> python scripts/benchmark_pp.py \
   --framework nano --tp-size 2 --pp-size 1 --dp-size 2 --sequence-parallel \
   --collective-backend nano-nccl \
@@ -115,10 +156,15 @@ mpirun -n 4 <rank-env-wrapper> python scripts/benchmark_pp.py \
   --nano-nccl-transport auto --overlap-grad-reduce --overlap-tp-dgrad
 ```
 
+`<rank-env-wrapper>` 负责将 MPI world/local rank 映射到 PyTorch 使用的
+`WORLD_SIZE`/`RANK`/`LOCAL_RANK` 环境变量；已验收的双节点启动器与拓扑映射见
+[实验脚本](https://github.com/zhoujuan0305/experiments/tree/main/nano-megatron/nano-nccl-collectives/scripts)。
+
 Nano NCCL factory 为活跃的 TP 与 DP×CP group 分别创建 communicator，并按
-process-group 对象路由三类 tensor 集合通信。广播、barrier 与流水线 send/recv
-仍使用 PyTorch fallback。所有 rank 必须按相同顺序创建 communicator；原生库的
-编译期 rank 数必须等于每个被路由 group 的大小。
+process-group 对象路由 AllReduce、AllGather 与 ReduceScatter。广播、barrier
+与流水线 send/recv 仍使用 PyTorch fallback。所有 rank 必须按相同顺序创建
+communicator；原生库的编译期 rank 数必须等于每个被路由 group 的大小。
+Nano NCCL 是可选的限定范围后端，不承诺兼容 NCCL API。
 
 全部规模与并行组合见 [performance.md](performance.md)。
 

@@ -20,7 +20,7 @@ The project has two long-term goals:
 
 PyTorch tensors, autograd, CUDA, and distributed communication primitives may be used directly. PyTorch DDP, FSDP, and related distributed implementations may be used as correctness or performance references, but they should not replace the main implementation of the corresponding nano-megatron feature.
 
-A future communication backend may integrate [`nano-nccl`](https://github.com/zhoujuan0305/nano-nccl). Model, optimizer, and parallelism code must therefore avoid depending directly on a single communication backend.
+An optional communication backend integrates [`nano-nccl`](https://github.com/zhoujuan0305/nano-nccl) for TP/SP and DP AllReduce, AllGather, and ReduceScatter. Model, optimizer, and parallelism code must remain independent of any single communication backend.
 
 This project is in an early stage. Prefer correctness, clarity, and testability over broad feature coverage. Do not claim Megatron-equivalent correctness, scalability, or throughput until supported by reproducible results.
 
@@ -128,7 +128,7 @@ Sequence parallelism reuses the tensor-parallel group and is not an independent 
 
 Communication must be accessed through a small backend interface instead of scattered direct calls to `torch.distributed`.
 
-The initial backend may wrap PyTorch distributed collectives. A later backend may use `nano-nccl` without requiring changes to model, DDP, or ZeRO logic.
+The default backend wraps PyTorch distributed collectives. The optional routed backend selects per-group `nano-nccl` communicators without requiring changes to model, DDP, or ZeRO logic; unsupported operations retain an explicit PyTorch fallback.
 
 The abstraction is expected to cover operations such as:
 
@@ -175,4 +175,3 @@ single-device GPT reference
 * Prefer a small working interface over a large speculative framework.
 * Do not weaken numerical tolerances only to make a test pass.
 * Keep benchmark configurations reproducible and separate correctness runs from performance runs.
-

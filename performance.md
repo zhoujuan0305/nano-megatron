@@ -1,6 +1,40 @@
 # Performance Report
 
-## 1. Test Environment
+## 0. Current two-node integrated path
+
+The current end-to-end communication benchmark covers a 1.424B-parameter GPT
+in BF16 at sequence length 2048 on two nodes with four RTX A6000 GPUs each.
+The logical placement keeps TP2 and PP2 within each node and sends every DP2
+pair across nodes. Sequence parallelism reuses the TP group. A measured step
+includes forward, backward, TP/SP communication, PP point-to-point traffic,
+and final DP gradient synchronization; it excludes the optimizer update.
+
+| Path | Global tok/s | Step ms | Peak MiB/GPU |
+|------|-------------:|--------:|-------------:|
+| nano-megatron + Nano NCCL, synchronous | 17,221.76 | 475.68 | 3,129.86 |
+| nano-megatron + Nano NCCL, DP+TP overlap | **19,263.63** | **425.26** | 4,249.92 |
+| nano-megatron + PyTorch NCCL GDR=0, DP+TP overlap | 19,974.20 | 410.13 | 3,559.31 |
+| Megatron-LM/TE + NCCL GDR=0 | 18,958.51 | 432.10 | 3,531.70 |
+
+These are medians of five rotating, interleaved repetitions, each with five
+warmup and twenty measured steps. Communication overlap improves the Nano NCCL
+path by 11.86%; the integrated backend retains 0.964x the matched PyTorch NCCL
+throughput. The Nano path has a 1.016x median against Megatron-LM/TE, with
+overlapping five-run ranges, so the supported conclusion is parity on this
+workload.
+
+All training-path TP/SP and DP AllReduce, AllGather, and ReduceScatter calls use
+Nano NCCL Ring/Simple/four-channel communicators. TP resolves to intra-node P2P
+and DP to cross-node host-pinned RDMA. PP Send/Recv and parameter broadcast
+remain on PyTorch NCCL. Both collective backends run with GPUDirect RDMA
+disabled. The complete record is in the
+[experiments repository](https://github.com/zhoujuan0305/experiments/tree/main/nano-megatron/nano-nccl-collectives/runs/run-20260907-002).
+
+Sections below preserve the earlier single-node baseline matrix. Their ratios
+use different model sizes, rank placements, and measurement campaigns and are
+not before/after comparisons with the integrated result above.
+
+## 1. Earlier single-node test environment
 
 | Item | Value |
 |------|-------|
