@@ -175,3 +175,12 @@ single-device GPT reference
 * Prefer a small working interface over a large speculative framework.
 * Do not weaken numerical tolerances only to make a test pass.
 * Keep benchmark configurations reproducible and separate correctness runs from performance runs.
+
+## Maintainer Workflow
+
+* 与项目维护者使用中文交流；代码、命令、日志和标识符保持原文。
+* 开始任务时，若存在 `.local-memory/AGENTS.md` 和 `.local-memory/memory/README.md`，先读取它们，并按任务读取对应主题。该目录保存本机的私有项目约定，应由本地主工作区刷新；不得提交其中的内部环境信息。
+* 开发改动使用 Git worktree。创建前检查并复用合适的现有 worktree；分支名与目录对应，具体路径和同步约定以本地记忆为准。
+* 主代理负责理解目标、拆分任务、关键决策、整合及最终验收。当两个以上边界清晰的独立子任务并行有明显收益时，主动委派子代理，使用 `gpt-6-luna`、`reasoning_effort=medium`。优先委派探索、检索、测试、审查及文件互不重叠的实现；强耦合任务串行完成。主代理核验结果后统一交付。
+* 实验资源可能多人共用。实验前检查资源和作业归属；严禁终止他人的进程、容器或服务。仅清理有明确启动和归属记录的本任务进程，不能仅凭同一 Unix 用户推定归属。
+* 设备库存、历史实验与实时状态分别核对。同步前检查分支、完整 commit SHA 及未提交改动，不覆盖未知目标改动。性能结论须保留配置与计时边界。

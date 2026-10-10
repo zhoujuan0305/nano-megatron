@@ -13,3 +13,4 @@ docs/
 !tests/**/fixtures/*.pt
 .worktrees/
 sdd
+.local-memory/
