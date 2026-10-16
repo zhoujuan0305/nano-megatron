@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -34,3 +35,18 @@ def test_megatron_next_token_loss_omits_wrapped_last_target() -> None:
     assert loss.item() == 2.0
     loss.backward()
     torch.testing.assert_close(per_token.grad, torch.tensor([[0.5, 0.5, 0.0]]))
+
+
+def test_nano_channel_cli_keeps_four_default_and_accepts_eight(monkeypatch):
+    from scripts.benchmark_pp import parse_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
+    assert parse_args().nano_nccl_channels == 4
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--nano-nccl-channels", "8"])
+    assert parse_args().nano_nccl_channels == 8
+
+
+def test_nano_channel_cli_rejects_nonpositive_value(monkeypatch):
+    from scripts.benchmark_pp import parse_args, _validate_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--nano-nccl-channels", "0"])
+    with pytest.raises(ValueError, match="nano-nccl-channels must be positive"):
+        _validate_args(parse_args())

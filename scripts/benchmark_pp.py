@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         default="rdma",
     )
     p.add_argument(
+        "--nano-nccl-channels",
+        type=int,
+        default=4,
+        help="Expected channel count of the supplied Nano NCCL library.",
+    )
+    p.add_argument(
         "--overlap-grad-reduce",
         action="store_true",
         help="Overlap DP gradient bucket reductions with the final backward.",
@@ -180,6 +186,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("overlap-p2p-comm currently supports pp-size <= 2")
     if args.learning_rate <= 0:
         raise ValueError("learning-rate must be positive")
+    if args.nano_nccl_channels < 1:
+        raise ValueError("nano-nccl-channels must be positive")
     if args.collective_backend == "nano-nccl":
         if not args.nano_nccl_library:
             raise ValueError(
@@ -403,7 +411,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             ctx,
             args.nano_nccl_library,
             transport=args.nano_nccl_transport,
-            expected_channels=4,
+            expected_channels=args.nano_nccl_channels,
         )
         ctx.backend = collective_backend
 
@@ -455,7 +463,9 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                     f"[{','.join(route.backend.edge_transports)}]"
                     for route in collective_backend.routes
                 )
-                backend_detail += f"/{args.nano_nccl_transport}/4ch/{routes}"
+                backend_detail += (
+                    f"/{args.nano_nccl_transport}/{args.nano_nccl_channels}ch/{routes}"
+                )
             print(
                 f"[nano] params/rank={n_params/1e6:.1f}M "
                 f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
