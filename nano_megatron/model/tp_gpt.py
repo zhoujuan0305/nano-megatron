@@ -174,8 +174,28 @@ class TPCausalSelfAttention(nn.Module):
                 self.config.max_seq_len,
                 theta=self.config.rotary_base,
             )
+            self._rotary_freqs_cache: Tensor | None = None
+            self._rotary_freqs_cache_device: torch.device | None = None
         else:
             self.rotary_emb = False
+
+    def _get_rotary_freqs(self, device: torch.device | str) -> Tensor:
+        """Return the fixed RoPE table cached on one runtime device."""
+        device = torch.device(device)
+        if (
+            self._rotary_freqs_cache is None
+            or self._rotary_freqs_cache_device != device
+        ):
+            self._rotary_freqs_cache = self.freqs.to(device=device)
+            self._rotary_freqs_cache_device = device
+        return self._rotary_freqs_cache
+
+    def _apply(self, fn: Any, recurse: bool = True) -> TPCausalSelfAttention:
+        result = super()._apply(fn, recurse=recurse)
+        if self.rotary_emb:
+            self._rotary_freqs_cache = None
+            self._rotary_freqs_cache_device = None
+        return result
 
     def _split_heads(self, x: Tensor, num_heads: int) -> Tensor:
         batch, seq_len, _ = x.shape
@@ -213,9 +233,7 @@ class TPCausalSelfAttention(nn.Module):
 
         # Apply RoPE if configured
         if self.rotary_emb and positions is not None:
-            # Move freqs to the same device as x
-            freqs = self.freqs.to(x.device)
-            freqs = freqs[positions]
+            freqs = self._get_rotary_freqs(x.device)[positions]
             q = apply_rotary_emb(q, freqs)
             k = apply_rotary_emb(k, freqs)
 
