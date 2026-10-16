@@ -9,6 +9,11 @@ from nano_megatron.model.tp_gpt import TPCausalSelfAttention
 from nano_megatron.reference.layers import precompute_freqs_cis
 
 
+class _IdentityBackend:
+    def all_reduce(self, tensor, *, group=None, op="sum", async_op=False):
+        return tensor
+
+
 def _attention_with_freqs() -> TPCausalSelfAttention:
     attention = TPCausalSelfAttention.__new__(TPCausalSelfAttention)
     nn.Module.__init__(attention)
@@ -63,6 +68,7 @@ def test_rotary_freqs_cache_moves_to_cuda_and_back():
     assert cuda_freqs.device.type == "cuda"
     assert torch.equal(cuda_freqs.cpu(), canonical)
     assert attention._get_rotary_freqs("cuda") is cuda_freqs
+    assert attention._get_rotary_freqs(cuda_freqs.device) is cuda_freqs
 
     attention.to("cuda")
     assert attention._rotary_freqs_cache is None
@@ -75,7 +81,6 @@ def test_rotary_freqs_cache_moves_to_cuda_and_back():
 def test_cached_attention_matches_uncached_output_and_gradients(dtype, device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    from nano_megatron.distributed import TorchDistBackend
     from nano_megatron.reference.config import ReferenceGPTConfig
     from nano_megatron.reference.layers import CausalSelfAttention
 
@@ -86,7 +91,7 @@ def test_cached_attention_matches_uncached_output_and_gradients(dtype, device):
     )
     context = SimpleNamespace(
         tensor_parallel_size=1, tensor_parallel_rank=0,
-        tensor_parallel_group=None, backend=TorchDistBackend(),
+        tensor_parallel_group=None, backend=_IdentityBackend(),
         sequence_parallel=False, context_parallel_rank=0,
         context_parallel_size=1, context_parallel_group=None,
         context_parallel_pack="contiguous",

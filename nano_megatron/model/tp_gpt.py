@@ -182,6 +182,8 @@ class TPCausalSelfAttention(nn.Module):
     def _get_rotary_freqs(self, device: torch.device | str) -> Tensor:
         """Return the fixed RoPE table cached on one runtime device."""
         device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         if (
             self._rotary_freqs_cache is None
             or self._rotary_freqs_cache_device != device
@@ -191,11 +193,10 @@ class TPCausalSelfAttention(nn.Module):
         return self._rotary_freqs_cache
 
     def _apply(self, fn: Any, recurse: bool = True) -> TPCausalSelfAttention:
-        result = super()._apply(fn, recurse=recurse)
         if self.rotary_emb:
             self._rotary_freqs_cache = None
             self._rotary_freqs_cache_device = None
-        return result
+        return super()._apply(fn, recurse=recurse)
 
     def _split_heads(self, x: Tensor, num_heads: int) -> Tensor:
         batch, seq_len, _ = x.shape
