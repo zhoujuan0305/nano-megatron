@@ -238,12 +238,19 @@ def _ensure_dist(local_rank: int) -> None:
     )
 
 
-def _validate_training_step(adamw, losses, phase: str, before=None) -> None:
+def _mean_next_token_loss(per_token_loss: torch.Tensor) -> torch.Tensor:
+    """Megatron returns [batch, sequence]; omit the target after the sequence."""
+    return per_token_loss[:, :-1].float().mean()
+
+
+def _validate_training_step(
+    adamw, losses, phase: str, before=None, *, master_samples=None
+) -> None:
     """Correctness evidence outside the timed region on every participating rank."""
     import json
     import math
 
-    stats = adamw.verify_updated(before)
+    stats = adamw.verify_updated(before, master_samples=master_samples)
     values = [float(loss.float().item()) for loss in losses]
     if not all(math.isfinite(value) for value in values):
         raise RuntimeError(f"non-finite benchmark loss after {phase}")
@@ -419,11 +426,6 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
     try:
         from scripts.benchmark_optimizer import make_benchmark_adamw
 
-        adamw = (
-            make_benchmark_adamw(stage, learning_rate=args.learning_rate)
-            if args.optimizer == "adamw"
-            else None
-        )
         ddp = None
         if dp_size > 1:
             ddp = DistributedDataParallel(
@@ -438,6 +440,11 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             stage_mod = stage
             train_mod = stage
         train_mod.train()
+        adamw = (
+            make_benchmark_adamw(stage_mod, learning_rate=args.learning_rate)
+            if args.optimizer == "adamw"
+            else None
+        )
 
         if is_rank0:
             n_params = sum(p.numel() for p in stage_mod.parameters())
@@ -493,7 +500,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 overlap_p2p_comm=args.overlap_p2p_comm,
             )
             if loss is not None:
-                last_losses.append(loss.detach())
+                last_losses.append(loss.detach().clone())
             if adamw is not None:
                 adamw.step()
             else:
@@ -504,10 +511,13 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             if adamw is not None
             else None
         )
+        master_samples = None
+
         def validate_warmup() -> None:
-            nonlocal before
+            nonlocal before, master_samples
             if adamw is not None:
                 _validate_training_step(adamw, last_losses, "warmup", before)
+                master_samples = adamw.snapshot_master_samples()
             before = None  # Do not retain validation snapshots in timed memory.
 
         elapsed, memory_mb = _time_loop(
@@ -518,7 +528,9 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             after_warmup=validate_warmup,
         )
         if adamw is not None:
-            _validate_training_step(adamw, last_losses, "measured")
+            _validate_training_step(
+                adamw, last_losses, "measured", master_samples=master_samples
+            )
         elapsed, memory_mb = _global_max_metrics(
             elapsed, memory_mb, device=device
         )
@@ -674,11 +686,6 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
 
     from scripts.benchmark_optimizer import make_benchmark_adamw
 
-    adamw = (
-        make_benchmark_adamw(model, learning_rate=args.learning_rate)
-        if args.optimizer == "adamw"
-        else None
-    )
     bucket_size = int(
         args.bucket_cap_mb * 1024 * 1024 / _dtype(args).itemsize
     )
@@ -695,6 +702,11 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
     train_model = ddp
     if args.overlap_grad_reduce:
         config.no_sync_func = ddp.no_sync
+    adamw = (
+        make_benchmark_adamw(model, learning_rate=args.learning_rate)
+        if args.optimizer == "adamw"
+        else None
+    )
 
     if is_rank0:
         n_params = sum(p.numel() for p in model.parameters())
@@ -728,7 +740,9 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         .expand(args.batch_size, -1)
         .contiguous()
     )
-    full_labels = full_ids.clone()
+    # Nano shifts labels in shifted_cross_entropy; Megatron expects callers
+    # to supply next-token targets. The wrapped final target is excluded below.
+    full_labels = torch.roll(full_ids, shifts=-1, dims=1)
 
     forward_backward_func = get_forward_backward_func()
 
@@ -759,9 +773,9 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         output_tensor = model_chunk(tokens, position_ids, None, labels=labels)
 
         def loss_func(output_tensor):
-            # With labels, GPTModel returns per-token loss; mean matches nano CE.
-            loss = output_tensor.float().mean()
-            last_losses.append(loss.detach())
+            loss = _mean_next_token_loss(output_tensor)
+            # The schedule may scale loss in place by the microbatch count.
+            last_losses.append(loss.detach().clone())
             return loss, {"lm loss": loss.detach()}
 
         return output_tensor, loss_func
@@ -790,10 +804,13 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         if adamw is not None
         else None
     )
+    master_samples = None
+
     def validate_warmup() -> None:
-        nonlocal before
+        nonlocal before, master_samples
         if adamw is not None:
             _validate_training_step(adamw, last_losses, "warmup", before)
+            master_samples = adamw.snapshot_master_samples()
         before = None
 
     elapsed, memory_mb = _time_loop(
@@ -804,7 +821,9 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         after_warmup=validate_warmup,
     )
     if adamw is not None:
-        _validate_training_step(adamw, last_losses, "measured")
+        _validate_training_step(
+            adamw, last_losses, "measured", master_samples=master_samples
+        )
     elapsed, memory_mb = _global_max_metrics(
         elapsed, memory_mb, device=device
     )

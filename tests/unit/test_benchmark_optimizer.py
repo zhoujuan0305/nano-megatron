@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -91,3 +92,25 @@ def test_benchmark_adamw_skips_parameters_without_gradients() -> None:
 
     torch.testing.assert_close(module.bias, before_bias)
     assert benchmark._masters[1] not in benchmark.optimizer.state
+
+
+def test_master_probes_detect_measured_updates_without_gpu_snapshot() -> None:
+    module = nn.Linear(2, 2, bias=False)
+    benchmark = make_benchmark_adamw(module, learning_rate=0.01)
+    module.weight.grad = torch.ones_like(module.weight)
+    benchmark.step()
+    probes = benchmark.snapshot_master_samples()
+    assert all(probe.device.type == "cpu" for probe in probes)
+    with pytest.raises(RuntimeError, match="no sampled master update"):
+        benchmark.verify_updated(master_samples=probes)
+    benchmark.step()
+    stats = benchmark.verify_updated(master_samples=probes)
+    assert stats["master_samples_changed"] is True
+    assert stats["optimizer_steps"] == 2
+
+
+def test_benchmark_adamw_ignores_frozen_parameters() -> None:
+    module = nn.Linear(2, 2)
+    module.bias.requires_grad_(False)
+    benchmark = make_benchmark_adamw(module, learning_rate=0.01)
+    assert len(benchmark._model_params) == 1

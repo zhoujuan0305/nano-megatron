@@ -67,8 +67,27 @@ class BenchmarkAdamW:
             param.copy_(master)
         self.step_count += 1
 
-    def verify_updated(self, before: list[torch.Tensor] | None = None) -> dict:
-        """Validate outside timing; optionally prove model weights changed."""
+    def snapshot_master_samples(self) -> list[torch.Tensor]:
+        """Keep small CPU probes, never an extra live GPU snapshot during timing."""
+        return [master.detach().reshape(-1)[:32].cpu().clone() for master in self._masters]
+
+    def verify_updated(
+        self,
+        before: list[torch.Tensor] | None = None,
+        *,
+        master_samples: list[torch.Tensor] | None = None,
+    ) -> dict:
+        """Validate outside timing; optionally prove model/master updates."""
+        samples_changed = None
+        if master_samples is not None:
+            current = self.snapshot_master_samples()
+            if len(master_samples) != len(current):
+                raise ValueError("master probes do not match optimizer parameters")
+            samples_changed = any(
+                not torch.equal(old, new) for old, new in zip(master_samples, current)
+            )
+            if not samples_changed:
+                raise RuntimeError("AdamW validation found no sampled master update")
         if before is not None:
             if len(before) != len(self._model_params):
                 raise ValueError("parameter snapshot does not match optimizer parameters")
@@ -98,6 +117,7 @@ class BenchmarkAdamW:
             "fused": self.fused,
             "finite": True,
             "model_changed": True if before is not None else None,
+            "master_samples_changed": samples_changed,
         }
 
 
