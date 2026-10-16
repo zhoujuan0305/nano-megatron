@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
         "--optimizer",
-        choices=["none", "sgd"],
+        choices=["none", "sgd", "adamw"],
         default="none",
         help="Optional parameter update included in each measured step.",
     )
@@ -196,10 +196,19 @@ def _dtype(args: argparse.Namespace) -> torch.dtype:
     return torch.bfloat16 if args.precision == "bf16" else torch.float32
 
 
+def _make_input_ids(
+    *, vocab_size: int, shape: tuple[int, int], device: torch.device
+) -> torch.Tensor:
+    generator = torch.Generator(device=device).manual_seed(1234)
+    return torch.randint(0, vocab_size, shape, device=device, generator=generator)
+
+
 @torch.no_grad()
 def _optimizer_step(module: torch.nn.Module, optimizer: str, learning_rate: float) -> None:
     if optimizer == "none":
         return
+    if optimizer == "adamw":
+        raise RuntimeError("AdamW steps require the persistent benchmark optimizer")
     if optimizer != "sgd":
         raise ValueError(f"unsupported optimizer: {optimizer}")
     params = []
@@ -229,15 +238,36 @@ def _ensure_dist(local_rank: int) -> None:
     )
 
 
+def _validate_training_step(adamw, losses, phase: str, before=None) -> None:
+    """Correctness evidence outside the timed region on every participating rank."""
+    import json
+    import math
+
+    stats = adamw.verify_updated(before)
+    values = [float(loss.float().item()) for loss in losses]
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError(f"non-finite benchmark loss after {phase}")
+    stats.update(
+        phase=phase,
+        rank=int(os.environ.get("RANK", 0)),
+        loss=sum(values) / len(values) if values else None,
+        loss_observations=len(values),
+    )
+    print("OPTIMIZER_VALIDATION " + json.dumps(stats, sort_keys=True), flush=True)
+
+
 def _time_loop(
     step_fn,
     *,
     warmup: int,
     steps: int,
     device: torch.device,
+    after_warmup=None,
 ) -> tuple[float, float]:
     for _ in range(warmup):
         step_fn()
+    if after_warmup is not None:
+        after_warmup()
     if device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -387,6 +417,13 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         raise
 
     try:
+        from scripts.benchmark_optimizer import make_benchmark_adamw
+
+        adamw = (
+            make_benchmark_adamw(stage, learning_rate=args.learning_rate)
+            if args.optimizer == "adamw"
+            else None
+        )
         ddp = None
         if dp_size > 1:
             ddp = DistributedDataParallel(
@@ -420,23 +457,33 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 f"precision={args.precision} sp={args.sequence_parallel} "
                 f"collective_backend={backend_detail} "
                 f"optimizer={args.optimizer} "
-                f"overlap_dp={args.overlap_grad_reduce} "
+                + (
+                    f"optimizer_config=lr:{args.learning_rate:g},betas:(0.9,0.95),"
+                    "eps:1e-8,weight_decay:0.1,decay:ndim>=2,clip:none "
+                    if args.optimizer == "adamw"
+                    else ""
+                )
+                + f"overlap_dp={args.overlap_grad_reduce} "
                 f"overlap_tp={args.overlap_tp_dgrad} "
                 f"overlap_pp={args.overlap_p2p_comm}",
                 flush=True,
             )
 
-        input_ids = torch.randint(
-            0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device
+        input_ids = _make_input_ids(
+            vocab_size=cfg.vocab_size,
+            shape=(args.batch_size, args.seq_len),
+            device=device,
         )
         labels = input_ids.clone()
+        last_losses: list[torch.Tensor] = []
 
         def step() -> None:
+            last_losses.clear()
             if ddp is not None:
                 ddp.zero_grad(set_to_none=True)
             else:
                 stage_mod.zero_grad(set_to_none=True)
-            forward_backward_1f1b(
+            loss = forward_backward_1f1b(
                 stage=stage_mod,
                 ctx=ctx,
                 input_ids=input_ids,
@@ -445,11 +492,33 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 ddp=ddp,
                 overlap_p2p_comm=args.overlap_p2p_comm,
             )
-            _optimizer_step(stage_mod, args.optimizer, args.learning_rate)
+            if loss is not None:
+                last_losses.append(loss.detach())
+            if adamw is not None:
+                adamw.step()
+            else:
+                _optimizer_step(stage_mod, args.optimizer, args.learning_rate)
+
+        before = (
+            [param.detach().clone() for param in stage_mod.parameters() if param.requires_grad]
+            if adamw is not None
+            else None
+        )
+        def validate_warmup() -> None:
+            nonlocal before
+            if adamw is not None:
+                _validate_training_step(adamw, last_losses, "warmup", before)
+            before = None  # Do not retain validation snapshots in timed memory.
 
         elapsed, memory_mb = _time_loop(
-            step, warmup=args.warmup_steps, steps=args.benchmark_steps, device=device
+            step,
+            warmup=max(args.warmup_steps, 1) if adamw is not None else args.warmup_steps,
+            steps=args.benchmark_steps,
+            device=device,
+            after_warmup=validate_warmup,
         )
+        if adamw is not None:
+            _validate_training_step(adamw, last_losses, "measured")
         elapsed, memory_mb = _global_max_metrics(
             elapsed, memory_mb, device=device
         )
@@ -603,24 +672,29 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         model = model.bfloat16()
     model.train()
 
-    ddp = None
-    train_model = model
+    from scripts.benchmark_optimizer import make_benchmark_adamw
+
+    adamw = (
+        make_benchmark_adamw(model, learning_rate=args.learning_rate)
+        if args.optimizer == "adamw"
+        else None
+    )
+    bucket_size = int(
+        args.bucket_cap_mb * 1024 * 1024 / _dtype(args).itemsize
+    )
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=False,
+        overlap_grad_reduce=args.overlap_grad_reduce,
+        use_distributed_optimizer=False,
+        average_in_collective=True,
+        bucket_size=bucket_size,
+    )
+    ddp = MegatronDDP(config=config, ddp_config=ddp_config, module=model)
     if dp_size > 1:
-        bucket_size = int(
-            args.bucket_cap_mb * 1024 * 1024 / _dtype(args).itemsize
-        )
-        ddp_config = DistributedDataParallelConfig(
-            grad_reduce_in_fp32=False,
-            overlap_grad_reduce=args.overlap_grad_reduce,
-            use_distributed_optimizer=False,
-            average_in_collective=True,
-            bucket_size=bucket_size,
-        )
-        ddp = MegatronDDP(config=config, ddp_config=ddp_config, module=model)
         ddp.broadcast_params()
-        train_model = ddp
-        if args.overlap_grad_reduce:
-            config.no_sync_func = ddp.no_sync
+    train_model = ddp
+    if args.overlap_grad_reduce:
+        config.no_sync_func = ddp.no_sync
 
     if is_rank0:
         n_params = sum(p.numel() for p in model.parameters())
@@ -631,14 +705,22 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             f"micro_bs={micro_batch_size} precision={args.precision} "
             f"sp={args.sequence_parallel} "
             f"optimizer={args.optimizer} "
-            f"overlap_dp={args.overlap_grad_reduce} "
+            + (
+                f"optimizer_config=lr:{args.learning_rate:g},betas:(0.9,0.95),"
+                "eps:1e-8,weight_decay:0.1,decay:ndim>=2,clip:none "
+                if args.optimizer == "adamw"
+                else ""
+            )
+            + f"overlap_dp={args.overlap_grad_reduce} "
             "overlap_tp=native overlap_pp=False",
             flush=True,
         )
 
     # One full local batch; iterator yields microbatch slices each schedule.
-    full_ids = torch.randint(
-        0, vocab_size, (args.batch_size, args.seq_len), device=device
+    full_ids = _make_input_ids(
+        vocab_size=vocab_size,
+        shape=(args.batch_size, args.seq_len),
+        device=device,
     )
     full_pos = (
         torch.arange(args.seq_len, device=device)
@@ -665,6 +747,8 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
 
         return gen()
 
+    last_losses: list[torch.Tensor] = []
+
     def forward_step_func(data_iterator, model_chunk):
         batch = next(data_iterator)
         tokens = batch["tokens"]
@@ -677,11 +761,13 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         def loss_func(output_tensor):
             # With labels, GPTModel returns per-token loss; mean matches nano CE.
             loss = output_tensor.float().mean()
+            last_losses.append(loss.detach())
             return loss, {"lm loss": loss.detach()}
 
         return output_tensor, loss_func
 
     def step() -> None:
+        last_losses.clear()
         if ddp is not None:
             ddp.zero_grad_buffer()
         model.zero_grad(set_to_none=True)
@@ -694,14 +780,31 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
             micro_batch_size=micro_batch_size,
             forward_only=False,
         )
-        _optimizer_step(model, args.optimizer, args.learning_rate)
+        if adamw is not None:
+            adamw.step()
+        else:
+            _optimizer_step(model, args.optimizer, args.learning_rate)
+
+    before = (
+        [param.detach().clone() for param in model.parameters() if param.requires_grad]
+        if adamw is not None
+        else None
+    )
+    def validate_warmup() -> None:
+        nonlocal before
+        if adamw is not None:
+            _validate_training_step(adamw, last_losses, "warmup", before)
+        before = None
 
     elapsed, memory_mb = _time_loop(
         step,
-        warmup=args.warmup_steps,
+        warmup=max(args.warmup_steps, 1) if adamw is not None else args.warmup_steps,
         steps=args.benchmark_steps,
         device=device,
+        after_warmup=validate_warmup,
     )
+    if adamw is not None:
+        _validate_training_step(adamw, last_losses, "measured")
     elapsed, memory_mb = _global_max_metrics(
         elapsed, memory_mb, device=device
     )
