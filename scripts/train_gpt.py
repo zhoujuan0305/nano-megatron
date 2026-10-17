@@ -41,6 +41,14 @@ def learning_rate(update: int, total: int, warmup: int, peak: float, minimum: fl
     return minimum + (peak - minimum) * (1 + math.cos(math.pi * fraction)) / 2
 
 
+def model_config_dict(config: ReferenceGPTConfig) -> dict:
+    def encode(value):
+        if isinstance(value, torch.dtype):
+            return str(value)
+        raise TypeError(f"unsupported model configuration value: {type(value)}")
+    return json.loads(json.dumps(asdict(config), default=encode))
+
+
 def advance_data_hash(previous: str, batch_id: str) -> str:
     return hashlib.sha256(bytes.fromhex(previous) + bytes.fromhex(batch_id)).hexdigest()
 
@@ -215,7 +223,7 @@ def main() -> None:
     heldout = DocumentTokenSampler(args.data_dir, "validation", args.seq_len, args.data_seed)
     if train.dataset_id != heldout.dataset_id:
         raise ValueError("split provenance differs")
-    semantic = dict(model=asdict(cfg), world_size=world, tp_size=args.tp_size, pp_size=args.pp_size,
+    semantic = dict(model=model_config_dict(cfg), world_size=world, tp_size=args.tp_size, pp_size=args.pp_size,
         batch_size=args.batch_size, microbatches=args.microbatches, precision=args.precision,
         seed=args.seed, data_seed=args.data_seed, dataset_id=train.dataset_id, sampler="document-window-v1",
         total_schedule_steps=args.steps, warmup=args.warmup, learning_rate=args.learning_rate, min_learning_rate=args.min_learning_rate)
@@ -300,4 +308,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Also cover failures during construction/restore before the logging loop.
+        destroy_parallel()
+        if dist.is_initialized():
+            dist.destroy_process_group()

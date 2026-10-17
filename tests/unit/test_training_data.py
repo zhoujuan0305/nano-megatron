@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import torch
 from scripts.training_data import DocumentTokenSampler
-from scripts.train_gpt import learning_rate, advance_data_hash
+from scripts.train_gpt import learning_rate, advance_data_hash, model_config_dict
+from nano_megatron.reference import ReferenceGPTConfig
 
 
 def _data(root: Path):
@@ -52,6 +53,14 @@ def test_dataset_checksum_and_too_short_documents_rejected(tmp_path):
     path.write_bytes(path.read_bytes() + b"corrupted")
     with pytest.raises(ValueError, match="checksum"):
         DocumentTokenSampler(str(tmp_path), "train", 16, 42)
+
+
+def test_model_config_is_json_serializable_including_torch_dtypes():
+    config = ReferenceGPTConfig(vocab_size=51200, max_seq_len=32, hidden_size=64,
+                                num_layers=2, num_heads=4, ffn_hidden_size=176)
+    canonical = model_config_dict(config)
+    assert json.loads(json.dumps(canonical)) == canonical
+    assert any(value == "torch.float32" for value in canonical.values())
 
 
 def test_schedule_and_data_trace_are_resumable():
