@@ -219,13 +219,22 @@ def vocab_parallel_cross_entropy_from_shifted(
         group,
         backend,
     )
-    valid = labels_1d != ignore_index
-    if not valid.any():
-        # Keep a connected graph when every label is ignored.
-        return per_token.sum() * 0.0
-    if reduction == "sum":
-        return per_token[valid].sum()
-    return per_token[valid].mean()
+    # The per-token operator already zeros ignored positions.  Avoid a Python
+    # tensor predicate and boolean indexing: both synchronize CUDA with the host,
+    # and boolean indexing creates a data-dependent output shape.
+    # Accumulate low-precision values in FP32, as mean() does internally, so the
+    # intermediate sum cannot overflow before division.  Preserve the loss dtype.
+    accumulation_dtype = (
+        torch.float32
+        if per_token.dtype in (torch.float16, torch.bfloat16)
+        else per_token.dtype
+    )
+    total = per_token.sum(dtype=accumulation_dtype)
+    if reduction == "mean":
+        count = (labels_1d != ignore_index).sum().clamp_min(1)
+        total = total / count
+    # Empty/all-ignored inputs have a connected zero loss and zero logits grad.
+    return total.to(dtype=per_token.dtype)
 
 
 def vocab_parallel_cross_entropy(
