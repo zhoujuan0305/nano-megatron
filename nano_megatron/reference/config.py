@@ -43,6 +43,7 @@ class ReferenceGPTConfig:
     # Opt-in CUDA pointwise kernels; lazy Inductor compilation, no CUDA Graphs.
     fuse_rope: bool = False
     fuse_swiglu: bool = False
+    rope_fp32_phase: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_heads != 0:

@@ -10,14 +10,14 @@ from nano_megatron.reference import ReferenceGPT, ReferenceGPTConfig
 from nano_megatron.reference.layers import apply_rotary_emb, swiglu
 
 
-@pytest.mark.parametrize("fuse_rope,fuse_swiglu", [(False,False),(True,False),(False,True),(True,True)])
+@pytest.mark.parametrize("fuse_rope,fuse_swiglu,fp32_phase", [(False,False,False),(True,False,False),(False,True,False),(True,True,False),(False,False,True),(True,False,True)])
 @pytest.mark.parametrize("tensor_parallel", [False,True])
-def test_pointwise_dispatch_is_opt_in(monkeypatch, fuse_rope, fuse_swiglu, tensor_parallel):
+def test_pointwise_dispatch_is_opt_in(monkeypatch, fuse_rope, fuse_swiglu, fp32_phase, tensor_parallel):
     import nano_megatron.parallel.fused_pointwise as helpers
     calls = dict(rope=0, swiglu=0)
-    def rotary(x, freqs):
+    def rotary(x, freqs, *, fp32_phase=False):
         calls['rope'] += 1
-        return apply_rotary_emb(x, freqs)
+        return apply_rotary_emb(x, freqs, fp32_phase=fp32_phase)
     def gate(x):
         calls['swiglu'] += 1
         return swiglu(x)
@@ -25,8 +25,9 @@ def test_pointwise_dispatch_is_opt_in(monkeypatch, fuse_rope, fuse_swiglu, tenso
     monkeypatch.setattr(helpers, 'fused_swiglu', gate)
     cfg = ReferenceGPTConfig(vocab_size=16, max_seq_len=8, hidden_size=8, num_heads=2,
                              num_layers=2, ffn_hidden_size=16, use_fused_qkv=True, attn_backend='unfused')
-    baseline = ReferenceGPT(cfg)
-    enabled = ReferenceGPT(replace(cfg, fuse_rope=fuse_rope, fuse_swiglu=fuse_swiglu))
+    baseline_cfg = replace(cfg, rope_fp32_phase=fp32_phase)
+    baseline = ReferenceGPT(baseline_cfg)
+    enabled = ReferenceGPT(replace(baseline_cfg, fuse_rope=fuse_rope, fuse_swiglu=fuse_swiglu))
     enabled.load_state_dict(baseline.state_dict())
     try:
         if tensor_parallel:
@@ -52,7 +53,9 @@ def test_disabled_pointwise_flags_preserve_schema1_model_config():
     cfg = ReferenceGPTConfig()
     serialized = model_config_dict(cfg)
     assert 'fuse_rope' not in serialized and 'fuse_swiglu' not in serialized
-    enabled = model_config_dict(replace(cfg, fuse_rope=True, fuse_swiglu=True))
+    assert 'rope_fp32_phase' not in serialized
+    enabled = model_config_dict(replace(cfg, fuse_rope=True, fuse_swiglu=True, rope_fp32_phase=True))
     assert enabled.pop('fuse_rope') is True
     assert enabled.pop('fuse_swiglu') is True
+    assert enabled.pop('rope_fp32_phase') is True
     assert enabled == serialized

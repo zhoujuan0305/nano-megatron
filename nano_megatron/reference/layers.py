@@ -51,6 +51,8 @@ def swiglu(x: Tensor) -> Tensor:
 def apply_rotary_emb(
     x: Tensor,
     freqs: Tensor,
+    *,
+    fp32_phase: bool = False,
 ) -> Tensor:
     """Apply rotary embeddings to input tensor.
     
@@ -64,10 +66,11 @@ def apply_rotary_emb(
     # x: [B, H, S, D], freqs: [B, S, D/2]
     # Reshape freqs to broadcast with x
     # freqs: [B, S, D/2] -> [B, 1, S, D/2]
-    freqs = freqs.to(dtype=x.dtype).unsqueeze(1)
+    phase = freqs.float() if fp32_phase else freqs.to(dtype=x.dtype)
+    phase = phase.unsqueeze(1)
 
-    cos = torch.cos(freqs)  # [B, 1, S, D/2]
-    sin = torch.sin(freqs)  # [B, 1, S, D/2]
+    cos = torch.cos(phase).to(dtype=x.dtype)  # [B, 1, S, D/2]
+    sin = torch.sin(phase).to(dtype=x.dtype)  # [B, 1, S, D/2]
     
     # Split x into pairs
     x1, x2 = x[..., ::2], x[..., 1::2]  # Each [B, H, S, D/2]
@@ -224,8 +227,8 @@ class CausalSelfAttention(nn.Module):
             if self.config.fuse_rope:
                 from nano_megatron.parallel.fused_pointwise import fused_rotary_emb
                 rotary = fused_rotary_emb
-            q = rotary(q, freqs)
-            k = rotary(k, freqs)
+            q = rotary(q, freqs, fp32_phase=self.config.rope_fp32_phase)
+            k = rotary(k, freqs, fp32_phase=self.config.rope_fp32_phase)
 
         # Repeat KV heads for GQA
         k = self._repeat_kv(k, self.num_heads_per_group)

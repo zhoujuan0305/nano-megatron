@@ -7,7 +7,9 @@ import torch
 from torch import Tensor
 
 
-def rotary_reference(x: Tensor, freqs: Tensor) -> Tensor:
+def rotary_reference(
+    x: Tensor, freqs: Tensor, *, fp32_phase: bool = False
+) -> Tensor:
     """Eager RoPE reference matching reference.layers.apply_rotary_emb."""
     if x.ndim != 4 or x.shape[-1] % 2:
         raise ValueError("x must have shape [B, H, S, even D]")
@@ -15,10 +17,13 @@ def rotary_reference(x: Tensor, freqs: Tensor) -> Tensor:
         raise ValueError("freqs must have shape [B, S, D/2]")
     if freqs.requires_grad:
         raise ValueError("freqs are constants and must not require gradients")
-    phase = freqs.to(dtype=x.dtype).unsqueeze(1)
+    phase = freqs.float() if fp32_phase else freqs.to(dtype=x.dtype)
+    phase = phase.unsqueeze(1)
+    cos = torch.cos(phase).to(dtype=x.dtype)
+    sin = torch.sin(phase).to(dtype=x.dtype)
     even, odd = x[..., ::2], x[..., 1::2]
-    a = even * torch.cos(phase) - odd * torch.sin(phase)
-    b = even * torch.sin(phase) + odd * torch.cos(phase)
+    a = even * cos - odd * sin
+    b = even * sin + odd * cos
     return torch.stack((a, b), dim=-1).flatten(-2)
 
 
@@ -39,13 +44,15 @@ def _compiled(name: str):
     )
 
 
-def fused_rotary_emb(x: Tensor, freqs: Tensor) -> Tensor:
+def fused_rotary_emb(
+    x: Tensor, freqs: Tensor, *, fp32_phase: bool = False
+) -> Tensor:
     """Apply interleaved-pair RoPE with a lazily compiled CUDA pointwise kernel."""
     if not x.is_cuda or not freqs.is_cuda:
         raise ValueError("fused_rotary_emb requires CUDA tensors; use rotary_reference on CPU")
     if x.device != freqs.device:
         raise ValueError("x and freqs must be on the same device")
-    return _compiled("rotary")(x, freqs)
+    return _compiled("rotary")(x, freqs, fp32_phase=fp32_phase)
 
 
 def fused_swiglu(projected: Tensor) -> Tensor:

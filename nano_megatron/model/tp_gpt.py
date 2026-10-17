@@ -239,8 +239,8 @@ class TPCausalSelfAttention(nn.Module):
             if self.config.fuse_rope:
                 from nano_megatron.parallel.fused_pointwise import fused_rotary_emb
                 rotary = fused_rotary_emb
-            q = rotary(q, freqs)
-            k = rotary(k, freqs)
+            q = rotary(q, freqs, fp32_phase=self.config.rope_fp32_phase)
+            k = rotary(k, freqs, fp32_phase=self.config.rope_fp32_phase)
 
         # Repeat KV heads for GQA
         k = self._repeat_kv(k, self.num_heads_per_group)

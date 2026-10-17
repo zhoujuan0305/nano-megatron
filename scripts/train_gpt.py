@@ -48,7 +48,7 @@ def model_config_dict(config: ReferenceGPTConfig) -> dict:
         raise TypeError(f"unsupported model configuration value: {type(value)}")
     values = asdict(config)
     # Preserve schema-1 eager checkpoint semantics; enabled numerical paths remain explicit.
-    for name in ("fuse_rope", "fuse_swiglu"):
+    for name in ("fuse_rope", "fuse_swiglu", "rope_fp32_phase"):
         if not values[name]:
             values.pop(name)
     return json.loads(json.dumps(values, default=encode))
