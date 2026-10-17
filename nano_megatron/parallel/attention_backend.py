@@ -245,6 +245,9 @@ def flash_causal_attention(
             "flash_causal_attention requires the flash_attn package"
         ) from exc
 
+    # FlashAttention is a custom operator: explicitly honor PyTorch's policy.
+    # Leave the default call unchanged for older optional flash_attn versions.
+    deterministic = {"deterministic": True} if torch.are_deterministic_algorithms_enabled() else {}
     out = flash_attn_func(
         _to_bshd(q),
         _to_bshd(k),
@@ -252,6 +255,7 @@ def flash_causal_attention(
         dropout_p=dropout_p,
         softmax_scale=scale,
         causal=True,
+        **deterministic,
     )
     return _to_bhsd(out)
 

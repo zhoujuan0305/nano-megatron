@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import time
 from dataclasses import dataclass
+from functools import wraps
 
 import torch
 import torch.distributed as dist
@@ -35,6 +37,9 @@ class BenchmarkResult:
     tokens_per_sec_global: float
     memory_mb: float
     avg_step_time_ms: float
+    cuda_graphs: bool = False
+    deterministic: bool = False
+    extra_warmup_updates: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +79,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ffn-hidden-size", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=3)
     p.add_argument("--benchmark-steps", type=int, default=10)
+    p.add_argument(
+        "--deterministic", action="store_true",
+        help="Process-local deterministic PyTorch/FlashAttention execution (nano only).",
+    )
+    p.add_argument(
+        "--cuda-graphs", action="store_true",
+        help="Experimental full-step replay; requires --deterministic and CUDA TP2/PP2/SP BF16 flash.",
+    )
+    p.add_argument(
+        "--cuda-graph-warmup-steps", type=int, default=50,
+        help="Additional real optimizer updates after capture, outside timing; reported separately.",
+    )
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
         "--optimizer",
@@ -161,6 +178,23 @@ def _resolve_dp(args: argparse.Namespace) -> int:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "deterministic", False) and args.framework != "nano":
+        raise ValueError("--deterministic currently supports --framework=nano only")
+    if getattr(args, "cuda_graph_warmup_steps", 50) < 1:
+        raise ValueError("cuda-graph-warmup-steps must be positive")
+    if getattr(args, "cuda_graphs", False):
+        if not getattr(args, "deterministic", False):
+            raise ValueError("--cuda-graphs requires --deterministic")
+        supported = (
+            args.framework == "nano" and args.device == "cuda"
+            and args.collective_backend == "torch" and args.optimizer == "adamw"
+            and args.tp_size == 2 and args.pp_size == 2 and args.dp_size in (None, 1)
+            and args.sequence_parallel and args.precision == "bf16"
+            and args.attn_backend == "flash" and not args.overlap_grad_reduce
+            and not args.overlap_tp_dgrad and not args.overlap_p2p_comm
+        )
+        if not supported:
+            raise ValueError("CUDA graphs currently require nano CUDA Torch/NCCL, TP2/PP2/DP1/SP, BF16 flash, AdamW, and no overlap flags")
     if args.pp_size < 1:
         raise ValueError(f"pp-size must be >= 1, got {args.pp_size}")
     if args.tp_size < 1:
@@ -260,6 +294,13 @@ def _validate_training_step(
     import math
 
     stats = adamw.verify_updated(before, master_samples=master_samples)
+    device_steps = torch.stack([
+        state["step"].detach().reshape(())
+        for state in adamw.optimizer.state.values()
+    ]).cpu()
+    if not bool((device_steps == adamw.step_count).all()):
+        raise RuntimeError(f"optimizer state step counts disagree with CPU counter after {phase}")
+    stats["optimizer_device_steps"] = sorted(set(device_steps.tolist()))
     values = [float(loss.float().item()) for loss in losses]
     if not all(math.isfinite(value) for value in values):
         raise RuntimeError(f"non-finite benchmark loss after {phase}")
@@ -360,12 +401,42 @@ def _make_result(
         tokens_per_sec_local=tps_local,
         tokens_per_sec_global=tps_global,
         memory_mb=memory_mb,
+        cuda_graphs=getattr(args, "cuda_graphs", False),
+        deterministic=getattr(args, "deterministic", False),
+        extra_warmup_updates=getattr(args, "cuda_graph_warmup_steps", 50) if getattr(args, "cuda_graphs", False) else 0,
         avg_step_time_ms=(elapsed / args.benchmark_steps) * 1000
         if args.benchmark_steps > 0
         else 0.0,
     )
 
 
+def _scoped_determinism(function):
+    """Scope process-local policy; CUDA libraries can still cache handle settings.
+
+    Run isolated processes for performance comparisons. Concurrent unrelated
+    work in the same Python process is not supported by this benchmark.
+    """
+    @wraps(function)
+    def wrapped(args, *pargs, **kwargs):
+        if not getattr(args, "deterministic", False):
+            return function(args, *pargs, **kwargs)
+        enabled = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+        try:
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.use_deterministic_algorithms(True)
+            return function(args, *pargs, **kwargs)
+        finally:
+            torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+            if workspace is None:
+                os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+            else:
+                os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace
+    return wrapped
+
+
+@_scoped_determinism
 def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
     from nano_megatron.distributed import DistributedDataParallel
     from nano_megatron.model import build_pipeline_stage_from_reference
@@ -388,6 +459,10 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         f"cuda:{local_rank}" if args.device == "cuda" else args.device
     )
 
+    if getattr(args, "cuda_graphs", False):
+        _validate_args(args)
+        if dp_size != 1:
+            raise ValueError("CUDA graphs currently require DP1")
     _ensure_dist(local_rank)
     ctx = initialize_parallel(
         ParallelConfig(
@@ -450,6 +525,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         destroy_parallel()
         raise
 
+    graph_step = None
     try:
         from scripts.benchmark_optimizer import make_benchmark_adamw
 
@@ -493,6 +569,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 f"precision={args.precision} sp={args.sequence_parallel} "
                 f"collective_backend={backend_detail} "
                 f"optimizer={args.optimizer} "
+                f"deterministic={torch.are_deterministic_algorithms_enabled()} "
+                f"cuda_graphs={getattr(args, 'cuda_graphs', False)} "
                 + (
                     f"optimizer_config=lr:{args.learning_rate:g},betas:(0.9,0.95),"
                     "eps:1e-8,weight_decay:0.1,decay:ndim>=2,clip:none "
@@ -535,6 +613,11 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             else:
                 _optimizer_step(stage_mod, args.optimizer, args.learning_rate)
 
+        if getattr(args, "cuda_graphs", False):
+            from scripts.benchmark_cuda_graph import BenchmarkCudaGraphStep
+
+            graph_step = BenchmarkCudaGraphStep(step, adamw, last_losses, device)
+
         before = (
             [param.detach().clone() for param in stage_mod.parameters() if param.requires_grad]
             if adamw is not None
@@ -549,12 +632,19 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 master_samples = adamw.snapshot_master_samples()
             before = None  # Do not retain validation snapshots in timed memory.
 
+        def prepare_measurement() -> None:
+            validate_warmup()
+            if graph_step is not None:
+                preparation = graph_step.prepare(args.cuda_graph_warmup_steps)
+                print("CUDA_GRAPH_PREPARATION " + json.dumps(preparation), flush=True)
+                validate_warmup()  # Refresh probes after additional real updates.
+
         elapsed, memory_mb = _time_loop(
-            step,
+            graph_step.run if graph_step is not None else step,
             warmup=max(args.warmup_steps, 1) if adamw is not None else args.warmup_steps,
             steps=args.benchmark_steps,
             device=device,
-            after_warmup=validate_warmup,
+            after_warmup=prepare_measurement,
         )
         if adamw is not None:
             _validate_training_step(
@@ -564,6 +654,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
             elapsed, memory_mb, device=device
         )
     finally:
+        if graph_step is not None:
+            graph_step.close()
         if collective_backend is not None:
             collective_backend.close()
         destroy_parallel()
@@ -573,6 +665,10 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         if args.collective_backend == "nano-nccl"
         else "nano-megatron"
     ]
+    if getattr(args, "deterministic", False):
+        tag_parts[0] += "+deterministic"
+    if getattr(args, "cuda_graphs", False):
+        tag_parts[0] += "+cuda-graph"
     dims = []
     if args.pp_size > 1:
         dims.append("PP")
@@ -900,6 +996,10 @@ def write_markdown(results: list[BenchmarkResult], path: str) -> None:
             f"{r.tokens_per_sec_local:.2f} | {r.tokens_per_sec_global:.2f} | "
             f"{r.memory_mb:.2f} | {r.avg_step_time_ms:.2f} |\n"
         )
+    graph_notes = "".join(
+        f"- **CUDA Graph ({r.framework})**: fixed-shape full forward/backward and AdamW replay; {r.extra_warmup_updates} additional real warmup updates outside timing. Per-rank costs are logged as CUDA_GRAPH_PREPARATION. The automatic GC policy is unchanged. Not an I/O/checkpoint or dynamic-input benchmark.\n"
+        for r in results if r.cuda_graphs
+    )
     analysis = ""
     if len(results) >= 2:
         a, b = results[0], results[1]
@@ -923,6 +1023,7 @@ def write_markdown(results: list[BenchmarkResult], path: str) -> None:
 | Framework | Parallel | Microbatches | Local-BS | Seq | Hidden | Layers | Heads | Tok/s local | Tok/s global | Mem MB | Step ms |
 |-----------|----------|--------------|----------|-----|--------|--------|-------|-------------|--------------|--------|---------|
 {rows}
+{graph_notes}
 ## Analysis
 
 {analysis}

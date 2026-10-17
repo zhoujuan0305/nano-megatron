@@ -212,6 +212,101 @@ def test_nano_channel_cli_keeps_four_default_and_accepts_eight(monkeypatch):
     assert parse_args().nano_nccl_channels == 8
 
 
+def test_graph_cli_defaults_off_and_validated_configuration(monkeypatch):
+    from scripts.benchmark_pp import parse_args, _validate_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
+    args = parse_args()
+    assert not args.cuda_graphs and not args.deterministic
+    assert args.cuda_graph_warmup_steps == 50
+    args = _graph_args(monkeypatch)
+    _validate_args(args)
+
+
+def _graph_args(monkeypatch):
+    from scripts.benchmark_pp import parse_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--cuda-graphs", "--deterministic", "--tp-size", "2", "--pp-size", "2", "--dp-size", "1", "--sequence-parallel", "--precision", "bf16", "--attn-backend", "flash", "--optimizer", "adamw"])
+    return parse_args()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("device", "cpu"), ("tp_size", 1), ("pp_size", 1), ("dp_size", 2),
+    ("sequence_parallel", False), ("precision", "fp32"), ("attn_backend", "unfused"),
+    ("optimizer", "sgd"), ("collective_backend", "nano-nccl"),
+    ("overlap_p2p_comm", True), ("overlap_tp_dgrad", True), ("overlap_grad_reduce", True),
+])
+def test_graph_cli_rejects_unvalidated_combinations(monkeypatch, field, value):
+    from scripts.benchmark_pp import _validate_args
+    args = _graph_args(monkeypatch)
+    setattr(args, field, value)
+    with pytest.raises(ValueError, match="CUDA graphs currently require"):
+        _validate_args(args)
+
+
+def test_graph_cli_requires_determinism_and_positive_extra_warmup(monkeypatch):
+    from scripts.benchmark_pp import _validate_args
+    args = _graph_args(monkeypatch)
+    args.deterministic = False
+    with pytest.raises(ValueError, match="requires --deterministic"):
+        _validate_args(args)
+    args.deterministic = True
+    args.cuda_graph_warmup_steps = 0
+    with pytest.raises(ValueError, match="must be positive"):
+        _validate_args(args)
+
+
+def test_graph_result_discloses_extra_updates_without_counting_tokens(monkeypatch, tmp_path):
+    from scripts.benchmark_pp import _make_result, write_markdown
+    args = _graph_args(monkeypatch)
+    result = _make_result(framework="nano+cuda-graph", args=args, dp_size=1, elapsed=2.0, memory_mb=10.0)
+    assert result.extra_warmup_updates == 50
+    assert result.tokens_per_sec_global == args.benchmark_steps * args.batch_size * args.seq_len / 2.0
+    path = tmp_path / "results.md"
+    write_markdown([result], str(path))
+    assert "50 additional real warmup updates" in path.read_text()
+    assert "CUDA_GRAPH_PREPARATION" in path.read_text()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("workspace", [None, ":16:8"])
+def test_determinism_scope_restores_flags_and_environment(monkeypatch, raises, workspace):
+    import os
+    from types import SimpleNamespace
+    from scripts.benchmark_pp import _scoped_determinism
+    if workspace is None:
+        monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", workspace)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warning = torch.is_deterministic_algorithms_warn_only_enabled()
+    @_scoped_determinism
+    def call(args):
+        assert torch.are_deterministic_algorithms_enabled()
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == (workspace or ":4096:8")
+        if raises:
+            raise RuntimeError("deliberate")
+    if raises:
+        with pytest.raises(RuntimeError, match="deliberate"):
+            call(SimpleNamespace(deterministic=True))
+    else:
+        call(SimpleNamespace(deterministic=True))
+    assert torch.are_deterministic_algorithms_enabled() == enabled
+    assert torch.is_deterministic_algorithms_warn_only_enabled() == warning
+    assert os.environ.get("CUBLAS_WORKSPACE_CONFIG") == workspace
+
+
+def test_optimizer_validation_rejects_cpu_only_step_increment():
+    from scripts.benchmark_optimizer import make_benchmark_adamw
+    from scripts.benchmark_pp import _validate_training_step
+    module = nn.Linear(2, 2)
+    optimizer = make_benchmark_adamw(module, learning_rate=1e-4)
+    module(torch.ones(1, 2)).square().mean().backward()
+    optimizer.step()
+    _validate_training_step(optimizer, [], "real")
+    optimizer.step_count += 1  # A replay that forgot its GPU update must fail.
+    with pytest.raises(RuntimeError, match="state step counts disagree"):
+        _validate_training_step(optimizer, [], "false-replay")
+
+
 def test_nano_channel_cli_rejects_nonpositive_value(monkeypatch):
     from scripts.benchmark_pp import parse_args, _validate_args
     monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--nano-nccl-channels", "0"])

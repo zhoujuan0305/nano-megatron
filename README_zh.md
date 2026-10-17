@@ -168,6 +168,34 @@ Nano NCCL 是可选的限定范围后端，不承诺兼容 NCCL API。
 
 全部规模与并行组合见 [performance.md](performance.md)。
 
+### 静态训练步 CUDA Graph（实验性、默认关闭）
+
+`benchmark_pp.py --cuda-graphs --deterministic` 捕获完整 forward/backward 与
+FP32-master AdamW 更新，不以省略 optimizer 换取吞吐。当前仅开放 CUDA、
+Torch/NCCL、TP2×PP2×DP1+SP、BF16 FlashAttention、AdamW 且不开 overlap 的组合。
+确定性模式同时作用于 PyTorch 与 CP1 FlashAttention 反向；它是进程内配置，
+不设置设备时钟、CPU affinity 或共享系统参数。
+
+```bash
+# 两节点各两 GPU；所有节点使用相同参数，自行设置 rendezvous 环境变量。
+python -m torch.distributed.run --nnodes=2 --nproc_per_node=2 \
+  --node_rank="$NODE_RANK" --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+  scripts/benchmark_pp.py --framework nano --tp-size 2 --pp-size 2 --dp-size 1 \
+  --sequence-parallel --precision bf16 --attn-backend flash --optimizer adamw \
+  --hidden-size 1024 --num-layers 12 --num-heads 8 --ffn-hidden-size 2752 \
+  --batch-size 4 --num-microbatches 4 --seq-len 1024 \
+  --warmup-steps 150 --benchmark-steps 400 --deterministic --cuda-graphs \
+  --cuda-graph-warmup-steps 50
+```
+
+此例计时前实际完成 150+50 次训练更新；capture 本身不增加设备端更新，
+Python 计数在 capture 后对齐。额外准备耗时按 rank 输出为
+`CUDA_GRAPH_PREPARATION`，结果标签和 Markdown 单列额外 warmup 更新。
+自动 GC 策略不变，计时内发生的维护仍计入。该模式要求输入形状、存储地址、
+优化器状态及超参数固定，capture 后持续重放，不混入其它 eager 训练步骤；
+不代表动态数据、学习率调度、checkpoint 或完整生产训练吞吐，也不承诺任意
+共享环境下的方差上限。默认 eager 路径仍可独立使用。
+
 ### 验证模型结构
 
 ```bash
