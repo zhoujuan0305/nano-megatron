@@ -64,7 +64,7 @@ def optimizer_state_dict(optimizer: Any, module: nn.Module) -> dict[str, Any]:
 
 @torch.no_grad()
 def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str, Any]) -> None:
-    """Restore strictly; saved parameter-group hyperparameters, including LR, take precedence.
+    """Restore strictly; saved LR takes precedence, other optimizer policy must match.
 
     A driver may resume its scheduler from the saved step and then update LR as usual.
     """
@@ -95,9 +95,14 @@ def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str
     for current, saved, metadata in zip(optimizer.optimizer.param_groups, saved_groups, groups):
         if len(current["params"]) != len(saved.get("params", [])):
             raise ValueError("optimizer checkpoint parameter group topology mismatch")
+        if set(metadata) != set(saved).difference({"params"}):
+            raise ValueError("optimizer checkpoint hyperparameter metadata incomplete")
         for key, value in metadata.items():
-            if key != "params" and saved.get(key) != value:
+            if saved.get(key) != value:
                 raise ValueError("optimizer checkpoint hyperparameter metadata mismatch")
+        for key in ("betas", "eps", "weight_decay", "amsgrad", "maximize", "foreach", "capturable", "differentiable", "fused"):
+            if saved.get(key) != current.get(key):
+                raise ValueError(f"optimizer checkpoint policy mismatch: {key}")
         for key in ("lr", "eps", "weight_decay"):
             value = saved.get(key)
             if not isinstance(value, (int, float)) or not math.isfinite(value):

@@ -64,7 +64,7 @@ def test_untrained_optimizer_checkpoint_roundtrip() -> None:
     assert other.optimizer.param_groups[0]["lr"] == 0.01
 
 
-@pytest.mark.parametrize("corruption", ["signature", "master_shape", "master_nan", "counter", "counter_mismatch", "missing_state", "moment_nan", "moment_shape"])
+@pytest.mark.parametrize("corruption", ["signature", "master_shape", "master_nan", "counter", "counter_mismatch", "missing_state", "optimizer_policy", "moment_nan", "moment_shape"])
 def test_optimizer_checkpoint_rejects_corruption(corruption: str) -> None:
     module = _module()
     optimizer = make_benchmark_adamw(module, learning_rate=0.01)
@@ -82,6 +82,9 @@ def test_optimizer_checkpoint_rejects_corruption(corruption: str) -> None:
         checkpoint["step_count"] += 1
     elif corruption == "missing_state":
         checkpoint["torch_optimizer"]["state"].pop(next(iter(checkpoint["torch_optimizer"]["state"])))
+    elif corruption == "optimizer_policy":
+        checkpoint["torch_optimizer"]["param_groups"][0]["betas"] = (0.8, 0.9)
+        checkpoint["groups"][0]["betas"] = (0.8, 0.9)
     else:
         item = next(iter(checkpoint["torch_optimizer"]["state"].values()))
         key = "exp_avg" if corruption == "moment_nan" else "exp_avg_sq"
