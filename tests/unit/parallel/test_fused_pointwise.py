@@ -122,6 +122,7 @@ def test_cuda_compiled_rotary_fp32_phase_output_and_gradient(dtype):
     _compiled_close(actual_grad, x.grad)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cuda_compiled_swiglu_output_and_gradient(dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

@@ -15,7 +15,9 @@ from nano_megatron.reference.layers import apply_rotary_emb, swiglu
 def test_pointwise_dispatch_is_opt_in(monkeypatch, fuse_rope, fuse_swiglu, fp32_phase, tensor_parallel):
     import nano_megatron.parallel.fused_pointwise as helpers
     calls = dict(rope=0, swiglu=0)
+    observed_phases = []
     def rotary(x, freqs, *, fp32_phase=False):
+        observed_phases.append(fp32_phase)
         calls['rope'] += 1
         return apply_rotary_emb(x, freqs, fp32_phase=fp32_phase)
     def gate(x):
@@ -43,6 +45,7 @@ def test_pointwise_dispatch_is_opt_in(monkeypatch, fuse_rope, fuse_swiglu, fp32_
         actual.sum().backward()
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in enabled.parameters())
         assert calls == dict(rope=4 if fuse_rope else 0, swiglu=2 if fuse_swiglu else 0)
+        assert observed_phases == [fp32_phase] * calls['rope']
     finally:
         if tensor_parallel and is_parallel_initialized():
             destroy_parallel()
