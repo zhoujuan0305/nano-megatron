@@ -10,6 +10,13 @@ from nano_megatron.parallel.fused_pointwise import (
 from nano_megatron.reference.layers import apply_rotary_emb, swiglu
 
 
+def _compiled_close(actual, expected):
+    # Fixed before any CUDA outcome: fusion changes low-precision intermediate rounding.
+    atol, rtol = {torch.float32: (2e-6, 2e-5), torch.float16: (2e-3, 2e-3),
+                  torch.bfloat16: (2e-2, 2e-2)}[actual.dtype]
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rotary_cpu_math_and_gradient(dtype):
     x = torch.randn(2, 3, 4, 8, dtype=dtype, requires_grad=True)
@@ -60,26 +67,27 @@ def test_cuda_compiled_rotary_output_and_gradient(dtype, shape):
     freqs = torch.randn(shape[0], shape[2], shape[3] // 2, device="cuda")
     actual = fused_rotary_emb(x, freqs)
     expected = apply_rotary_emb(x, freqs)
-    torch.testing.assert_close(actual, expected)
+    _compiled_close(actual, expected)
     grad = torch.randn_like(actual)
     actual.backward(grad)
     grad_actual = x.grad.clone()
     x.grad = None
     expected.backward(grad)
-    torch.testing.assert_close(grad_actual, x.grad)
+    _compiled_close(grad_actual, x.grad)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cuda_compiled_swiglu_output_and_gradient(dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    x = torch.randn(4, 32, device="cuda", dtype=dtype, requires_grad=True).t().contiguous().t()
+    x = torch.randn(4, 32, device="cuda", dtype=dtype).t().contiguous().t().detach().requires_grad_(True)
+    assert x.is_leaf and not x.is_contiguous()
     actual = fused_swiglu(x)
     expected = swiglu(x)
-    torch.testing.assert_close(actual, expected)
+    _compiled_close(actual, expected)
     grad = torch.randn_like(actual)
     actual.backward(grad)
     grad_actual = x.grad.clone()
     x.grad = None
     expected.backward(grad)
-    torch.testing.assert_close(grad_actual, x.grad)
+    _compiled_close(grad_actual, x.grad)
