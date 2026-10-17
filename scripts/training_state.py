@@ -62,6 +62,7 @@ def optimizer_state_dict(optimizer: Any, module: nn.Module) -> dict[str, Any]:
     }
 
 
+@torch.no_grad()
 def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str, Any]) -> None:
     """Restore strictly; saved parameter-group hyperparameters, including LR, take precedence.
 
@@ -102,7 +103,7 @@ def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"invalid optimizer hyperparameter: {key}")
         betas = saved.get("betas")
-        if not isinstance(betas, (tuple, list)) or len(betas) != 2 or not all(math.isfinite(float(v)) for v in betas):
+        if not isinstance(betas, (tuple, list)) or len(betas) != 2 or not all(math.isfinite(float(v)) and 0 <= float(v) < 1 for v in betas):
             raise ValueError("invalid optimizer betas")
 
     param_ids = [pid for group in saved_groups for pid in group["params"]]
@@ -111,6 +112,8 @@ def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str
     saved_state = torch_state.get("state")
     if not isinstance(saved_state, dict) or set(saved_state).difference(param_ids):
         raise ValueError("invalid torch optimizer state mapping")
+    if count > 0 and set(saved_state) != set(param_ids):
+        raise ValueError("trained checkpoint must initialize every parameter state")
     for entry in saved_state.values():
         if not isinstance(entry, dict) or not all(key in entry for key in ("step", "exp_avg", "exp_avg_sq")):
             raise ValueError("incomplete AdamW moment state")
@@ -118,12 +121,13 @@ def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str
             value = entry[key]
             if not isinstance(value, torch.Tensor) or not torch.isfinite(value).all():
                 raise ValueError(f"invalid/non-finite AdamW state {key}")
+        if entry["step"].numel() != 1 or entry["step"].item() != count:
+            raise ValueError("AdamW per-parameter step disagrees with checkpoint counter")
         for key in ("exp_avg", "exp_avg_sq"):
-            value = entry[key]
-            if key != "step" and value.dtype != torch.float32:
+            if entry[key].dtype != torch.float32:
                 raise ValueError(f"invalid AdamW state {key} dtype")
-            if key == "step" and value.numel() != 1:
-                raise ValueError("invalid AdamW per-parameter step")
+        if (entry["exp_avg_sq"] < 0).any():
+            raise ValueError("AdamW second moment cannot be negative")
     # Validate each moment against the parameter associated with its serialized ID.
     for group, live_group in zip(saved_groups, optimizer.optimizer.param_groups):
         for pid, master in zip(group["params"], live_group["params"]):
@@ -143,5 +147,7 @@ def load_optimizer_state_dict(optimizer: Any, module: nn.Module, state: dict[str
     for grad_buffer in optimizer._grad_buffers:
         grad_buffer.zero_()
     for model_param, master in zip(optimizer._model_params, optimizer._masters):
-        if hasattr(model_param, "main_grad"):
-            model_param.main_grad = None
+        master.grad = None
+        main_grad = getattr(model_param, "main_grad", None)
+        if main_grad is not None:
+            main_grad.zero_()  # Preserve any DDP-owned buffer alias.

@@ -35,6 +35,7 @@ def test_optimizer_checkpoint_resumes_identically_and_is_cpu_snapshot() -> None:
     resumed_module = copy.deepcopy(source)
     resumed = make_benchmark_adamw(resumed_module, learning_rate=0.2)
     load_optimizer_state_dict(resumed, resumed_module, checkpoint)
+    assert all(param.grad is None for param in resumed_module.parameters())
     for module, optimizer in ((source, first), (resumed_module, resumed)):
         _update(module, optimizer, 3)
     for left, right in zip(source.parameters(), resumed_module.parameters()):
@@ -48,7 +49,6 @@ def test_optimizer_checkpoint_resumes_identically_and_is_cpu_snapshot() -> None:
             assert torch.equal(left[key], right[key])
             if isinstance(right[key], torch.Tensor):
                 assert right[key].device == resumed._masters[0].device
-    assert all(param.grad is None for param in resumed_module.parameters())
 
 
 def test_untrained_optimizer_checkpoint_roundtrip() -> None:
@@ -64,7 +64,7 @@ def test_untrained_optimizer_checkpoint_roundtrip() -> None:
     assert other.optimizer.param_groups[0]["lr"] == 0.01
 
 
-@pytest.mark.parametrize("corruption", ["signature", "master_shape", "master_nan", "counter", "moment_nan", "moment_shape"])
+@pytest.mark.parametrize("corruption", ["signature", "master_shape", "master_nan", "counter", "counter_mismatch", "missing_state", "moment_nan", "moment_shape"])
 def test_optimizer_checkpoint_rejects_corruption(corruption: str) -> None:
     module = _module()
     optimizer = make_benchmark_adamw(module, learning_rate=0.01)
@@ -78,6 +78,10 @@ def test_optimizer_checkpoint_rejects_corruption(corruption: str) -> None:
         checkpoint["masters"][0].flatten()[0] = float("nan")
     elif corruption == "counter":
         checkpoint["step_count"] = -1
+    elif corruption == "counter_mismatch":
+        checkpoint["step_count"] += 1
+    elif corruption == "missing_state":
+        checkpoint["torch_optimizer"]["state"].pop(next(iter(checkpoint["torch_optimizer"]["state"])))
     else:
         item = next(iter(checkpoint["torch_optimizer"]["state"].values()))
         key = "exp_avg" if corruption == "moment_nan" else "exp_avg_sq"
