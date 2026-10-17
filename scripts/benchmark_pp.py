@@ -9,6 +9,7 @@ microbatch sum on each DP rank; global = local × dp_size).
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
 from dataclasses import dataclass
@@ -279,12 +280,30 @@ def _time_loop(
     device: torch.device,
     after_warmup=None,
 ) -> tuple[float, float]:
+    """Measure steady-state steps after one full GC outside the timed region.
+
+    This aligns the synthetic benchmark's post-warmup state without disabling
+    automatic or explicit GC during measurement; it is not a production GC
+    optimization. Distributed ranks rendezvous after collection, outside timing.
+    """
     for _ in range(warmup):
         step_fn()
     if after_warmup is not None:
         after_warmup()
+    gc.collect(2)
     if device.type == "cuda":
         torch.cuda.synchronize()
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        if device.type == "cuda":
+            index = (
+                device.index if device.index is not None else torch.cuda.current_device()
+            )
+            dist.barrier(device_ids=[index])
+        else:
+            dist.barrier()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+    if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.nvtx.range_push("nano_megatron_benchmark_loop")
     t0 = time.perf_counter()
@@ -899,6 +918,7 @@ def write_markdown(results: list[BenchmarkResult], path: str) -> None:
 - **Precision**: see run command
 - **Tokens**: global = local_batch × seq × dp_size / wall_time
 - **Schedule**: non-interleaved 1F1B
+- **Timing boundary**: synthetic steady-state benchmark; one full generation-2 GC runs after warmup and its validation callback, before GPU synchronization/reset and the timer. Distributed ranks rendezvous after collection, outside timing. The caller's automatic GC policy is unchanged, and any subsequent GC remains part of measured steps. This boundary aligns framework benchmark state; it is not a production GC optimization or a claim about production training throughput.
 
 | Framework | Parallel | Microbatches | Local-BS | Seq | Hidden | Layers | Heads | Tok/s local | Tok/s global | Mem MB | Step ms |
 |-----------|----------|--------------|----------|-----|--------|--------|-------|-------------|--------------|--------|---------|
