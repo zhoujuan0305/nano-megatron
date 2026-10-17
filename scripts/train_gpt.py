@@ -67,12 +67,13 @@ def evaluate(stage, ctx, sampler, *, batch_size: int, microbatches: int, batches
     micro = batch_size // microbatches
     shape = (micro, sampler.sequence_length // ctx.tensor_parallel_size if ctx.sequence_parallel else sampler.sequence_length, stage.config.hidden_size)
     dtype = next(stage.parameters()).dtype
+    positions = torch.arange(sampler.sequence_length, device=device)
     for batch_index in range(batches):
         ids, _ = sampler.batch(batch_index, batch_size)
         ids = ids.to(device)
         for mb in ids.split(micro):
             hidden = mb if stage.is_first_stage else recv_forward(ctx, shape=shape, dtype=dtype, device=device)
-            output = stage(hidden)
+            output = stage(hidden, positions=positions)
             if stage.is_last_stage:
                 loss = stage.shifted_cross_entropy(output, mb)
                 if ctx.tensor_parallel_rank == 0:
