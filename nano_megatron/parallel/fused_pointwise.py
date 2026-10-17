@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from types import FunctionType
 
 import torch
 from torch import Tensor
@@ -35,9 +36,18 @@ def swiglu_reference(projected: Tensor) -> Tensor:
     return torch.nn.functional.silu(gate) * up
 
 
-@lru_cache(maxsize=2)
-def _compiled(name: str):
-    fn = rotary_reference if name == "rotary" else swiglu_reference
+def _signature(*tensors: Tensor):
+    return tuple((tuple(t.shape), t.stride(), t.dtype, t.device, t.requires_grad) for t in tensors)
+
+
+@lru_cache(maxsize=32)
+def _compiled(name: str, signature):
+    template = rotary_reference if name == "rotary" else swiglu_reference
+    # Dynamo's specialization limit is per code object. Each static tensor contract
+    # gets its own code identity, without resetting/changing global compiler state.
+    code = template.__code__.replace(co_name=f"{name}_{hash(signature)}")
+    fn = FunctionType(code, template.__globals__, code.co_name, template.__defaults__)
+    fn.__kwdefaults__ = template.__kwdefaults__
     return torch.compile(
         fn, fullgraph=True, dynamic=False, backend="inductor",
         options={"triton.cudagraphs": False},
@@ -52,11 +62,11 @@ def fused_rotary_emb(
         raise ValueError("fused_rotary_emb requires CUDA tensors; use rotary_reference on CPU")
     if x.device != freqs.device:
         raise ValueError("x and freqs must be on the same device")
-    return _compiled("rotary")(x, freqs, fp32_phase=fp32_phase)
+    return _compiled("rotary", (_signature(x, freqs), fp32_phase))(x, freqs, fp32_phase=fp32_phase)
 
 
 def fused_swiglu(projected: Tensor) -> Tensor:
     """Apply SiLU(gate) * up with a lazily compiled CUDA pointwise kernel."""
     if not projected.is_cuda:
         raise ValueError("fused_swiglu requires CUDA; use swiglu_reference on CPU")
-    return _compiled("swiglu")(projected)
+    return _compiled("swiglu", _signature(projected))(projected)
