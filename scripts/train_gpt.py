@@ -67,7 +67,7 @@ def evaluate(stage, ctx, sampler, *, batch_size: int, microbatches: int, batches
     micro = batch_size // microbatches
     shape = (micro, sampler.sequence_length // ctx.tensor_parallel_size if ctx.sequence_parallel else sampler.sequence_length, stage.config.hidden_size)
     dtype = next(stage.parameters()).dtype
-    positions = torch.arange(sampler.sequence_length, device=device)
+    positions = torch.arange(sampler.sequence_length, device=device).unsqueeze(0).expand(micro, -1)
     for batch_index in range(batches):
         ids, _ = sampler.batch(batch_index, batch_size)
         ids = ids.to(device)
