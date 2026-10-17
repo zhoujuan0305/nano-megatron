@@ -155,6 +155,8 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "flash", "unfused"],
         default="auto",
     )
+    p.add_argument("--fuse-rope", action="store_true", help="Nano CUDA pointwise RoPE via lazy Inductor (no CUDA Graphs).")
+    p.add_argument("--fuse-swiglu", action="store_true", help="Nano CUDA pointwise SwiGLU via lazy Inductor (no CUDA Graphs).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output", type=str, default=None)
     return p.parse_args()
@@ -183,6 +185,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     if getattr(args, "cuda_graph_warmup_steps", 50) < 1:
         raise ValueError("cuda-graph-warmup-steps must be positive")
     if getattr(args, "cuda_graphs", False):
+        if getattr(args, "fuse_rope", False) or getattr(args, "fuse_swiglu", False):
+            raise ValueError("CUDA Graphs with fused pointwise kernels are not validated")
         if not getattr(args, "deterministic", False):
             raise ValueError("--cuda-graphs requires --deterministic")
         supported = (
@@ -494,6 +498,8 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attn_backend=args.attn_backend,
+        fuse_rope=getattr(args, "fuse_rope", False),
+        fuse_swiglu=getattr(args, "fuse_swiglu", False),
         tp_comm_overlap=args.overlap_tp_dgrad,
     )
 

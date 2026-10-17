@@ -235,8 +235,12 @@ class TPCausalSelfAttention(nn.Module):
         # Apply RoPE if configured
         if self.rotary_emb and positions is not None:
             freqs = self._get_rotary_freqs(x.device)[positions]
-            q = apply_rotary_emb(q, freqs)
-            k = apply_rotary_emb(k, freqs)
+            rotary = apply_rotary_emb
+            if self.config.fuse_rope:
+                from nano_megatron.parallel.fused_pointwise import fused_rotary_emb
+                rotary = fused_rotary_emb
+            q = rotary(q, freqs)
+            k = rotary(k, freqs)
 
         # Repeat KV heads for GQA
         k = self._repeat_kv(k, self.num_heads_per_group)
@@ -385,7 +389,11 @@ class TPMLP(nn.Module):
         
         if self.config.gated_linear_unit:
             # SwiGLU activation
-            h = swiglu(h)
+            if self.config.fuse_swiglu:
+                from nano_megatron.parallel.fused_pointwise import fused_swiglu
+                h = fused_swiglu(h)
+            else:
+                h = swiglu(h)
         else:
             # GELU activation
             h = gelu_erf(h)

@@ -46,7 +46,12 @@ def model_config_dict(config: ReferenceGPTConfig) -> dict:
         if isinstance(value, torch.dtype):
             return str(value)
         raise TypeError(f"unsupported model configuration value: {type(value)}")
-    return json.loads(json.dumps(asdict(config), default=encode))
+    values = asdict(config)
+    # Preserve schema-1 eager checkpoint semantics; enabled numerical paths remain explicit.
+    for name in ("fuse_rope", "fuse_swiglu"):
+        if not values[name]:
+            values.pop(name)
+    return json.loads(json.dumps(values, default=encode))
 
 
 def advance_data_hash(previous: str, batch_id: str) -> str:
