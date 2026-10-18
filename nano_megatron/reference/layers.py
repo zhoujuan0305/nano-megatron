@@ -220,9 +220,11 @@ class CausalSelfAttention(nn.Module):
 
         # Apply RoPE if configured
         if self.rotary_emb and positions is not None:
-            # Move freqs to the same device as x
-            freqs = self.freqs.to(x.device)
-            freqs = freqs[positions]  # [B, S, D]
+            # Keep FP32 phases on the active device instead of copying the CPU
+            # table (and synchronizing its stream) on every microbatch.
+            if self.freqs.device != x.device:
+                self.freqs = self.freqs.to(x.device)
+            freqs = self.freqs[positions]  # [B, S, D]
             rotary = apply_rotary_emb
             if self.config.fuse_rope:
                 from nano_megatron.parallel.fused_pointwise import fused_rotary_emb
