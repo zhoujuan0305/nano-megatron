@@ -16,9 +16,14 @@ def test_flash_cp1_honors_process_determinism(monkeypatch, deterministic):
         return result
     monkeypatch.setitem(sys.modules,'flash_attn',SimpleNamespace(flash_attn_func=flash))
     monkeypatch.setattr(torch,'are_deterministic_algorithms_enabled',lambda:deterministic)
-    monkeypatch.setattr(backend,'_to_bshd',lambda x:x)
-    monkeypatch.setattr(backend,'_to_bhsd',lambda x:x)
+    layouts=[]
+    def layout(x, *, allow_view=False):
+        layouts.append(allow_view)
+        return x
+    monkeypatch.setattr(backend,'_to_bshd',layout)
+    monkeypatch.setattr(backend,'_to_bhsd',layout)
     q=SimpleNamespace(dim=lambda:4,shape=(1,2,8,16),device=torch.device('cuda'),dtype=torch.bfloat16)
     assert backend.flash_causal_attention(q,q,q,scale=0.25) is result
+    assert layouts == [True, True, True, True]
     if deterministic:assert calls[0]['deterministic'] is True
     else:assert 'deterministic' not in calls[0]  # Default optional-version compatibility.
