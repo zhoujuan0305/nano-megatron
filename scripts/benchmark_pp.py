@@ -93,6 +93,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
+        "--disable-bucketing-after-first-stage",
+        action="store_true",
+        help=(
+            "Nano only: use one DP gradient bucket per contiguous dtype run on "
+            "pipeline stages after stage 0. Keeps final-backward async reduction; "
+            "may reduce communication/PP contention at the cost of DP overlap."
+        ),
+    )
+    p.add_argument(
         "--optimizer",
         choices=["none", "sgd", "adamw"],
         default="none",
@@ -180,7 +189,17 @@ def _resolve_dp(args: argparse.Namespace) -> int:
     return args.dp_size
 
 
+def _disable_stage_bucketing(args: argparse.Namespace, pipeline_rank: int) -> bool:
+    return (
+        getattr(args, "disable_bucketing_after_first_stage", False)
+        and pipeline_rank > 0
+    )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
+    if (getattr(args, "disable_bucketing_after_first_stage", False)
+            and args.framework != "nano"):
+        raise ValueError("--disable-bucketing-after-first-stage supports nano only")
     if getattr(args, "deterministic", False) and args.framework != "nano":
         raise ValueError("--deterministic currently supports --framework=nano only")
     if getattr(args, "cuda_graph_warmup_steps", 50) < 1:
@@ -544,6 +563,9 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 stage,
                 ctx,
                 bucket_cap_mb=args.bucket_cap_mb,
+                disable_bucketing=_disable_stage_bucketing(
+                    args, ctx.pipeline_parallel_rank
+                ),
                 overlap_grad_reduce=args.overlap_grad_reduce,
             )
             stage_mod = ddp.module
@@ -575,6 +597,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                 f"pp={args.pp_size} tp={args.tp_size} dp={dp_size} "
                 f"microbatches={args.num_microbatches} "
                 f"bucket_cap_mb={args.bucket_cap_mb} "
+                f"disable_bucketing_after_first_stage={getattr(args, 'disable_bucketing_after_first_stage', False)} "
                 f"precision={args.precision} sp={args.sequence_parallel} "
                 f"collective_backend={backend_detail} "
                 f"optimizer={args.optimizer} "

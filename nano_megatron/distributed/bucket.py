@@ -209,7 +209,14 @@ class GradBucket:
 def build_buckets(
     module: nn.Module,
     bucket_cap_mb: float = 25.0,
+    *,
+    disable_bucketing: bool = False,
 ) -> list[GradBucket]:
+    """Build reverse-order buckets, optionally ignoring the size target.
+
+    Dtype boundaries still split buckets: one flat buffer cannot mix dtypes.
+    For a homogeneous stage, disabling bucketing produces one reduction.
+    """
     if bucket_cap_mb <= 0:
         raise ValueError(f"bucket_cap_mb must be > 0, got {bucket_cap_mb}")
     cap_bytes = int(bucket_cap_mb * 1024 * 1024)
@@ -248,7 +255,7 @@ def build_buckets(
         # parameter is indivisible, so closing the bucket after crossing the
         # threshold avoids systematically under-filled buckets when adjacent
         # transformer weights are each a large fraction of the target.
-        if current_bytes >= cap_bytes:
+        if not disable_bucketing and current_bytes >= cap_bytes:
             flush()
     flush()
     return buckets

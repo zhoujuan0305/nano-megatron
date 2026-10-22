@@ -177,6 +177,13 @@ the native library's compile-time rank count must equal each routed group
 size. Nano NCCL is an optional scoped backend, not an NCCL API-compatible
 replacement.
 
+`benchmark_pp.py --framework nano --disable-bucketing-after-first-stage`
+optionally disables size-based DP gradient bucketing after PP stage 0. Dtype
+boundaries, final-backward asynchronous reduction, and stage 0's bucket target
+are unchanged. It is off by default: fewer reductions may reduce pipeline
+contention but can also lose DP overlap, so benchmark the target layout.
+The DDP constructor also accepts `disable_bucketing=True` directly.
+
 All sizes and modes: [performance.md](performance.md).
 
 ### Verify Architecture

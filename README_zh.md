@@ -166,6 +166,12 @@ process-group 对象路由 AllReduce、AllGather 与 ReduceScatter。广播、ba
 communicator；原生库的编译期 rank 数必须等于每个被路由 group 的大小。
 Nano NCCL 是可选的限定范围后端，不承诺兼容 NCCL API。
 
+`benchmark_pp.py --framework nano --disable-bucketing-after-first-stage`
+可选地取消 PP stage 0 之后的 DP 梯度按大小分桶，保留 dtype 边界、
+最后一次 backward 的异步归约及 stage 0 的原桶配置。默认关闭；此策略
+可能减少通信与流水线的竞争，也可能损失 DP overlap，需对目标布局实测。
+DDP 构造器也可直接传入 `disable_bucketing=True`。
+
 全部规模与并行组合见 [performance.md](performance.md)。
 
 ### 静态训练步 CUDA Graph（实验性、默认关闭）

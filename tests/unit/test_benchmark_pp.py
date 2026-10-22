@@ -212,6 +212,21 @@ def test_nano_channel_cli_keeps_four_default_and_accepts_eight(monkeypatch):
     assert parse_args().nano_nccl_channels == 8
 
 
+def test_stage_bucketing_cli_is_opt_in_and_only_applies_after_stage_zero(monkeypatch):
+    from scripts.benchmark_pp import parse_args, _disable_stage_bucketing, _validate_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
+    args = parse_args()
+    assert not args.disable_bucketing_after_first_stage
+    assert not any(_disable_stage_bucketing(args, rank) for rank in range(4))
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--disable-bucketing-after-first-stage"])
+    args = parse_args()
+    _validate_args(args)
+    assert [_disable_stage_bucketing(args, rank) for rank in range(4)] == [False, True, True, True]
+    args.framework = "megatron"
+    with pytest.raises(ValueError, match="supports nano only"):
+        _validate_args(args)
+
+
 def test_graph_cli_defaults_off_and_validated_configuration(monkeypatch):
     from scripts.benchmark_pp import parse_args, _validate_args
     monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])

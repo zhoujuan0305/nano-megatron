@@ -23,6 +23,7 @@ class DistributedDataParallel(nn.Module):
         ctx: ParallelContext,
         *,
         bucket_cap_mb: float = 25.0,
+        disable_bucketing: bool = False,
         broadcast_buffers: bool = False,
         overlap_grad_reduce: bool = False,
         grad_sync_backend: AllReduceBackend | None = None,
@@ -46,7 +47,9 @@ class DistributedDataParallel(nn.Module):
         )
         self._sync_group_size = self._mean_divisor
         self._overlap_grad_reduce = overlap_grad_reduce
-        self._buckets: list[GradBucket] = build_buckets(module, bucket_cap_mb)
+        self._buckets: list[GradBucket] = build_buckets(
+            module, bucket_cap_mb, disable_bucketing=disable_bucketing
+        )
         self._param_to_bucket: dict[nn.Parameter, GradBucket] = {
             p: bucket for bucket in self._buckets for p in bucket.params
         }
