@@ -4,6 +4,8 @@ import torch
 
 from nano_megatron.parallel.attention_backend import (
     _online_softmax_combine,
+    _to_bhsd,
+    _to_bshd,
     flash_attn_available,
     flash_ring_causal_attention,
     resolve_attention_backend,
@@ -62,6 +64,84 @@ def test_resolve_invalid_requested():
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd_view", "last_stride2"])
+def test_attention_layout_helpers_allow_view(batch, dtype, layout):
+    b, h, s, d = batch, 3, 5, 4
+    if layout == "bhsd":
+        x = torch.randn(b, h, s, d, dtype=dtype)
+    elif layout == "bshd_view":
+        x = torch.randn(b, s, h, d, dtype=dtype).transpose(1, 2)
+    else:
+        base = torch.randn(b, h, s, d * 2, dtype=dtype)
+        x = base[..., ::2]
+    x = x.detach().requires_grad_(True)
+    for helper in (_to_bshd, _to_bhsd):
+        default = helper(x)
+        assert default.is_contiguous()
+        viewed = helper(x, allow_view=True)
+        expected = x.transpose(1, 2)
+        torch.testing.assert_close(viewed, expected, rtol=0, atol=0)
+        if layout != "last_stride2":
+            assert viewed.stride(-1) == 1
+            assert viewed.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+        else:
+            assert viewed.is_contiguous()
+            assert viewed.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        grad = torch.randn_like(viewed)
+        actual_grad = torch.autograd.grad(viewed, x, grad, retain_graph=True)[0]
+        expected_grad = torch.autograd.grad(expected, x, grad, retain_graph=True)[0]
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd_view", "last_stride2"])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not flash_attn_available(),
+    reason="requires CUDA and flash_attn",
+)
+def test_flash_attention_view_layout_matches_contiguous_reference(batch, dtype, layout):
+    from flash_attn import flash_attn_func
+    from nano_megatron.parallel.attention_backend import flash_causal_attention
+
+    torch.manual_seed(4)
+    b, h, s, d = batch, 2, 32, 32
+    device = "cuda"
+    inputs = []
+    refs = []
+    for _ in range(3):
+        if layout == "bhsd":
+            value = torch.randn(b, h, s, d, device=device, dtype=dtype)
+        elif layout == "bshd_view":
+            value = torch.randn(b, s, h, d, device=device, dtype=dtype).transpose(1, 2)
+        else:
+            storage = torch.randn(b, h, s, d * 2, device=device, dtype=dtype)
+            value = storage[..., ::2]
+        value = value.detach().requires_grad_(True)
+        inputs.append(value)
+        refs.append(value.detach().contiguous().requires_grad_(True))
+
+    actual = flash_causal_attention(*inputs, scale=d ** -0.5)
+    expected_bshd = flash_attn_func(
+        *[x.transpose(1, 2).contiguous() for x in refs],
+        dropout_p=0.0,
+        softmax_scale=d ** -0.5,
+        causal=True,
+    )
+    expected = expected_bshd.transpose(1, 2).contiguous()
+    upstream_storage = torch.randn(b, h, s, d * 2, device=device, dtype=dtype)
+    upstream = upstream_storage[..., ::2]
+    # Use the existing Flash-vs-reference tolerances; backward can be
+    # nondeterministic when PyTorch's deterministic policy is not enabled.
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    actual_grads = torch.autograd.grad(actual, inputs, upstream)
+    expected_grads = torch.autograd.grad(expected, refs, upstream)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=5e-2, rtol=5e-2)
 
 
 def test_unfused_matches_reference_math():

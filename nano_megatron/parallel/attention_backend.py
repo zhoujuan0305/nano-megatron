@@ -172,14 +172,20 @@ def unfused_causal_attention(
     return torch.matmul(probs, v)
 
 
-def _to_bshd(x: Tensor) -> Tensor:
+def _to_bshd(x: Tensor, *, allow_view: bool = False) -> Tensor:
     """Convert ``[B, H, S, D]`` → ``[B, S, H, D]`` (flash_attn layout)."""
-    return x.transpose(1, 2).contiguous()
+    transposed = x.transpose(1, 2)
+    if allow_view and transposed.stride(-1) == 1:
+        return transposed
+    return transposed.contiguous()
 
 
-def _to_bhsd(x: Tensor) -> Tensor:
+def _to_bhsd(x: Tensor, *, allow_view: bool = False) -> Tensor:
     """Convert ``[B, S, H, D]`` → ``[B, H, S, D]`` (project layout)."""
-    return x.transpose(1, 2).contiguous()
+    transposed = x.transpose(1, 2)
+    if allow_view and transposed.stride(-1) == 1:
+        return transposed
+    return transposed.contiguous()
 
 
 def flash_causal_attention(
@@ -249,15 +255,15 @@ def flash_causal_attention(
     # Leave the default call unchanged for older optional flash_attn versions.
     deterministic = {"deterministic": True} if torch.are_deterministic_algorithms_enabled() else {}
     out = flash_attn_func(
-        _to_bshd(q),
-        _to_bshd(k),
-        _to_bshd(v),
+        _to_bshd(q, allow_view=True),
+        _to_bshd(k, allow_view=True),
+        _to_bshd(v, allow_view=True),
         dropout_p=dropout_p,
         softmax_scale=scale,
         causal=True,
         **deterministic,
     )
-    return _to_bhsd(out)
+    return _to_bhsd(out, allow_view=True)
 
 
 def _online_softmax_combine(
