@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
+        "--tp-attention-views", action="store_true",
+        help="Nano only: allow TP attention layout views on the CP1 Flash path.",
+    )
+    p.add_argument(
         "--disable-bucketing-after-first-stage",
         action="store_true",
         help=(
@@ -197,6 +201,9 @@ def _disable_stage_bucketing(args: argparse.Namespace, pipeline_rank: int) -> bo
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if (getattr(args, "tp_attention_views", False)
+            and args.framework != "nano"):
+        raise ValueError("--tp-attention-views supports nano only")
     if (getattr(args, "disable_bucketing_after_first_stage", False)
             and args.framework != "nano"):
         raise ValueError("--disable-bucketing-after-first-stage supports nano only")
@@ -519,6 +526,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attn_backend=args.attn_backend,
+        tp_attention_views=getattr(args, "tp_attention_views", False),
         fuse_rope=getattr(args, "fuse_rope", False),
         fuse_swiglu=getattr(args, "fuse_swiglu", False),
         rope_fp32_phase=getattr(args, "rope_fp32_phase", False),

@@ -198,15 +198,22 @@ class TPCausalSelfAttention(nn.Module):
             self._rotary_freqs_cache_device = None
         return super()._apply(fn, recurse=recurse)
 
-    def _split_heads(self, x: Tensor, num_heads: int) -> Tensor:
+    def _split_heads(
+        self, x: Tensor, num_heads: int, *, allow_view: bool = False
+    ) -> Tensor:
         batch, seq_len, _ = x.shape
-        x = x.view(batch, seq_len, num_heads, self.head_dim)
-        return x.transpose(1, 2).contiguous()
+        x = x.view(batch, seq_len, num_heads, self.head_dim).transpose(1, 2)
+        if allow_view and x.stride(-1) == 1:
+            return x
+        return x.contiguous()
 
-    def _merge_heads(self, x: Tensor) -> Tensor:
+    def _merge_heads(self, x: Tensor, *, allow_view: bool = False) -> Tensor:
         batch, _, seq_len, _ = x.shape
-        x = x.transpose(1, 2).contiguous()
-        return x.view(batch, seq_len, self.local_num_heads * self.head_dim)
+        x = x.transpose(1, 2)
+        merged = x.reshape(batch, seq_len, self.local_num_heads * self.head_dim)
+        if allow_view and merged._base is not None:
+            return merged
+        return merged.contiguous()
 
     def _repeat_kv(self, x: Tensor, n_rep: int) -> Tensor:
         """Repeat KV heads for Group Query Attention."""
@@ -228,9 +235,21 @@ class TPCausalSelfAttention(nn.Module):
             k = self.k_proj(x)
             v = self.v_proj(x)
 
-        q = self._split_heads(q, self.local_num_heads)
-        k = self._split_heads(k, self.local_num_kv_heads)
-        v = self._split_heads(v, self.local_num_kv_heads)
+        requested = getattr(self.config, "attn_backend", "auto")
+        backend = resolve_attention_backend(
+            requested=requested,
+            dtype=q.dtype,
+            device=q.device,
+            return_activations=False,
+        )
+        allow_views = (
+            getattr(self.config, "tp_attention_views", False)
+            and self._cp_size == 1
+            and backend == "flash"
+        )
+        q = self._split_heads(q, self.local_num_heads, allow_view=allow_views)
+        k = self._split_heads(k, self.local_num_kv_heads, allow_view=allow_views)
+        v = self._split_heads(v, self.local_num_kv_heads, allow_view=allow_views)
 
         # Apply RoPE if configured
         if self.rotary_emb and positions is not None:
@@ -247,13 +266,6 @@ class TPCausalSelfAttention(nn.Module):
         v = self._repeat_kv(v, self.num_heads_per_group)
 
         # Attention: flash (cp=1 or CP chunked) or unfused AG-KV.
-        requested = getattr(self.config, "attn_backend", "auto")
-        backend = resolve_attention_backend(
-            requested=requested,
-            dtype=q.dtype,
-            device=q.device,
-            return_activations=False,
-        )
         dropout_p = float(getattr(self.config, "attention_dropout", 0.0))
         if backend == "flash" and self._cp_size > 1:
             # CP: AG-KV + chunked flash (contiguous or zigzag pack; not P2P ring).
@@ -330,7 +342,9 @@ class TPCausalSelfAttention(nn.Module):
             )
         else:
             context = unfused_causal_attention(q, k, v, scale=self.scale)
-        attn_out = self.out_proj(self._merge_heads(context))
+        attn_out = self.out_proj(
+            self._merge_heads(context, allow_view=allow_views)
+        )
         return attn_out
 
 

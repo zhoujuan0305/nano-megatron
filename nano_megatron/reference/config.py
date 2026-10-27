@@ -39,6 +39,7 @@ class ReferenceGPTConfig:
     hidden_dropout: float = 0.0
     attention_dropout: float = 0.0
     attn_backend: Literal["auto", "flash", "unfused"] = "auto"
+    tp_attention_views: bool = False
     tp_comm_overlap: bool = False
     # Opt-in CUDA pointwise kernels; lazy Inductor compilation, no CUDA Graphs.
     fuse_rope: bool = False
