@@ -108,6 +108,10 @@ class PipelineStage(nn.Module):
             tp_size=self._tp_size,
         )
 
+        if config.fuse_wgrad_accum:
+            from nano_megatron.parallel.wgrad import configure_wgrad_fusion
+            configure_wgrad_fusion(self)
+
     @property
     def is_first_stage(self) -> bool:
         return self._pp_rank == 0

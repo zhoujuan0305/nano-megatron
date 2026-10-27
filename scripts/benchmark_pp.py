@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--bucket-cap-mb", type=float, default=25.0)
     p.add_argument(
+        "--fuse-wgrad-accum", action="store_true",
+        help="Nano TP only: direct wgrad accumulation during explicit training backward.",
+    )
+    p.add_argument(
         "--tp-attention-views", action="store_true",
         help="Nano only: allow TP attention layout views on the CP1 Flash path.",
     )
@@ -201,6 +205,11 @@ def _disable_stage_bucketing(args: argparse.Namespace, pipeline_rank: int) -> bo
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "fuse_wgrad_accum", False):
+        if args.framework != "nano" or args.tp_size <= 1:
+            raise ValueError("--fuse-wgrad-accum requires Nano with TP>1")
+        if getattr(args, "cuda_graphs", False):
+            raise ValueError("fused wgrad CUDA Graph capture is not validated")
     if (getattr(args, "tp_attention_views", False)
             and args.framework != "nano"):
         raise ValueError("--tp-attention-views supports nano only")
@@ -531,6 +540,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
         fuse_swiglu=getattr(args, "fuse_swiglu", False),
         rope_fp32_phase=getattr(args, "rope_fp32_phase", False),
         tp_comm_overlap=args.overlap_tp_dgrad,
+        fuse_wgrad_accum=getattr(args, "fuse_wgrad_accum", False),
     )
 
     collective_backend = None
@@ -617,6 +627,7 @@ def benchmark_nano(args: argparse.Namespace, dp_size: int) -> BenchmarkResult:
                     if args.optimizer == "adamw"
                     else ""
                 )
+                + f"fuse_wgrad_accum={getattr(args, 'fuse_wgrad_accum', False)} "
                 + f"overlap_dp={args.overlap_grad_reduce} "
                 f"overlap_tp={args.overlap_tp_dgrad} "
                 f"overlap_pp={args.overlap_p2p_comm}",

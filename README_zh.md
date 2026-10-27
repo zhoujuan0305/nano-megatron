@@ -174,6 +174,22 @@ DDP 构造器也可直接传入 `disable_bucketing=True`。
 
 全部规模与并行组合见 [performance.md](performance.md)。
 
+### TP 反向与布局候选（实验性、默认关闭）
+
+`benchmark_pp.py --tp-attention-views` 仅在 CP1 实际 Flash 路径允许 TP
+head split/merge 使用布局视图；不能直接外推到其它 attention 路径。
+
+`--fuse-wgrad-accum` 仅支持 Nano TP>1 的显式训练反向入口。wgrad GEMM
+用 `addmm(out=param.grad)` 直接累加到梯度，保留 DDP bucket view、no_sync
+和梯度就绪通知，不通过省略梯度同步获得速度。训练 schedule 调用
+`nano_megatron.parallel.wgrad.fused_wgrad_backward`；在该入口之外，普通
+`backward`/`autograd.grad` 仍返回正常梯度，不手动累加。该训练入口不支持
+高阶梯度、并发使用同一参数、同一 microbatch 内重复使用线性权重、共享或
+绑定权重、autocast、whole-step CUDA Graph；参数和激活需显式使用同一精度。
+
+这些开关默认关闭；需在目标布局完成正确性与单因素性能验证后选择，
+不保证每个形状或并行组合都有收益。
+
 ### 静态训练步 CUDA Graph（实验性、默认关闭）
 
 `benchmark_pp.py --cuda-graphs --deterministic` 捕获完整 forward/backward 与

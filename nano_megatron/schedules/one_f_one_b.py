@@ -198,7 +198,12 @@ def forward_backward_1f1b(
         )
         sync_ctx = ddp.no_sync() if defer_dp_sync else nullcontext()
         with sync_ctx:
-            if is_last:
+            if getattr(stage.config, "fuse_wgrad_accum", False):
+                from nano_megatron.parallel.wgrad import fused_wgrad_backward
+                if not is_last:
+                    assert output_tensor_grad is not None
+                fused_wgrad_backward(stage, output_tensor, output_tensor_grad)
+            elif is_last:
                 # output_tensor is the scaled microbatch loss.
                 output_tensor.backward()
             else:

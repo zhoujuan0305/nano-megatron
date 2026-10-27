@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nano_megatron.distributed.backend import CommBackend
+from nano_megatron.parallel.wgrad import accumulate_wgrad, notify_wgrad_ready
 
 SEQ_DIM = 1
 
@@ -499,7 +500,14 @@ class _LinearWithGradOverlap(torch.autograd.Function):
         backend: CommBackend,
         tp_size: int,
         sequence_parallel: bool,
+        fuse_wgrad_accum: bool = False,
     ) -> Tensor:
+        if fuse_wgrad_accum and torch.is_autocast_enabled(x.device.type):
+            raise ValueError("fused wgrad requires explicit parameter/input dtypes, not autocast")
+        ctx.parameter = weight
+        ctx.fuse_wgrad_accum = fuse_wgrad_accum
+        if fuse_wgrad_accum:
+            weight._nano_fuse_wgrad_accum = True
         if sequence_parallel and tp_size > 1:
             linear_input = _all_gather_along_sequence(
                 x, group=group, backend=backend, group_size=tp_size
@@ -518,7 +526,7 @@ class _LinearWithGradOverlap(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any, grad_output: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor | None, None, None, None, None]:
+    ) -> tuple[Any, ...]:
         linear_input, weight = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_input_full = grad_output.matmul(weight)
@@ -540,14 +548,21 @@ class _LinearWithGradOverlap(torch.autograd.Function):
         else:
             grad_input = grad_input_full
 
+        fused = (ctx.needs_input_grad[1] and ctx.fuse_wgrad_accum
+                 and accumulate_wgrad(ctx.parameter, grad_output, linear_input))
         grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
-        input_2d = linear_input.reshape(-1, linear_input.size(-1))
-        grad_weight = grad_output_2d.t().matmul(input_2d)
+        grad_weight = None
+        if ctx.needs_input_grad[1] and not fused:
+            input_2d = linear_input.reshape(-1, linear_input.size(-1))
+            grad_weight = grad_output_2d.t().matmul(input_2d)
         grad_bias = grad_output_2d.sum(dim=0) if ctx.has_bias else None
 
         if hasattr(work, "wait"):
             work.wait()
-        return grad_input, grad_weight, grad_bias, None, None, None, None
+        if fused:
+            notify_wgrad_ready(ctx.parameter)
+        result = (grad_input, grad_weight, grad_bias, None, None, None, None, None)
+        return result[:len(ctx.needs_input_grad)]
 
 
 class ColumnParallelLinear(nn.Module):
@@ -563,6 +578,7 @@ class ColumnParallelLinear(nn.Module):
         weight_is_local: bool = False,
         sequence_parallel: bool = False,
         overlap_dgrad: bool = False,
+        fuse_wgrad_accum: bool = False,
     ) -> None:
         super().__init__()
         if weight_is_local:
@@ -579,6 +595,9 @@ class ColumnParallelLinear(nn.Module):
         self.buffer_manager = CommunicationBuffer()
         self.sequence_parallel = sequence_parallel
         self.overlap_dgrad = overlap_dgrad
+        self.fuse_wgrad_accum = fuse_wgrad_accum
+        if fuse_wgrad_accum:
+            self.weight._nano_fuse_wgrad_accum = True
 
     def forward(self, x: Tensor) -> Tensor:
         if self.overlap_dgrad:
@@ -590,6 +609,7 @@ class ColumnParallelLinear(nn.Module):
                 self.backend,
                 self.tp_size,
                 self.sequence_parallel,
+                self.fuse_wgrad_accum,
             )
         # SP path: input is sequence-sharded; gather full S then matmul.
         # No CopyToTPRegion — grad reduce-scatter is handled by the gather op.
@@ -600,6 +620,10 @@ class ColumnParallelLinear(nn.Module):
         else:
             x = _CopyToTPRegion.apply(
                 x, self.group, self.backend, self.buffer_manager
+            )
+        if self.fuse_wgrad_accum:
+            return _LinearWithGradOverlap.apply(
+                x, self.weight, self.bias, None, None, 1, False, True
             )
         return F.linear(x, self.weight, self.bias)
 
@@ -615,6 +639,7 @@ class RowParallelLinear(nn.Module):
         backend: CommBackend,
         *,
         sequence_parallel: bool = False,
+        fuse_wgrad_accum: bool = False,
     ) -> None:
         super().__init__()
         w_local, b_local = row_shard(weight, bias, tp_rank, tp_size)
@@ -626,13 +651,21 @@ class RowParallelLinear(nn.Module):
         self.backend = backend
         self.buffer_manager = CommunicationBuffer()
         self.sequence_parallel = sequence_parallel
+        self.fuse_wgrad_accum = fuse_wgrad_accum
+        if fuse_wgrad_accum:
+            self.weight._nano_fuse_wgrad_accum = True
         # Bias is added after reduce-scatter on the local sequence shard, so
         # its grad is partial and must be summed across the TP group.
         if sequence_parallel and self.bias is not None:
             mark_sequence_parallel_parameter(self.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        out = F.linear(x, self.weight, bias=None)
+        if self.fuse_wgrad_accum:
+            out = _LinearWithGradOverlap.apply(
+                x, self.weight, None, None, None, 1, False, True
+            )
+        else:
+            out = F.linear(x, self.weight, bias=None)
         # SP path: reduce-scatter partial outputs to local sequence shard.
         # Bias is full and applied after the collective (Megatron-style).
         if self.sequence_parallel:

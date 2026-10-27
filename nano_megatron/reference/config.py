@@ -41,12 +41,15 @@ class ReferenceGPTConfig:
     attn_backend: Literal["auto", "flash", "unfused"] = "auto"
     tp_attention_views: bool = False
     tp_comm_overlap: bool = False
+    fuse_wgrad_accum: bool = False
     # Opt-in CUDA pointwise kernels; lazy Inductor compilation, no CUDA Graphs.
     fuse_rope: bool = False
     fuse_swiglu: bool = False
     rope_fp32_phase: bool = False
 
     def __post_init__(self) -> None:
+        if self.fuse_wgrad_accum and self.tie_word_embeddings:
+            raise ValueError("fused wgrad does not support tied embeddings")
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by "

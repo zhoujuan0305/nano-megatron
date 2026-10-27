@@ -540,6 +540,10 @@ class TPGPT(nn.Module):
             tp_size=self._tp_size,
         )
 
+        if config.fuse_wgrad_accum:
+            from nano_megatron.parallel.wgrad import configure_wgrad_fusion
+            configure_wgrad_fusion(self)
+
     def finish_sequence_parallel_grad_sync(self) -> int:
         """Coalesce and sum replicated SP parameter gradients over TP."""
         return self._sequence_parallel_grad_sync.finish()

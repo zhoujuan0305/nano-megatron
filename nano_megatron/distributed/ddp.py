@@ -124,6 +124,9 @@ class DistributedDataParallel(nn.Module):
             torch.Tensor, "register_post_accumulate_grad_hook"
         )
         for param in self._param_to_bucket:
+            # Explicit fused backward writes .grad without AccumulateGrad. The
+            # same readiness method still owns no_sync and bucket ordering.
+            param._nano_wgrad_ready = self._on_param_grad_ready
             if use_post_accumulate:
                 handle = param.register_post_accumulate_grad_hook(
                     self._make_post_accumulate_hook(param)
