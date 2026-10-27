@@ -136,6 +136,9 @@ class PipelineStage(nn.Module):
                 "shifted_cross_entropy is only valid on the last pipeline stage "
                 f"(pp_rank={self._pp_rank}, pp_size={self._pp_size})"
             )
+        if (getattr(self.config, "vocab_ce_fp32", False)
+                and logits.dtype in (torch.float16, torch.bfloat16)):
+            logits = logits.float()
         if self._tp_size == 1:
             return ref_shifted_cross_entropy(
                 logits, labels, ignore_index=ignore_index

@@ -561,6 +561,9 @@ class TPGPT(nn.Module):
         local prediction pairs and scales the sum so DDP mean over the DP×CP
         group recovers full-sequence mean-CE gradients.
         """
+        if (getattr(self.config, "vocab_ce_fp32", False)
+                and logits.dtype in (torch.float16, torch.bfloat16)):
+            logits = logits.float()
         if self._cp_size == 1:
             return vocab_parallel_cross_entropy(
                 logits,

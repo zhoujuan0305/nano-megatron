@@ -212,6 +212,18 @@ def test_nano_channel_cli_keeps_four_default_and_accepts_eight(monkeypatch):
     assert parse_args().nano_nccl_channels == 8
 
 
+def test_fp32_vocab_ce_cli_is_opt_in_and_nano_only(monkeypatch):
+    from scripts.benchmark_pp import parse_args, _validate_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
+    assert parse_args().vocab_ce_fp32 is False
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--vocab-ce-fp32"])
+    args = parse_args()
+    _validate_args(args)
+    args.framework = "megatron"
+    with pytest.raises(ValueError, match="supports Nano only"):
+        _validate_args(args)
+
+
 def test_fused_wgrad_cli_is_opt_in_tp_only_and_rejects_graphs(monkeypatch):
     from scripts.benchmark_pp import parse_args, _validate_args
     monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])

@@ -42,6 +42,7 @@ class ReferenceGPTConfig:
     tp_attention_views: bool = False
     tp_comm_overlap: bool = False
     fuse_wgrad_accum: bool = False
+    vocab_ce_fp32: bool = False
     # Opt-in CUDA pointwise kernels; lazy Inductor compilation, no CUDA Graphs.
     fuse_rope: bool = False
     fuse_swiglu: bool = False
