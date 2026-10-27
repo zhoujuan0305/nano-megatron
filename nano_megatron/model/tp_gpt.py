@@ -53,6 +53,16 @@ from nano_megatron.reference.layers import (
 from nano_megatron.reference.model import ReferenceGPT
 
 
+def _allow_tp_attention_views(
+    config: ReferenceGPTConfig, cp_size: int, backend: str
+) -> bool:
+    return (
+        getattr(config, "tp_attention_views", False)
+        and cp_size == 1
+        and backend == "flash"
+    )
+
+
 def _validate_tp_constraints(config: ReferenceGPTConfig, tp_size: int) -> None:
     if tp_size < 1:
         raise ValueError(f"tensor_parallel_size must be >= 1, got {tp_size}")
@@ -210,10 +220,9 @@ class TPCausalSelfAttention(nn.Module):
     def _merge_heads(self, x: Tensor, *, allow_view: bool = False) -> Tensor:
         batch, _, seq_len, _ = x.shape
         x = x.transpose(1, 2)
-        merged = x.reshape(batch, seq_len, self.local_num_heads * self.head_dim)
-        if allow_view and merged._base is not None:
-            return merged
-        return merged.contiguous()
+        if not allow_view:
+            x = x.contiguous()
+        return x.reshape(batch, seq_len, self.local_num_heads * self.head_dim)
 
     def _repeat_kv(self, x: Tensor, n_rep: int) -> Tensor:
         """Repeat KV heads for Group Query Attention."""
@@ -242,10 +251,8 @@ class TPCausalSelfAttention(nn.Module):
             device=q.device,
             return_activations=False,
         )
-        allow_views = (
-            getattr(self.config, "tp_attention_views", False)
-            and self._cp_size == 1
-            and backend == "flash"
+        allow_views = _allow_tp_attention_views(
+            self.config, self._cp_size, backend
         )
         q = self._split_heads(q, self.local_num_heads, allow_view=allow_views)
         k = self._split_heads(k, self.local_num_kv_heads, allow_view=allow_views)

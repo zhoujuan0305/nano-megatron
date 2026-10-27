@@ -212,6 +212,20 @@ def test_nano_channel_cli_keeps_four_default_and_accepts_eight(monkeypatch):
     assert parse_args().nano_nccl_channels == 8
 
 
+def test_tp_attention_views_cli_is_opt_in_and_nano_only(monkeypatch):
+    from scripts.benchmark_pp import parse_args, _validate_args
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
+    args = parse_args()
+    assert not args.tp_attention_views
+    monkeypatch.setattr("sys.argv", ["benchmark_pp.py", "--tp-attention-views"])
+    args = parse_args()
+    assert args.tp_attention_views
+    _validate_args(args)
+    args.framework = "megatron"
+    with pytest.raises(ValueError, match="supports nano only"):
+        _validate_args(args)
+
+
 def test_stage_bucketing_cli_is_opt_in_and_only_applies_after_stage_zero(monkeypatch):
     from scripts.benchmark_pp import parse_args, _disable_stage_bucketing, _validate_args
     monkeypatch.setattr("sys.argv", ["benchmark_pp.py"])
