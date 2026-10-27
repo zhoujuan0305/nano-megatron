@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nano_megatron.distributed.backend import CommBackend
-from nano_megatron.parallel.wgrad import accumulate_wgrad, notify_wgrad_ready
+from nano_megatron.parallel.wgrad import accumulate_wgrad
 
 SEQ_DIM = 1
 
@@ -559,8 +559,6 @@ class _LinearWithGradOverlap(torch.autograd.Function):
 
         if hasattr(work, "wait"):
             work.wait()
-        if fused:
-            notify_wgrad_ready(ctx.parameter)
         result = (grad_input, grad_weight, grad_bias, None, None, None, None, None)
         return result[:len(ctx.needs_input_grad)]
 

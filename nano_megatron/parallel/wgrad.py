@@ -7,7 +7,6 @@ patch or thread-local state is needed by the engine's backward worker threads.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -49,6 +48,8 @@ def fused_wgrad_backward(
     linear weights within one microbatch are unsupported. Calls outside this
     helper do not manually mutate parameter gradients.
     """
+    if not hasattr(torch.Tensor, "register_post_accumulate_grad_hook"):
+        raise RuntimeError("fused wgrad requires PyTorch post-accumulate gradient hooks")
     params = []
     identities = set()
     for name, param in module.named_parameters(remove_duplicate=False):
@@ -87,6 +88,9 @@ def accumulate_wgrad(weight: Tensor, grad_output: Tensor, linear_input: Tensor) 
     if grad is None:
         grad = torch.empty_like(weight, memory_format=torch.contiguous_format)
         weight.grad = grad
+    # AccumulateGrad still visits this leaf when backward returns None. Because
+    # .grad is defined, its native post-accumulate hook notifies DDP exactly once
+    # AFTER this Function returns, preserving the engine's communication order.
     if (grad.shape != weight.shape or grad.dtype != weight.dtype
             or grad.device != weight.device or grad.requires_grad
             or not grad.is_contiguous()):
@@ -96,10 +100,3 @@ def accumulate_wgrad(weight: Tensor, grad_output: Tensor, linear_input: Tensor) 
     torch.addmm(grad, output.t(), inputs, beta=beta, out=grad)
     weight._nano_fused_wgrad_calls = getattr(weight, "_nano_fused_wgrad_calls", 0) + 1
     return True
-
-
-def notify_wgrad_ready(weight: Tensor) -> None:
-    """Called after any TP dgrad wait, instead of a skipped AccumulateGrad hook."""
-    callback: Any = getattr(weight, "_nano_wgrad_ready", None)
-    if callback is not None:
-        callback(weight)

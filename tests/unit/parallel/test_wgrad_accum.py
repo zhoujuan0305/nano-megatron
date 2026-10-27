@@ -143,6 +143,28 @@ def test_reused_weight_rejected_and_scope_removed():
     assert not hasattr(module.weight, "_nano_wgrad_scope")
 
 
+def test_fused_weight_notifies_ddp_exactly_once(monkeypatch):
+    from collections import Counter
+    counts = Counter()
+    original = DistributedDataParallel._on_param_grad_ready
+
+    def record(self, param):
+        counts[id(param)] += 1
+        return original(self, param)
+
+    monkeypatch.setattr(DistributedDataParallel, "_on_param_grad_ready", record)
+    backend = Backend()
+    model = linear("overlap", backend=backend)
+    ctx = SimpleNamespace(rank=0, data_context_parallel_group="dp",
+                          data_context_parallel_src_rank=0,
+                          data_parallel_size=2, context_parallel_size=1,
+                          backend=backend)
+    ddp = DistributedDataParallel(model, ctx, overlap_grad_reduce=True)
+    fused_wgrad_backward(model, ddp(torch.randn(2, 4)).sum())
+    assert counts[id(model.weight)] == 1
+    assert counts[id(model.bias)] == 1
+
+
 @pytest.mark.parametrize("overlap", [False, True])
 def test_ddp_no_sync_ready_and_persistent_views(overlap):
     backend = Backend()
