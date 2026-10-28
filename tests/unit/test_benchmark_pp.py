@@ -14,6 +14,29 @@ from scripts.benchmark_pp import (
 )
 
 
+def test_megatron_reference_uses_strong_fusion_and_explicit_attention_backend():
+    import ast
+    import inspect
+    from scripts.benchmark_pp import benchmark_megatron
+
+    tree = ast.parse(inspect.getsource(benchmark_megatron))
+    configs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TransformerConfig"
+    ]
+    assert len(configs) == 1
+    values = {kw.arg: kw.value for kw in configs[0].keywords}
+    for name in (
+        "gradient_accumulation_fusion", "apply_rope_fusion",
+        "bias_activation_fusion", "masked_softmax_fusion", "bias_dropout_fusion",
+    ):
+        assert ast.literal_eval(values[name]) is True
+    assert ast.literal_eval(values["batch_p2p_sync"]) is False
+    assert ast.unparse(values["attention_backend"]) == "AttnBackend[args.attn_backend]"
+
+
 def test_optimizer_step_uses_grad_and_megatron_main_grad() -> None:
     module = nn.Module()
     module.regular = nn.Parameter(torch.tensor([2.0]))

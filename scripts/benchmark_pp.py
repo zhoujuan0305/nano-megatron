@@ -774,6 +774,7 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         from megatron.core.models.gpt.gpt_model import GPTModel
         from megatron.core.pipeline_parallel import get_forward_backward_func
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.enums import AttnBackend
         from megatron.core.transformer.transformer_config import TransformerConfig
     except ImportError as exc:
         raise ImportError(
@@ -832,16 +833,20 @@ def benchmark_megatron(args: argparse.Namespace, dp_size: int) -> BenchmarkResul
         hidden_dropout=0.0,
         attention_dropout=0.0,
         attention_softmax_in_fp32=True,
-        apply_rope_fusion=False,
-        bias_activation_fusion=False,
-        masked_softmax_fusion=False,
-        bias_dropout_fusion=False,
+        # Keep the public reference aligned with the optimized TE baseline.
+        attention_backend=AttnBackend[args.attn_backend],
+        gradient_accumulation_fusion=True,
+        apply_rope_fusion=True,
+        bias_activation_fusion=True,
+        masked_softmax_fusion=True,
+        bias_dropout_fusion=True,
         fp16=False,
         bf16=(args.precision == "bf16"),
         params_dtype=_dtype(args),
         deallocate_pipeline_outputs=False,
         overlap_p2p_comm=False,
         batch_p2p_comm=True,
+        batch_p2p_sync=False,
         # The pipeline schedule owns final gradient synchronization in a
         # normal Megatron training step.  This also coalesces replicated
         # sequence-parallel parameter grads across the TP group; calling only

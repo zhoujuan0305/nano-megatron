@@ -1,243 +1,79 @@
 # nano-megatron
 
-基于 PyTorch/CUDA 独立实现并验证 Megatron 风格大模型核心并行机制的紧凑训练框架。
+[English](README.md)
 
-English README: [README.md](README.md)
+## 背景
 
-## 功能
+一个基于PyTorch/CUDA的轻量训练框架，通过独立实现并与Megatron对照，理解大模型并行训练机制。
+已实现DP、TP、SP、PP和CP，包括自定义梯度分桶、非交错1F1B流水线及通信计算重叠。
+PyTorch提供tensor、autograd和分布式原语；Nano的并行层和DDP不使用Megatron实现。
 
-| 并行 / 能力 | 状态 | 说明 |
-|-------------|------|------|
-| 数据并行 (DP) | 已支持 | 自定义 DDP；持久化连续梯度 bucket；参数就绪异步 AllReduce |
-| 张量并行 (TP) | 已支持 | Column/Row Parallel；QKV/SwiGLU 与词表切分；dgrad 集合通信重叠 |
-| 序列并行 (SP) | 已支持 | 在 TP group 上执行 tensor AllGather/ReduceScatter；合并复制参数梯度 |
-| 流水线并行 (PP) | 已支持 | 非交错 1F1B；双向 batched P2P |
-| 上下文并行 (CP) | 已支持 | AG-KV + 分块 FA（默认 **prefix-concat** 多块，`NANO_CP_FA_CHUNK`）；pack 默认 `contiguous`，可选 `zigzag`；非 P2P ring；不与 PP/SP 组合；`cp>1` 时包 DDP |
-| FlashAttention | 已支持 | 可选 `flash-attn`；`attn_backend=auto\|flash\|unfused`；覆盖 TP + CP |
-| TP×DP / TP×PP / DP×PP / TP×SP×PP×DP | 已支持 | 通过 `ParallelContext` 组合；组合路径已对齐未切分参考实现 |
-| TP×CP / CP×DP | 已支持 | 通过 `ParallelContext` 组合 |
-| [Nano NCCL](https://github.com/zhoujuan0305/nano-nccl) 集合通信 | 可选 | 为各通信组创建 ABI v2 communicator，替换训练主路径 TP/SP 与 DP 的全部 AllReduce、AllGather、ReduceScatter；PP P2P 仍走 PyTorch distributed |
-| ZeRO | 规划中 | — |
-
-可直接使用 PyTorch tensor、autograd、CUDA 与分布式通信原语。通信经小型 `CommBackend` 抽象（默认包装 PyTorch distributed）。
-
-## 设计
-
-```mermaid
-flowchart LR
-    Step["1F1B 训练 step"] --> TP["TP / SP 映射"]
-    Step --> PP["PP 调度"]
-    Step --> DP["DP 梯度 bucket"]
-    TP --> Router["按通信组路由的集合通信后端"]
-    DP --> Router
-    Router --> Torch["PyTorch distributed"]
-    Router --> NanoTP["Nano NCCL TP communicator"]
-    Router --> NanoDP["Nano NCCL DP×CP communicator"]
-    PP --> Torch
-```
-
-`ParallelContext` 根据 rank 坐标统一构造正交通信组；模型和并行层只依赖通信
-接口，路由后端按 process-group 对象选择 communicator。参考模型与切分模型可
-从同一份权重初始化，测试直接对比 logits、loss 与各 rank 的局部参数梯度。
+FlashAttention为可选依赖。默认使用PyTorch/NCCL通信，也可接入
+[nano-nccl](https://github.com/zhoujuan0305/nano-nccl)。
 
 ## 性能
 
-### 双节点 TP2 × SP × PP2 × DP2
+双节点各4张RTX A6000，TP2 × PP2 × DP2并开启SP，1.424B GPT，
+BF16 + FlashAttention，共同FP32-master AdamW：
 
-当前集成测试采用 1.424B 参数 GPT、BF16、序列长度 2048 和双节点
-8× RTX A6000。TP 与 PP 留在单机，每个 DP 对跨节点。计时范围包含前向、
-反向、TP/SP 通信、PP P2P 和最终 DP 梯度同步，不包含优化器更新。
+| 实现 | 完整训练step |
+| --- | ---: |
+| nano-megatron，开启wgrad累加融合 | 266.57 ms |
+| Megatron-Core + Transformer Engine | 257.38 ms |
 
-| 路径 | 全局 tok/s | Step ms | 相对结果 |
-|------|-----------:|--------:|----------|
-| nano-megatron + Nano NCCL，同步通信 | 17,221.76 | 475.68 | — |
-| nano-megatron + Nano NCCL，DP+TP overlap | **19,263.63** | **425.26** | 相对同步路径 **+11.86%** |
-| nano-megatron + PyTorch NCCL GDR=0，DP+TP overlap | 19,974.20 | 410.13 | Nano NCCL 保持 **0.964x** |
-| Megatron-LM/TE + NCCL GDR=0 | 18,958.51 | 432.10 | Nano 路径中位吞吐为 **1.016x** |
+本次单次对照中，Nano吞吐为Megatron的 **96.55%**。每组50步预热、100步计时；
+每台机器使用共享的10逻辑CPU池，SMT竞争随测试变化。这不是独占环境下的稳定性能保证。
+环境和计时口径见 [performance.md](performance.md)。
 
-数据为五轮旋转交错实验的中位数，每轮 warmup 5 step、测量 20 step。
-Nano NCCL 与 PyTorch NCCL 的后端 A/B 使用相同连接设置，Megatron 使用其
-推荐设置。两条框架路径的五轮区间存在重叠，因此 1.016x 表示该工作负载下
-性能持平，不代表普遍快于 Megatron-LM。原始汇总、拓扑控制实验和适用范围见
-[实验记录](https://github.com/zhoujuan0305/experiments/tree/main/nano-megatron/nano-nccl-collectives/runs/run-20260907-002)。
+## 使用
 
-### 早期单机基线
-
-在 4× RTX A6000、相同 GPT 配置 **345M / 760M / 1.3B** 下对比
-Megatron-LM（TE）：
-
-| 模式 | 精度 | nano / Megatron 吞吐比 | 说明 |
-|------|------|------------------------|------|
-| TP / TP+SP | FP32 | **0.93x – 1.01x** | unfused attention（FA 需半精度） |
-| DP / TP×DP | FP32 | **0.97x – 1.05x** | |
-| PP | FP32 | **1.00x – 1.04x** | |
-| TP×PP | FP32 | **约 0.92x** | |
-| TP / TP+SP | **BF16 + FA** | **0.87x – 0.92x** | 三个规模均覆盖 |
-| DP2 | **BF16 + FA** | **0.95x – 1.01x** | 显存 **0.77x – 0.81x** |
-| CP2 | **BF16 + FA** | **0.81x – 0.83x**（contiguous pack） | 默认 pack **contiguous** + prefix-concat 多块 FA；zigzag 可选（`--cp-pack`）；显存常更低 |
-
-完整表格（按规模）：**[performance.md](performance.md)** §2.1（345M）· §3.1（760M）· §4.1（1.3B）。
-
-## 快速开始
-
-### 安装
+先安装适合CUDA环境的PyTorch，再安装项目：
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
+# 可选；下面的FlashAttention示例需要安装。
+python -m pip install flash-attn --no-build-isolation
 ```
 
-### 可选：FlashAttention
-
-`flash-attn` 是可选依赖。单独安装以加速半精度注意力：
-
-```bash
-pip install flash-attn
-```
-
-在 `ReferenceGPTConfig` 中设置注意力后端：
-
-```python
-config = ReferenceGPTConfig(attn_backend="auto")  # 默认
-```
-
-| `attn_backend` | 行为 |
-|----------------|------|
-| `"auto"` | 当 CUDA + fp16/bf16 + `flash-attn` 已安装时使用 FlashAttention；否则回退到 unfused |
-| `"flash"` | 要求 CUDA + fp16/bf16 + `flash-attn`；不可用时抛出 `RuntimeError` |
-| `"unfused"` | 始终使用参考实现：scores→softmax→matmul |
-
-**上下文并行（CP）说明：** CP flash 路径为 all-gather KV + 多块 FlashAttention（非 TE P2P ring）。多块 FA 默认 **prefix-concat**（`NANO_CP_FA_CHUNK=prefix`）：将非因果 KV 块拼接为一次 FA，再对本地块做一次因果 FA，最后 online-softmax 合并（每个 Q-shard ≤2 次 launch）；`legacy` 为每个 KV 块一次 launch。序列 pack 由 `ParallelConfig.context_parallel_pack` / bench `--cp-pack {contiguous,zigzag}` 控制（默认 **contiguous**）。`attention_dropout > 0` 且 `cp > 1` 时，flash CP 路径**不支持**（多块反向无法传递 dropout RNG 状态）。
-
-### 运行参考模型
+运行小规模CPU参考模型：
 
 ```bash
 python scripts/run_reference_gpt.py --seed 0 --steps 3 --device cpu --out ref_traj.pt
 ```
 
-### 基准测试（对比 Megatron-LM）
-
-需将 Megatron-LM 加入 `PYTHONPATH`。为公平对比峰值显存，建议 DP/PP/CP 分别用 `--framework nano` 与 `--framework megatron` 各跑一次。
+TP2 × SP × PP2 × DP2需要两台机器、每台4张GPU。两台机器均执行下列命令，
+`NODE_RANK`分别设为0和1，`MASTER_ADDR`和端口保持一致且两机可达。
 
 ```bash
-export PYTHONPATH=/path/to/nano-megatron:/path/to/Megatron-LM:$PYTHONPATH
+export MASTER_ADDR="<node-0-address>"
+export MASTER_PORT=29500
+export NODE_RANK=0  # 第二台设为1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 
-# --- BF16 + FlashAttention（345M TP2；需安装 flash-attn）---
-python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  scripts/benchmark_tp.py --framework nano --tp-size 2 --precision bf16 --attn-backend flash \
-  --batch-size 2 --seq-len 2048 --hidden-size 1024 --num-layers 24 \
-  --num-heads 16 --ffn-hidden-size 4096
-python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  scripts/benchmark_tp.py --framework megatron --tp-size 2 --precision bf16 \
-  --batch-size 2 --seq-len 2048 --hidden-size 1024 --num-layers 24 \
-  --num-heads 16 --ffn-hidden-size 4096
-
-# 760M:  --hidden-size 1536 --ffn-hidden-size 6144 --batch-size 2
-# 1.3B:  --hidden-size 2048 --ffn-hidden-size 8192 --batch-size 1（TP2/DP/CP；TP4 用 batch=2）
-# DP2 / CP2: scripts/benchmark_dp.py | benchmark_cp.py  + 同样 --precision bf16 [--attn-backend flash]
-
-# --- FP32 基线（TP2 345M）---
-python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  scripts/benchmark_tp.py --framework both --tp-size 2 \
-  --batch-size 2 --seq-len 2048 --hidden-size 1024 --num-layers 24 \
-  --num-heads 16 --ffn-hidden-size 4096
-
-# PP2（1F1B，FP32）
-python -m torch.distributed.run --standalone --nproc_per_node=2 \
-  scripts/benchmark_pp.py --framework nano --pp-size 2 --tp-size 1 \
-  --batch-size 8 --num-microbatches 4 --seq-len 1024 \
-  --hidden-size 1024 --num-layers 24 --num-heads 16 --ffn-hidden-size 4096
-
-# TP2×SP×DP2 使用 Nano NCCL 集合通信（每个 GPU 一个 MPI 进程）
-mpirun -n 4 <rank-env-wrapper> python scripts/benchmark_pp.py \
-  --framework nano --tp-size 2 --pp-size 1 --dp-size 2 --sequence-parallel \
-  --collective-backend nano-nccl \
-  --nano-nccl-library /path/to/libnano_nccl_mpi_c.so \
-  --nano-nccl-transport auto --overlap-grad-reduce --overlap-tp-dgrad
-```
-
-`<rank-env-wrapper>` 负责将 MPI world/local rank 映射到 PyTorch 使用的
-`WORLD_SIZE`/`RANK`/`LOCAL_RANK` 环境变量；已验收的双节点启动器与拓扑映射见
-[实验脚本](https://github.com/zhoujuan0305/experiments/tree/main/nano-megatron/nano-nccl-collectives/scripts)。
-
-Nano NCCL factory 为活跃的 TP 与 DP×CP group 分别创建 communicator，并按
-process-group 对象路由 AllReduce、AllGather 与 ReduceScatter。广播、barrier
-与流水线 send/recv 仍使用 PyTorch fallback。所有 rank 必须按相同顺序创建
-communicator；原生库的编译期 rank 数必须等于每个被路由 group 的大小。
-Nano NCCL 是可选的限定范围后端，不承诺兼容 NCCL API。
-
-`benchmark_pp.py --framework nano --disable-bucketing-after-first-stage`
-可选地取消 PP stage 0 之后的 DP 梯度按大小分桶，保留 dtype 边界、
-最后一次 backward 的异步归约及 stage 0 的原桶配置。默认关闭；此策略
-可能减少通信与流水线的竞争，也可能损失 DP overlap，需对目标布局实测。
-DDP 构造器也可直接传入 `disable_bucketing=True`。
-
-全部规模与并行组合见 [performance.md](performance.md)。
-
-### TP 反向与布局候选（实验性、默认关闭）
-
-`benchmark_pp.py --tp-attention-views` 仅在 CP1 实际 Flash 路径允许 TP
-head split/merge 使用布局视图；不能直接外推到其它 attention 路径。
-
-`--fuse-wgrad-accum` 仅支持 Nano TP>1 的显式训练反向入口。wgrad GEMM
-用 `addmm(out=param.grad)` 直接累加到梯度，保留 DDP bucket view、no_sync
-和梯度就绪通知，不通过省略梯度同步获得速度。训练 schedule 调用
-`nano_megatron.parallel.wgrad.fused_wgrad_backward`；在该入口之外，普通
-`backward`/`autograd.grad` 仍返回正常梯度，不手动累加。该训练入口不支持
-高阶梯度、并发使用同一参数、同一 microbatch 内重复使用线性权重、共享或
-绑定权重、autocast、whole-step CUDA Graph；参数和激活需显式使用同一精度。
-
-`--vocab-ce-fp32` 可将低精度 logits 的交叉熵计算显式提升到 FP32，
-用于对齐 Megatron 的损失计算路径；模型参数和返回到 logits 的梯度仍保留原精度。
-对照时应在所有 Nano 候选和基线中使用相同损失精度，不能仅给某个候选改变精度。
-
-这些开关默认关闭；需在目标布局完成正确性与单因素性能验证后选择，
-不保证每个形状或并行组合都有收益。
-
-### 静态训练步 CUDA Graph（实验性、默认关闭）
-
-`benchmark_pp.py --cuda-graphs --deterministic` 捕获完整 forward/backward 与
-FP32-master AdamW 更新，不以省略 optimizer 换取吞吐。当前仅开放 CUDA、
-Torch/NCCL、TP2×PP2×DP1+SP、BF16 FlashAttention、AdamW 且不开 overlap 的组合。
-确定性模式同时作用于 PyTorch 与 CP1 FlashAttention 反向；它是进程内配置，
-不设置设备时钟、CPU affinity 或共享系统参数。
-
-```bash
-# 两节点各两 GPU；所有节点使用相同参数，自行设置 rendezvous 环境变量。
-python -m torch.distributed.run --nnodes=2 --nproc_per_node=2 \
-  --node_rank="$NODE_RANK" --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
-  scripts/benchmark_pp.py --framework nano --tp-size 2 --pp-size 2 --dp-size 1 \
-  --sequence-parallel --precision bf16 --attn-backend flash --optimizer adamw \
-  --hidden-size 1024 --num-layers 12 --num-heads 8 --ffn-hidden-size 2752 \
+torchrun --nnodes=2 --nproc-per-node=4 \
+  --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  scripts/benchmark_pp.py --framework nano \
+  --tp-size 2 --pp-size 2 --dp-size 2 --sequence-parallel \
+  --hidden-size 2048 --num-layers 24 --num-heads 16 --ffn-hidden-size 5504 \
   --batch-size 4 --num-microbatches 4 --seq-len 1024 \
-  --warmup-steps 150 --benchmark-steps 400 --deterministic --cuda-graphs \
-  --cuda-graph-warmup-steps 50
+  --precision bf16 --attn-backend flash --optimizer adamw \
+  --warmup-steps 50 --benchmark-steps 100 \
+  --fuse-rope --rope-fp32-phase --fuse-swiglu --vocab-ce-fp32 \
+  --overlap-grad-reduce --overlap-tp-dgrad \
+  --disable-bucketing-after-first-stage --fuse-wgrad-accum
 ```
 
-此例计时前实际完成 150+50 次训练更新；capture 本身不增加设备端更新，
-Python 计数在 capture 后对齐。额外准备耗时按 rank 输出为
-`CUDA_GRAPH_PREPARATION`，结果标签和 Markdown 单列额外 warmup 更新。
-自动 GC 策略不变，计时内发生的维护仍计入。该模式要求输入形状、存储地址、
-优化器状态及超参数固定，capture 后持续重放，不混入其它 eager 训练步骤；
-不代表动态数据、学习率调度、checkpoint 或完整生产训练吞吐，也不承诺任意
-共享环境下的方差上限。默认 eager 路径仍可独立使用。
+`--batch-size`是每个DP副本的batch：上述配置global batch为8，microbatch为1。
+CPU亲和性和网卡应按自己的机器配置；该命令不会预留CPU，也不自动复现实测的绑核条件。
 
-### 验证模型结构
+Wgrad累加融合默认关闭，只支持显式训练反向入口；不支持共享/重复使用权重、同参数并发、
+autocast、高阶梯度和完整训练步CUDA Graph。真实文本训练与checkpoint见
+[TEXT_TRAINING.md](TEXT_TRAINING.md)。
 
-```bash
-python scripts/verify_architecture.py
-```
+单元测试：`python -m pytest tests/unit`。运行Megatron对照还需安装Megatron-Core和
+Transformer Engine；Nano本身不依赖TE。
 
-### 运行测试
+## License
 
-```bash
-# 单元测试
-PYTHONPATH=. python -m pytest tests/unit -v
-
-# 分布式测试（多进程；部分用例需要多卡 / NCCL）
-PYTHONPATH=. python -m pytest tests/distributed tests/integration -v
-```
-
-## 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件。
+[MIT](LICENSE)。

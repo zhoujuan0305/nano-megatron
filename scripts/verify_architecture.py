@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Verify that nano-megatron's ReferenceGPT matches Megatron-LM's GPT-3 345M architecture."""
 
-import sys
-sys.path.insert(0, "/workspace/src/Megatron-LM")
-
 import torch
 from nano_megatron.reference import ReferenceGPT, ReferenceGPTConfig
 
